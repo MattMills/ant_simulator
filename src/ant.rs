@@ -316,6 +316,8 @@ pub struct Ant {
     pub hold_activity: Activity,
     /// Fractional movement credit (unused sub-cell movement).
     pub move_credit: f64,
+    /// Ticks left lying stunned after a fall.
+    pub stun: u32,
     routes: HashMap<Position, Route>,
     memory: [Position; MEMORY_LEN],
     memory_cursor: usize,
@@ -381,6 +383,7 @@ impl Ant {
             hold_activity: Activity::Resting,
             transit: None,
             move_credit: 0.0,
+            stun: 0,
             routes: HashMap::new(),
             memory: [nest; MEMORY_LEN],
             memory_cursor: 0,

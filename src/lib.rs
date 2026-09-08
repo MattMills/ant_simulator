@@ -95,10 +95,14 @@
 //! * **The frame** ([`frame`]): surfaces joined along their edges on one
 //!   grid, as the net of a box unfolds: an outworld box with its corners
 //!   joined by portals and its walls sloping, a slab nest, tubes round
-//!   whose backs the two sides meet; each region standing somewhere in
-//!   space. An ant walking over a fold turns its frame and the vectors it
-//!   carries, the field flows through, and a trail is followed round a
-//!   corner, so a colony forages over a formicarium's surfaces.
+//!   whose backs the two sides meet, a lid over the box or a fluon band
+//!   round its rim; each region standing somewhere in space, so a slip
+//!   on a slope drops the ant straight down onto whatever lies below and
+//!   stuns it. An ant walking over a fold turns its frame and the vectors
+//!   it carries, the field flows through, the lens and the memoized
+//!   transits see through the fold, walls block the sight of landmarks,
+//!   and a trail is followed round a corner, so a colony forages over a
+//!   formicarium's surfaces.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`

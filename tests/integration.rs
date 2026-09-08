@@ -682,3 +682,50 @@ fn ants_forage_up_a_wall_and_through_a_tube() {
         assert!(frame.height(a.position).is_some());
     }
 }
+
+#[test]
+fn ants_fall_from_a_slippery_rim_and_carry_on() {
+    // An open box with fluon on the top two rows of its walls: ants that
+    // reach the rim fall to the floor, and none stays up there.
+    let mut frame = Frame::new(70, 60, 2.0);
+    let out = frame.outworld(20, 20, 30, 20, 8, [0.0, 0.0, 0.0], 0.6);
+    frame.nest(Position::new(35, 30), 2);
+    frame.barrier(&out, 2, 1.0);
+    let mut world = frame.config();
+    world.food_sources = vec![FoodSource::pool(Position::new(45, 25), 1, 40.0, 1.0)];
+    let mut cfg = SimConfig {
+        world,
+        ants: 120,
+        frame: Some(frame.clone()),
+        ..SimConfig::default()
+    };
+    cfg.nest.initial_satiation = 0.05;
+    let mut sim = Simulation::new(cfg, 11);
+    sim.run_seconds(20.0 * 60.0);
+    let s = sim.stats().clone();
+    assert!(s.falls > 0, "nobody fell: {s:?}");
+    assert!(s.food_delivered > 0);
+    // Whoever stands on the fluon now has just stepped onto it, and is
+    // on the floor again a tick later.
+    let on_rim = |sim: &Simulation, a: &Ant| {
+        sim.world()
+            .slope_at(a.cell())
+            .map(|s| s.slip >= 1.0)
+            .unwrap_or(false)
+    };
+    let slipping: Vec<_> = sim
+        .living()
+        .filter(|a| !a.is_inside() && a.stun == 0 && on_rim(&sim, a))
+        .map(|a| a.id)
+        .collect();
+    sim.run(1);
+    for a in sim.living().filter(|a| slipping.contains(&a.id)) {
+        assert!(
+            !on_rim(&sim, a) && a.stun > 0,
+            "still on the fluon a tick later at {:?}",
+            a.position
+        );
+        assert!(sim.world().is_passable(a.cell()));
+    }
+    assert!(sim.stats().falls >= s.falls + slipping.len() as u64);
+}

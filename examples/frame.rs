@@ -1,9 +1,10 @@
 //! A formicarium in a plastic frame: a slab nest, a tube through a hole
-//! in the wall of an open outworld box, and food on the floor of the
-//! box and on a shelf up its far wall. The ants find their way
-//! pheromonally over the folds and through the tube.
+//! in the wall of an open outworld box with fluon on its rim, and food
+//! on the floor of the box and on a shelf up its far wall. The ants find
+//! their way pheromonally over the folds and through the tube, and fall
+//! when they lose their grip on the rim.
 //!
-//!     cargo run --release --example frame [minutes]
+//!     cargo run --release --example frame [minutes] [lid]
 
 use ant_simulator::prelude::*;
 
@@ -12,6 +13,7 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(40.0);
+    let with_lid = std::env::args().any(|a| a == "lid");
     // The net: a 96 × 64 grid of 2-cm cells. The box's floor is 56 × 40 cm
     // with 16-cm walls; the nest slab lies west of it, joined by a tube
     // through a hole at the foot of the box's west wall.
@@ -19,6 +21,12 @@ fn main() {
     let out = frame.outworld(48, 20, 28, 20, 8, [56.0, 0.0, 0.0], 0.6);
     let slab = frame.slab("slab", 4, 22, 20, 12, [0.0, 4.0, 0.0]);
     frame.nest(Position::new(10, 28), 2);
+    // Fluon on the top two rows of the walls, or a lid on the box.
+    if with_lid {
+        frame.lid(&out, 0.001);
+    } else {
+        frame.barrier(&out, 2, 1.0);
+    }
     frame.wall(Rect::new(Position::new(44, 30), Position::new(47, 33)));
     let tube = frame.tube(
         "tube",
@@ -51,6 +59,7 @@ fn main() {
     let mut cfg = SimConfig {
         world,
         ants: 150,
+        frame: Some(frame.clone()),
         ..SimConfig::default()
     };
     cfg.nest.initial_satiation = 0.05;
@@ -62,7 +71,8 @@ fn main() {
     cfg.pipeline = Some(PipelineConfig::default());
     let mut sim = Simulation::new(cfg, 7);
     println!(
-        "== the frame: f floor, n/e/s/w walls, t tube, s slab, N nest; | and - where portals open ==\n{}\n",
+        "== the frame: f floor, n/e/s/w walls, t tube, s slab, l lid, N nest; | and - where portals open{} ==\n{}\n",
+        if with_lid { "; a lid on the box" } else { "; fluon on the rim" },
         frame.render()
     );
     println!(
@@ -94,11 +104,12 @@ fn main() {
         let taken =
             |at: Position| 360.0 - world.food_in(&Rect::new(at.offset(-1, -1), at.offset(1, 1)));
         println!(
-            "after {:.0} min: delivered {}, taken {:.0} µl from the floor pool and {:.0} µl from the shelf, {} outside, mean height {:.1} cm; ants per region {}",
+            "after {:.0} min: delivered {}, taken {:.0} µl from the floor pool and {:.0} µl from the shelf, {} falls, {} outside, mean height {:.1} cm; ants per region {}",
             minutes * q as f64 / quarters as f64,
             s.food_delivered,
             taken(on_floor),
             taken(on_wall),
+            s.falls,
             n,
             if n > 0 { heights / n as f64 } else { 0.0 },
             regions

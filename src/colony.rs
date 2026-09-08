@@ -226,6 +226,9 @@ pub struct SimConfig {
     /// ground and scheduled against a frame budget (none: every step
     /// decided).
     pub pipeline: Option<PipelineConfig>,
+    /// The frame the world's surfaces stand in, for falling: where a
+    /// point lands is where the surface below it lies in space.
+    pub frame: Option<crate::frame::Frame>,
 }
 
 impl Default for SimConfig {
@@ -262,6 +265,7 @@ impl SimConfig {
             mind: None,
             memo: None,
             pipeline: None,
+            frame: None,
         }
     }
 }
@@ -727,6 +731,8 @@ pub struct Stats {
     pub frames: FrameStats,
     /// Position fixes taken from familiar landmarks.
     pub landmark_fixes: u64,
+    /// Falls from walls, rims and ceilings.
+    pub falls: u64,
     /// Periodic snapshots.
     pub log: Vec<Snapshot>,
 }
@@ -915,6 +921,8 @@ pub struct Simulation {
     geodesics: std::collections::HashMap<Position, f64>,
     /// The decision pipeline, if decisions are coarse-grained in time.
     pipeline: Option<PipelineConfig>,
+    /// The frame the surfaces stand in, if any.
+    frame: Option<crate::frame::Frame>,
     /// Probability the last decision gave to holding the heading.
     straight_prob: f64,
     leaf_paths: Vec<Vec<NodeId>>,
@@ -984,6 +992,7 @@ impl Simulation {
         let cell_cm = world.cell_cm();
         let (world_width, world_height) = (world.width(), world.height());
         let pipeline = config.pipeline.clone();
+        let frame = config.frame.clone();
         let memo = config
             .memo
             .clone()
@@ -1020,6 +1029,7 @@ impl Simulation {
             policy_classes: Self::policy_classes(&hierarchy.compile()),
             geodesics: std::collections::HashMap::new(),
             pipeline,
+            frame,
             straight_prob: 0.0,
             policies: hierarchy.compile(),
             leaf_paths,
@@ -1922,6 +1932,44 @@ impl Simulation {
         self.stats.frames.horizons += 1;
     }
 
+    /// An ant loses its grip and falls to the surface below it in space,
+    /// which on the net is a walk down to where it lands: its path
+    /// integration takes the drop as such, it lands facing any way,
+    /// stunned for a moment, and whatever transit it was in ends inside.
+    fn fall(&mut self, i: usize) {
+        let from = self.ants[i].position;
+        let Some(target) = self.frame.as_ref().and_then(|f| f.fall_target(from)) else {
+            return;
+        };
+        if !self.world.is_passable(target.cell()) {
+            return;
+        }
+        let from_cell = from.cell();
+        let to_cell = target.cell();
+        if from_cell != to_cell {
+            if let Some(c) = self.world.cell_mut(from_cell) {
+                c.occupancy = c.occupancy.saturating_sub(1);
+            }
+            if let Some(c) = self.world.cell_mut(to_cell) {
+                c.occupancy = c.occupancy.saturating_add(1);
+            }
+            self.world.record_crossing(to_cell);
+        }
+        let stun = self.seconds_to_ticks(self.species.fall_stun_s);
+        let heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
+        let (dx, dy) = from.to(target);
+        let species = &self.species;
+        let a = &mut self.ants[i];
+        a.position = target;
+        a.integrate(dx, dy, species, &mut self.rng);
+        a.heading = heading;
+        a.stun = stun;
+        a.remember(from_cell);
+        self.close_records(i, INSIDE, 0.0);
+        self.ants[i].transit = None;
+        self.stats.falls += 1;
+    }
+
     /// The decision pipeline's configuration, if any.
     pub fn pipeline(&self) -> Option<&PipelineConfig> {
         self.pipeline.as_ref()
@@ -2175,7 +2223,17 @@ impl Simulation {
         };
         let o = t.outcome;
         let from_cell = self.ants[i].cell();
-        let to_cell = t.exit.cell();
+        // An exit beyond a portal's edge comes out on the joined edge,
+        // and the body's frame turns with the fold.
+        let (exit, turn) = if !self.world.is_passable(t.exit.cell()) {
+            match self.world.warp(t.exit) {
+                Some(warp) => (warp.point, warp.turn),
+                None => (t.exit, 0.0),
+            }
+        } else {
+            (t.exit, 0.0)
+        };
+        let to_cell = exit.cell();
         // The body moves from the entry cell to the exit cell.
         if let Some(c) = self.world.cell_mut(from_cell) {
             c.occupancy = c.occupancy.saturating_sub(1);
@@ -2256,13 +2314,14 @@ impl Simulation {
         let (dx, dy) = t.entry.to(t.exit);
         let species = &self.species;
         let a = &mut self.ants[i];
-        a.position = t.exit;
-        a.heading = o.heading as f64;
+        a.position = exit;
+        a.heading = crate::geometry::wrap_angle(o.heading as f64 + turn);
         a.trip_length += o.length as f64;
         a.integrate(dx, dy, species, &mut self.rng);
+        a.rotate_frame(turn);
         a.remember(from_cell);
         // Out of the nodes crossed, into the next.
-        self.cross(i, from_cell, to_cell, t.exit);
+        self.cross(i, from_cell, to_cell, exit);
     }
 
     /// The queen's mind, if she has one.
@@ -3225,6 +3284,25 @@ impl Simulation {
             .any(|r| r.key.leg != leg)
         {
             self.close_records(i, INSIDE, 0.0);
+        }
+        // Stunned by a fall, or losing grip on a slippery slope and
+        // falling to the surface below.
+        if self.frame.is_some() {
+            if self.ants[i].stun > 0 {
+                self.ants[i].stun -= 1;
+                self.tick_timers(i);
+                return;
+            }
+            let here = self.ants[i].cell();
+            let slip = self.world.slope_at(here).map(|s| s.slip).unwrap_or(0.0);
+            if slip > 0.0 {
+                let laden = self.ants[i].load_fill.clamp(0.0, 1.0);
+                if self.rng.chance((slip * (1.0 + 2.0 * laden)).min(1.0)) {
+                    self.fall(i);
+                    self.tick_timers(i);
+                    return;
+                }
+            }
         }
         // Speed: cells per tick at the current temperature, faster on a
         // strong trail, slower when loaded and in a crowd.

@@ -115,13 +115,154 @@ impl Frame {
         self.portals.push(Portal { a, b });
     }
 
-    /// Make a region a slope: walking towards `up` on it is climbing.
-    pub fn slope(&mut self, region: usize, up: Side, factor: f64) {
+    /// Make a region a slope: walking towards `up` on it is climbing at
+    /// `factor` of the speed, and a body loses its grip with chance
+    /// `slip` per tick.
+    pub fn slope(&mut self, region: usize, up: Side, factor: f64, slip: f64) {
         self.slopes.push(Slope {
             rect: self.regions[region].rect,
             up,
             factor,
+            slip,
         });
+    }
+
+    /// A slippery band on a region: the top `rows` cells of a wall
+    /// coated with fluon, from which an ant falls with chance `slip` per
+    /// tick (one for a sure fall). Later slopes take precedence over
+    /// earlier ones where they overlap.
+    pub fn barrier(&mut self, out: &Outworld, rows: i32, slip: f64) {
+        let rows = rows.max(1);
+        let band = |r: &Region, up: Side| -> Rect {
+            let (min, max) = (r.rect.min, r.rect.max);
+            match up {
+                Side::North => Rect::new(min, Position::new(max.x, min.y + rows - 1)),
+                Side::South => Rect::new(Position::new(min.x, max.y - rows + 1), max),
+                Side::East => Rect::new(Position::new(max.x - rows + 1, min.y), max),
+                Side::West => Rect::new(min, Position::new(min.x + rows - 1, max.y)),
+            }
+        };
+        for (region, up) in [
+            (out.north, Side::North),
+            (out.east, Side::East),
+            (out.south, Side::South),
+            (out.west, Side::West),
+        ] {
+            let factor = self
+                .slopes
+                .iter()
+                .find(|s| s.rect == self.regions[region].rect)
+                .map(|s| s.factor)
+                .unwrap_or(1.0);
+            self.slopes.push(Slope {
+                rect: band(&self.regions[region], up),
+                up,
+                factor,
+                slip,
+            });
+        }
+    }
+
+    /// A lid on an open box: a ceiling folded out above the north wall
+    /// on the net, its other three edges joined to the tops of the
+    /// east, south and west walls, on which an ant walks upside down
+    /// and loses its grip with chance `slip` per tick.
+    pub fn lid(&mut self, out: &Outworld, slip: f64) -> usize {
+        let north = self.regions[out.north].rect;
+        let floor = self.regions[out.floor].rect;
+        let (x0, y0) = (floor.min.x, floor.min.y);
+        let w = floor.max.x - floor.min.x + 1;
+        let d = floor.max.y - floor.min.y + 1;
+        let h = north.max.y - north.min.y + 1;
+        let c = self.cell_cm;
+        let origin = self.regions[out.floor].origin;
+        let lid = self.region(
+            "lid",
+            Rect::new(
+                Position::new(x0, y0 - h - d),
+                Position::new(x0 + w - 1, y0 - h - 1),
+            ),
+            [
+                origin[0],
+                origin[1] + d as f64 * c,
+                origin[2] + h as f64 * c,
+            ],
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        );
+        let edge = |start: (i32, i32), end: (i32, i32), side: Side| Edge {
+            start: Position::new(start.0, start.1),
+            end: Position::new(end.0, end.1),
+            side,
+        };
+        // Each edge listed from the north end, or from the west.
+        self.portal(
+            edge(
+                (x0 + w - 1, y0 - h - 1),
+                (x0 + w - 1, y0 - h - d),
+                Side::East,
+            ),
+            edge(
+                (x0 + w + h - 1, y0),
+                (x0 + w + h - 1, y0 + d - 1),
+                Side::East,
+            ),
+        );
+        self.portal(
+            edge((x0, y0 - h - d), (x0 + w - 1, y0 - h - d), Side::North),
+            edge(
+                (x0, y0 + d + h - 1),
+                (x0 + w - 1, y0 + d + h - 1),
+                Side::South,
+            ),
+        );
+        self.portal(
+            edge((x0, y0 - h - 1), (x0, y0 - h - d), Side::West),
+            edge((x0 - h, y0), (x0 - h, y0 + d - 1), Side::West),
+        );
+        self.slopes.push(Slope {
+            rect: self.regions[lid].rect,
+            up: Side::North,
+            factor: 1.0,
+            slip,
+        });
+        lid
+    }
+
+    /// Where a point of the net lands if the body at it falls: straight
+    /// down in space onto the highest level region below it (the floor
+    /// beneath a wall or a lid), as a point of that region; none where
+    /// there is nothing below.
+    pub fn fall_target(&self, p: Point) -> Option<Point> {
+        let from = self.region_of(p.cell())?;
+        let q = self.regions[from].position_3d(p, self.cell_cm);
+        let c = self.cell_cm;
+        let mut best: Option<(f64, Point)> = None;
+        for (i, r) in self.regions.iter().enumerate() {
+            if i == from || r.u[2].abs() > 1e-9 || r.v[2].abs() > 1e-9 {
+                continue;
+            }
+            let z = r.origin[2];
+            if z > q[2] - 1e-9 {
+                continue;
+            }
+            let d = [q[0] - r.origin[0], q[1] - r.origin[1]];
+            let a = d[0] * r.u[0] + d[1] * r.u[1];
+            let b = d[0] * r.v[0] + d[1] * r.v[1];
+            let w = (r.rect.max.x - r.rect.min.x + 1) as f64 * c;
+            let h = (r.rect.max.y - r.rect.min.y + 1) as f64 * c;
+            if a < -1e-9 || b < -1e-9 || a > w + 1e-9 || b > h + 1e-9 {
+                continue;
+            }
+            let x = (r.rect.min.x as f64 + a / c)
+                .clamp(r.rect.min.x as f64 + 0.5, r.rect.max.x as f64 + 0.5);
+            let y = (r.rect.min.y as f64 + b / c)
+                .clamp(r.rect.min.y as f64 + 0.5, r.rect.max.y as f64 + 0.5);
+            if best.map(|(bz, _)| z > bz).unwrap_or(true) {
+                best = Some((z, Point::new(x, y)));
+            }
+        }
+        best.map(|(_, p)| p)
     }
 
     /// Wall off cells of a region (a hole in a wall is made by walling
@@ -225,10 +366,10 @@ impl Frame {
             edge((x0 - 1, y0), (x0 - h, y0), Side::North),
             edge((x0, y0 - 1), (x0, y0 - h), Side::West),
         );
-        self.slope(north, Side::North, climb);
-        self.slope(east, Side::East, climb);
-        self.slope(south, Side::South, climb);
-        self.slope(west, Side::West, climb);
+        self.slope(north, Side::North, climb, 0.0);
+        self.slope(east, Side::East, climb, 0.0);
+        self.slope(south, Side::South, climb, 0.0);
+        self.slope(west, Side::West, climb, 0.0);
         Outworld {
             floor,
             north,
@@ -482,6 +623,59 @@ mod tests {
         );
         let picture = frame.render();
         assert!(picture.contains('f') && picture.contains('N') && picture.contains('|'));
+    }
+
+    #[test]
+    fn a_lid_closes_the_box_and_a_fall_lands_on_the_floor_below() {
+        let mut frame = Frame::new(60, 80, 2.0);
+        let out = frame.outworld(20, 40, 20, 16, 6, [0.0, 0.0, 0.0], 0.6);
+        frame.nest(Position::new(30, 48), 1);
+        frame.barrier(&out, 2, 1.0);
+        let lid = frame.lid(&out, 0.001);
+        let world = World::new(frame.config(), &mut Rng::seed_from_u64(1));
+        assert_eq!(frame.portals().len(), 7);
+        // The lid lies above the north wall on the net, at the walls'
+        // height in space, and its far edge is over the south wall.
+        let lid_rect = frame.regions()[lid].rect;
+        assert_eq!(
+            lid_rect,
+            Rect::new(Position::new(20, 18), Position::new(39, 33))
+        );
+        assert!((frame.height(Point::new(30.5, 25.5)).unwrap() - 12.0).abs() < 1e-9);
+        // Walking east across the lid comes out on the east wall walking
+        // down it (a half turn on the net), north across it on the south
+        // wall with no turn.
+        let east = world
+            .warp(Point::new(40.5, 25.5))
+            .expect("onto the east wall");
+        assert!((east.turn.abs() - std::f64::consts::PI).abs() < 1e-9);
+        assert!(frame.regions()[out.east].rect.contains(east.point.cell()));
+        let south = world
+            .warp(Point::new(30.5, 17.5))
+            .expect("onto the south wall");
+        assert!(south.turn.abs() < 1e-9);
+        assert!(frame.regions()[out.south].rect.contains(south.point.cell()));
+        // A fall from the lid lands on the floor at the same place in
+        // plan; from a wall, at its foot; from the floor, nowhere.
+        let from_lid = frame.fall_target(Point::new(30.5, 25.5)).expect("down");
+        let plan = frame.position_3d(Point::new(30.5, 25.5)).unwrap();
+        let landed = frame.position_3d(from_lid).unwrap();
+        assert!((landed[0] - plan[0]).abs() < 1e-9 && (landed[1] - plan[1]).abs() < 1e-9);
+        assert!(landed[2].abs() < 1e-9);
+        assert!(frame.regions()[out.floor].rect.contains(from_lid.cell()));
+        let from_wall = frame
+            .fall_target(Point::new(30.5, 36.5))
+            .expect("off the north wall");
+        assert_eq!(
+            from_wall.cell(),
+            Position::new(30, 40),
+            "the foot of the wall"
+        );
+        assert!(frame.fall_target(Point::new(30.5, 48.5)).is_none());
+        // The rim is slippery, the wall below it is not, the lid a little.
+        assert!((world.slope_at(Position::new(30, 34)).unwrap().slip - 1.0).abs() < 1e-9);
+        assert!(world.slope_at(Position::new(30, 38)).unwrap().slip.abs() < 1e-9);
+        assert!((world.slope_at(Position::new(30, 25)).unwrap().slip - 0.001).abs() < 1e-9);
     }
 
     #[test]

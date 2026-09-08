@@ -1364,7 +1364,6 @@ impl Transits {
                         || c.food_capacity_ul > 0.0
                         || c.has_food()
                         || c.renewal_ul_per_s > 0.0
-                        || world.has_portal(p)
                     {
                         ok = false;
                         break 'cells;

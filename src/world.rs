@@ -545,7 +545,9 @@ impl Portal {
 
 /// A region of the net that stands at an angle in space: walking
 /// towards `up` is climbing, and is slower by `factor` (1 for no
-/// slope, 0.5 for half speed straight up).
+/// slope, 0.5 for half speed straight up); a body on it may lose its
+/// grip and fall with chance `slip` per tick (1 on a fluon barrier, a
+/// little on a ceiling, none on a rough wall), more when laden.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Slope {
     /// The region.
@@ -554,6 +556,8 @@ pub struct Slope {
     pub up: Side,
     /// Speed factor straight up.
     pub factor: f64,
+    /// Chance per tick of losing grip.
+    pub slip: f64,
 }
 
 /// Where a point beyond a portal's edge comes out, and the turn made.
@@ -1254,6 +1258,39 @@ impl World {
         self.portal_cells.contains(&p)
     }
 
+    /// The cells joined through portals, in pairs.
+    pub fn portal_cell_pairs(&self) -> Vec<(Position, Position)> {
+        let w = self.config.width;
+        self.portal_pairs
+            .iter()
+            .map(|&(a, b)| {
+                (
+                    Position::new((a % w) as i32, (a / w) as i32),
+                    Position::new((b % w) as i32, (b / w) as i32),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether one point is in sight of another: nothing but open ground
+    /// on the line between them, sampled every half cell (a sight, not a
+    /// body: no clearance is needed).
+    pub fn line_of_sight(&self, a: Point, b: Point) -> bool {
+        if !self.has_walls {
+            return self.is_passable_point(b);
+        }
+        let len = a.distance(b);
+        let samples = (len / 0.5).ceil().max(1.0) as usize;
+        for i in 1..=samples {
+            let t = i as f64 / samples as f64;
+            let p = Point::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
+            if !self.is_passable(p.cell()) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Speed factor for walking from a cell on a heading: less than one
     /// when climbing a slope, one on the flat or downhill.
     pub fn climb_factor(&self, p: Position, heading: f64) -> f64 {
@@ -1273,6 +1310,17 @@ impl World {
         }
     }
 
+    /// The slope a cell lies on, if any.
+    pub fn slope_at(&self, p: Position) -> Option<&Slope> {
+        let idx = self.index(p)?;
+        let s = *self.slope_of.get(idx)?;
+        if s == u8::MAX {
+            None
+        } else {
+            self.config.slopes.get(s as usize)
+        }
+    }
+
     /// The landmarks of this world.
     pub fn landmarks(&self) -> &[Position] {
         &self.landmarks
@@ -1283,8 +1331,12 @@ impl World {
     pub fn nearest_landmark(&self, from: Point, sight: f64) -> Option<(usize, Position)> {
         let mut best: Option<(usize, Position, f64)> = None;
         for (i, &l) in self.landmarks.iter().enumerate() {
-            let d = from.distance(Point::center_of(l));
-            if d <= sight && best.map(|b| d < b.2).unwrap_or(true) {
+            let centre = Point::center_of(l);
+            let d = from.distance(centre);
+            if d <= sight
+                && best.map(|b| d < b.2).unwrap_or(true)
+                && self.line_of_sight(from, centre)
+            {
                 best = Some((i, l, d));
             }
         }
@@ -1811,6 +1863,9 @@ impl World {
         let Some(idx) = self.index(p) else {
             return;
         };
+        if self.cells[idx].terrain == Terrain::Wall {
+            return;
+        }
         if let Some(g) = self.grain.as_mut() {
             if g.volatile[k] {
                 // Into the pool of the node (its block breaking up
@@ -2323,11 +2378,20 @@ impl World {
     /// What a node of the world's quadtree is made of, for the lens:
     /// open ground crossed at unit cost, walled through, or both.
     pub fn ground(&self, key: QuadKey, rect: (usize, usize, usize, usize)) -> crate::lens::Ground {
+        let (x0, y0, x1, y1) = rect;
+        let area = (x1.saturating_sub(x0)) * (y1.saturating_sub(y0));
+        // A node with a portal's edge in it is refined to cells, so that
+        // the hop through the portal is a cell's.
+        if area > 1
+            && self.portal_cells.iter().any(|c| {
+                c.x >= x0 as i32 && c.y >= y0 as i32 && (c.x as usize) < x1 && (c.y as usize) < y1
+            })
+        {
+            return crate::lens::Ground::Mixed;
+        }
         let Some(tree) = &self.wall_tree else {
             return crate::lens::Ground::Open(1.0);
         };
-        let (x0, y0, x1, y1) = rect;
-        let area = (x1.saturating_sub(x0)) * (y1.saturating_sub(y0));
         let walls = *tree.get(key) as usize;
         if walls == 0 {
             crate::lens::Ground::Open(1.0)
@@ -3154,6 +3218,23 @@ mod tests {
     }
 
     #[test]
+    fn walls_block_sight_of_landmarks() {
+        // A landmark behind the wall of the small world is not seen from
+        // across it, and is from the same side.
+        let cfg = WorldConfig {
+            landmarks: vec![Position::new(11, 4)],
+            ..small_config()
+        };
+        let world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        assert!(world.nearest_landmark(Point::new(7.5, 4.5), 20.0).is_none());
+        assert!(world
+            .nearest_landmark(Point::new(10.5, 2.5), 20.0)
+            .is_some());
+        assert!(!world.line_of_sight(Point::new(7.5, 4.5), Point::new(11.5, 4.5)));
+        assert!(world.line_of_sight(Point::new(2.5, 2.5), Point::new(7.5, 7.5)));
+    }
+
+    #[test]
     fn slopes_slow_climbing() {
         use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
         let cfg = WorldConfig {
@@ -3161,6 +3242,7 @@ mod tests {
                 rect: Rect::new(Position::new(0, 0), Position::new(11, 4)),
                 up: Side::North,
                 factor: 0.5,
+                slip: 0.0,
             }],
             ..small_config()
         };

@@ -745,34 +745,57 @@ followed round a corner. A `Slope` makes walking up a wall slower than
 along it. Every region carries its place in space, so a point of the
 net has a position and a height in three dimensions.
 
+Gravity acts through the slopes. A body on a slope loses its grip with
+the slope's `slip` chance per tick, more when laden, and falls: straight
+down in space onto the highest level surface below it (the floor at the
+foot of a wall, the floor beneath a lid), which on the net is a walk
+down to where it lands, so its path integration takes the drop as such;
+it lands facing any way and lies stunned for a few seconds, and
+whatever transit it was in ends inside. A rough wall has no slip; a
+band of fluon on the rim of a wall (`Frame::barrier`) has a slip of one,
+so an ant that reaches it falls at once; a ceiling has a little.
+
 `Frame::outworld` folds out an open box: a floor with four walls
 attached along its sides on the net and joined at the corners by
-portals, each wall a slope; `Frame::slab` lays a flat nest module;
-`Frame::tube` runs a strip whose two long sides are joined round the
-back and whose ends are portals to the edges it connects; `Frame::wall`
-cuts a hole. `cargo run --release --example frame` builds a slab nest
-joined by a 32-cm tube through a hole at the foot of the west wall of a
-56 × 40 cm box with 16-cm walls, with a pool on the floor and one on a
-shelf 9 cm up the east wall, and lets 150 workers forage for forty
-minutes with the memo, memoized transits and the pipeline on:
+portals, each wall a slope; `Frame::lid` closes it with a ceiling
+folded out above the north wall and joined to the other three walls'
+tops; `Frame::slab` lays a flat nest module; `Frame::tube` runs a strip
+whose two long sides are joined round the back and whose ends are
+portals to the edges it connects; `Frame::wall` cuts a hole. Walls
+block sight: a landmark is seen only along a clear line, and the lens
+sees through portals, so the geodesic directness of a trip through a
+tube is measured along the tube. `cargo run --release --example frame`
+builds a slab nest joined by a 32-cm tube through a hole at the foot of
+the west wall of a 56 × 40 cm box with 16-cm walls, with a pool on the
+floor and one on a shelf 9 cm up the east wall, and lets 150 workers
+forage for forty minutes with the memo, memoized transits and the
+pipeline on, with fluon on the top two rows of the walls, or with a lid
+(`frame lid`):
 
 ```
-after 10 min: delivered 7, taken 20 µl from the floor pool and 16 µl from the shelf, 109 outside, mean height 6.5 cm
-after 20 min: delivered 26, taken 38 µl from the floor pool and 28 µl from the shelf, 121 outside, mean height 12.1 cm
-after 40 min: delivered 43, taken 45 µl from the floor pool and 30 µl from the shelf, 125 outside, mean height 13.2 cm
-ants per region: floor 3, north wall 32, east wall 17, south wall 34, west wall 26, slab 11, tube 2
+fluon rim:  after 40 min: delivered 100, taken 69 µl from the floor pool and 17 µl from the shelf, 4677 falls, 118 outside, mean height 2.3 cm
+            ants per region: floor 15, north wall 16, east wall 1, south wall 9, west wall 16, slab 32, tube 29
+lid:        after 40 min: delivered 78, taken 53 µl from the floor pool and 27 µl from the shelf, 69 falls, 116 outside, mean height 7.3 cm
+            ants per region: floor 26, north wall 8, east wall 11, south wall 14, west wall 8, slab 20, lid 22, tube 7
+neither:    after 40 min: delivered 43, taken 45 µl from the floor pool and 30 µl from the shelf, 125 outside, mean height 13.2 cm
+            ants per region: floor 3, north wall 32, east wall 17, south wall 34, west wall 26, slab 11, tube 2
 ```
 
 The ants find the tube, come out on the floor, climb every wall and
 reach the shelf; the trail runs through the tube, across the floor and
-up the east wall, and the heaviest marking lies along the rims of the
-walls, where searching ants turned back by the edge of the net walk
-along it, as they do along the barrier of a real box. What is
-simplified: a surface is flat within a region and folds only at the
-edges the builder joins; there is no gravity beyond a slope's slowing,
-no falling and no lid; the lens does not see through portals (a route
-through one falls back to the straight line), and transits are not
-memoized in the nodes that hold one.
+up the east wall. With neither fluon nor lid, searching ants turned
+back by the rim of a wall walk along it, and the colony spends its
+foragers up there; the fluon returns them to the floor (an ant a minute
+or so falls off the rim, for they keep climbing to it, as ants do at
+the barrier of a real box) and the colony delivers more than twice as
+much; a lid gives them a ceiling to walk over, from which a laden ant
+falls now and then. What is simplified: a surface is flat within a
+region and folds only at the edges the builder joins (a cylinder is a
+tube, a sphere has no net); a fall costs a stun and not an injury; and
+path integration runs along the surface, where desert ants on hills are
+known to integrate the ground distance instead (Wohlgemuth, Ronacher &
+Wehner 2001), which on the walls of a box is the distance that matters
+to a walker anyway.
 
 ## Performance and scaling
 

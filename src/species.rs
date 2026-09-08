@@ -299,6 +299,8 @@ pub struct Species {
     /// inside move in short bouts between rests, far slower than a
     /// forager on a trail.
     pub nest_speed_cm_s: f64,
+    /// Seconds an ant lies stunned after a fall.
+    pub fall_stun_s: f64,
     /// Width of a worker's spatial fidelity zone, as a fraction of the
     /// nest's depth: zones are fuzzy and overlap (Sendova-Franks & Franks
     /// 1995, *Behav. Ecol. Sociobiol.* 36:269).
@@ -516,6 +518,7 @@ impl Species {
             nursing_bout_s: 300.0,
             brood_per_nurse: 5.0,
             nest_speed_cm_s: 0.5,
+            fall_stun_s: 3.0,
             zone_spread: 0.15,
             callow_depth: 0.1,
             brood_depth: 0.5,

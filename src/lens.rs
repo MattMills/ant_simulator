@@ -103,24 +103,52 @@ pub struct Geodesic {
     pub cost: f64,
     /// Leaves the path crossed.
     pub leaves: usize,
+    /// The hops (from `points[i]` to `points[i + 1]`) that pass through a
+    /// portal, a cell apart in space however far apart on the net.
+    pub jumps: Vec<usize>,
 }
 
 impl Geodesic {
-    /// Length of the route, cells.
+    /// Length of the route, cells: a hop through a portal counts one.
     pub fn length(&self) -> f64 {
-        self.points.windows(2).map(|w| w[0].distance(w[1])).sum()
+        self.points
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                if self.jumps.contains(&i) {
+                    1.0
+                } else {
+                    w[0].distance(w[1])
+                }
+            })
+            .sum()
     }
 
     /// Pull the route straight: skip every point that a clear line of
-    /// sight makes unnecessary.
+    /// sight makes unnecessary, never across a portal.
     pub fn pull(&mut self, passable: impl Fn(Point, Point) -> bool) {
         if self.points.len() < 3 {
             return;
         }
         let mut kept = vec![self.points[0]];
+        let mut jumps = Vec::new();
         let mut i = 0;
         while i + 1 < self.points.len() {
-            let mut j = self.points.len() - 1;
+            if self.jumps.contains(&i) {
+                // The hop through the portal stays as it is.
+                jumps.push(kept.len() - 1);
+                kept.push(self.points[i + 1]);
+                i += 1;
+                continue;
+            }
+            let stop = self
+                .jumps
+                .iter()
+                .filter(|&&m| m > i)
+                .min()
+                .copied()
+                .unwrap_or(self.points.len() - 1);
+            let mut j = stop;
             while j > i + 1 && !passable(self.points[i], self.points[j]) {
                 j -= 1;
             }
@@ -128,6 +156,7 @@ impl Geodesic {
             i = j;
         }
         self.points = kept;
+        self.jumps = jumps;
     }
 }
 
@@ -143,6 +172,8 @@ pub struct Lens {
     /// Per leaf, its neighbours across a side and the length of the side
     /// shared.
     adjacency: Vec<Vec<(usize, f64)>>,
+    /// Pairs of leaves joined through a portal.
+    jumps: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Lens {
@@ -256,6 +287,23 @@ impl Lens {
             leaves,
             index,
             adjacency,
+            jumps: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Join the leaves holding the cells of each pair, as a portal joins
+    /// them: a hop between them costs one cell.
+    pub fn join(&mut self, pairs: &[(Position, Position)]) {
+        for &(pa, pb) in pairs {
+            let (Some(la), Some(lb)) = (self.leaf_of(pa), self.leaf_of(pb)) else {
+                continue;
+            };
+            if la == lb || self.adjacency[la].iter().any(|&(n, _)| n == lb) {
+                continue;
+            }
+            self.adjacency[la].push((lb, 1.0));
+            self.adjacency[lb].push((la, 1.0));
+            self.jumps.insert((la.min(lb), la.max(lb)));
         }
     }
 
@@ -342,7 +390,12 @@ impl Lens {
                     continue;
                 }
                 let cj = self.leaves[j].centre();
-                let step = ci.distance(cj) * 0.5 * (self.leaves[i].cost + self.leaves[j].cost);
+                let apart = if self.jumps.contains(&(i.min(j), i.max(j))) {
+                    1.0
+                } else {
+                    ci.distance(cj)
+                };
+                let step = apart * 0.5 * (self.leaves[i].cost + self.leaves[j].cost);
                 let nd = d + step;
                 if nd < dist[j] {
                     dist[j] = nd;
@@ -366,14 +419,18 @@ impl Lens {
         for &i in &path[1..path.len().saturating_sub(1)] {
             points.push(self.leaves[i].centre());
         }
-        if path.len() == 1 {
-            // Both ends in one leaf.
-        }
         points.push(self.b);
+        let jumps = path
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| self.jumps.contains(&(w[0].min(w[1]), w[0].max(w[1]))))
+            .map(|(k, _)| k)
+            .collect();
         Some(Geodesic {
             points,
             cost: dist[goal],
             leaves: path.len(),
+            jumps,
         })
     }
 
@@ -441,7 +498,8 @@ impl Lens {
 /// straight where the line of sight is clear.
 pub fn geodesic(world: &crate::world::World, a: Point, b: Point, radius: f64) -> Option<Geodesic> {
     let tree = QuadTree::<()>::new(world.width(), world.height());
-    let lens = Lens::new(&tree, a, b, radius, |key, rect| world.ground(key, rect));
+    let mut lens = Lens::new(&tree, a, b, radius, |key, rect| world.ground(key, rect));
+    lens.join(&world.portal_cell_pairs());
     let mut r = lens.geodesic()?;
     r.pull(|p, q| world.segment_passable(p, q));
     Some(r)
@@ -520,6 +578,67 @@ mod tests {
         assert!(
             (pulled.length() - a.distance(b)).abs() < 1e-9,
             "pulled straight in the open"
+        );
+    }
+
+    #[test]
+    fn the_geodesic_passes_through_portals() {
+        use crate::world::{Edge, Portal, Side};
+        // Two regions with twelve cells of wall between, joined by a
+        // portal: the route goes through it, a cell wide, and is the
+        // same from either end; without the portal there is no route.
+        let regions = vec![
+            Rect::new(Position::new(0, 0), Position::new(15, 39)),
+            Rect::new(Position::new(28, 0), Position::new(39, 39)),
+        ];
+        let portal = Portal {
+            a: Edge {
+                start: Position::new(15, 0),
+                end: Position::new(15, 39),
+                side: Side::East,
+            },
+            b: Edge {
+                start: Position::new(28, 0),
+                end: Position::new(28, 39),
+                side: Side::West,
+            },
+        };
+        let make = |portals: Vec<Portal>| {
+            World::new(
+                WorldConfig {
+                    width: 40,
+                    height: 40,
+                    nest: Position::new(4, 20),
+                    random_food: None,
+                    open: regions.clone(),
+                    portals,
+                    ..WorldConfig::default()
+                },
+                &mut Rng::seed_from_u64(1),
+            )
+        };
+        let a = Point::new(4.5, 20.5);
+        let b = Point::new(35.5, 20.5);
+        let joined = make(vec![portal]);
+        let there = geodesic(&joined, a, b, 2.0).expect("through the portal");
+        assert_eq!(
+            there.jumps.len(),
+            1,
+            "one hop through the portal: {there:?}"
+        );
+        // From a to the last cell before the edge (11 cells), one across,
+        // and on from the first cell beyond to b (7).
+        let expected = (15.5 - 4.5) + 1.0 + (35.5 - 28.5);
+        assert!(
+            (there.length() - expected).abs() < 1.0,
+            "{} vs {expected}",
+            there.length()
+        );
+        let back = geodesic(&joined, b, a, 2.0).expect("and back");
+        assert!((there.length() - back.length()).abs() < 1e-6);
+        assert!(
+            geodesic(&make(Vec::new()), a, b, 2.0).is_none(),
+            "no way without it"
         );
     }
 
