@@ -333,6 +333,14 @@ pub struct World {
     config: WorldConfig,
     cells: Vec<Cell>,
     scratch: Vec<[f64; Pheromone::COUNT]>,
+    /// Whether any cell carries the channel (empty channels are skipped
+    /// by the kinetics and by perception).
+    present: [bool; Pheromone::COUNT],
+    /// Whether the grid has any wall (open worlds skip clearance sweeps).
+    has_walls: bool,
+    /// Indices of the cells that carry or renew food, the only ones the
+    /// food kinetics visit.
+    food_cells: Vec<usize>,
     landmarks: Vec<Position>,
     params: PheromoneSet,
     base_retention: [f64; Pheromone::COUNT],
@@ -377,6 +385,9 @@ impl World {
         let mut world = World {
             cells: vec![Cell::default(); n],
             scratch: vec![[0.0; Pheromone::COUNT]; n],
+            present: [false; Pheromone::COUNT],
+            has_walls: false,
+            food_cells: Vec::new(),
             landmarks: config.landmarks.clone(),
             params,
             base_retention: retention,
@@ -387,6 +398,7 @@ impl World {
             config,
         };
         world.lay_terrain();
+        world.has_walls = world.cells.iter().any(|c| c.terrain == Terrain::Wall);
         let sources = world.config.food_sources.clone();
         for src in &sources {
             world.place_food(src);
@@ -543,6 +555,28 @@ impl World {
                 }
             }
         }
+        self.refresh_food_cells();
+    }
+
+    /// Recollect the cells that carry or renew food.
+    fn refresh_food_cells(&mut self) {
+        self.food_cells = self
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.has_food() || c.renewal_ul_per_s > 0.0 || c.food_capacity_ul > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// Whether any cell carries the channel.
+    pub fn channel_present(&self, kind: Pheromone) -> bool {
+        self.present[kind.index()]
+    }
+
+    /// Whether the grid has any wall.
+    pub fn has_walls(&self) -> bool {
+        self.has_walls
     }
 
     /// Refill renewing sources by one tick and let food give off its
@@ -553,16 +587,24 @@ impl World {
         let tick_s = self.config.tick_s;
         let cap = self.params[Pheromone::Odour.index()].cap;
         let active = self.retention[Pheromone::Odour.index()] > 0.0;
-        for c in self.cells.iter_mut() {
+        let mut emitted = false;
+        for &i in &self.food_cells {
+            let c = &mut self.cells[i];
             if c.renewal_ul_per_s > 0.0 && c.food_ul < c.food_capacity_ul {
                 c.food_ul = (c.food_ul + c.renewal_ul_per_s * tick_s).min(c.food_capacity_ul);
             }
             if active && c.has_food() {
                 let emission =
                     odour_per_ul_s * c.food_ul.min(5.0) + odour_per_mg_s * c.prey_mg.min(30.0);
-                let slot = &mut c.pheromone[Pheromone::Odour.index()];
-                *slot = (*slot + emission * tick_s).min(cap);
+                if emission > 0.0 {
+                    let slot = &mut c.pheromone[Pheromone::Odour.index()];
+                    *slot = (*slot + emission * tick_s).min(cap);
+                    emitted = true;
+                }
             }
+        }
+        if emitted {
+            self.present[Pheromone::Odour.index()] = true;
         }
     }
 
@@ -760,6 +802,11 @@ impl World {
     /// clearance is checked every quarter cell along it, so walls cannot be
     /// clipped and corners cannot be cut.
     pub fn segment_passable(&self, a: Point, b: Point) -> bool {
+        if !self.has_walls {
+            // Only the edge of the grid can stop a body in an open world,
+            // and the grid is convex: the far end decides.
+            return self.has_clearance(b);
+        }
         let len = a.distance(b);
         let samples = (len / 0.25).ceil().max(1.0) as usize;
         for i in 1..=samples {
@@ -851,6 +898,7 @@ impl World {
         if let Some(c) = self.cell_mut(p) {
             let v = &mut c.pheromone[kind.index()];
             *v = (*v + amount).min(cap);
+            self.present[kind.index()] = true;
         }
     }
 
@@ -927,12 +975,19 @@ impl World {
     pub fn step_pheromones(&mut self) {
         let w = self.config.width as i32;
         let h = self.config.height as i32;
-        for s in self.scratch.iter_mut() {
-            *s = [0.0; Pheromone::COUNT];
-        }
+        // Only channels that carry something somewhere are stepped; a
+        // cell counts as empty below a millionth of a unit.
         let active: Vec<usize> = (0..Pheromone::COUNT)
-            .filter(|&k| self.retention[k] > 0.0)
+            .filter(|&k| self.retention[k] > 0.0 && self.present[k])
             .collect();
+        if active.is_empty() {
+            return;
+        }
+        for s in self.scratch.iter_mut() {
+            for &k in &active {
+                s[k] = 0.0;
+            }
+        }
         for y in 0..h {
             for x in 0..w {
                 let idx = y as usize * w as usize + x as usize;
@@ -971,10 +1026,23 @@ impl World {
                 }
             }
         }
+        let mut present = [false; Pheromone::COUNT];
         for (cell, s) in self.cells.iter_mut().zip(self.scratch.iter()) {
-            for ((slot, &v), params) in cell.pheromone.iter_mut().zip(s).zip(self.params.iter()) {
-                *slot = if v < 1e-6 { 0.0 } else { v.min(params.cap) };
+            for &k in &active {
+                let v = s[k];
+                let value = if v < 1e-6 {
+                    0.0
+                } else {
+                    v.min(self.params[k].cap)
+                };
+                cell.pheromone[k] = value;
+                if value > 0.0 {
+                    present[k] = true;
+                }
             }
+        }
+        for &k in &active {
+            self.present[k] = present[k];
         }
     }
 
@@ -1312,8 +1380,17 @@ mod tests {
 
     #[test]
     fn walls_block_diffusion() {
-        let mut rng = Rng::seed_from_u64(1);
-        let mut world = World::new(small_config(), &mut rng);
+        // A diffusive trail, so that one tick moves more than the cut
+        // below which a cell counts as empty.
+        let cfg = WorldConfig {
+            pheromones: Some({
+                let mut set = Species::lasius_niger().pheromones();
+                set[Pheromone::Trail.index()].diffusion_per_s = 0.05;
+                set
+            }),
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
         world.deposit(Position::new(8, 4), Pheromone::Trail, 10.0);
         world.step_pheromones();
         assert_eq!(world.level(Position::new(9, 4), Pheromone::Trail), 0.0);

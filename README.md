@@ -258,6 +258,7 @@ unit tests in `src/colony.rs` cover the trophallaxis and heat mechanisms.
 | Spatial fidelity zones and social groups (Sendova-Franks & Franks 1995; Mersch et al. 2013) | young workers with the brood, old by the entrance; contacts mostly within a group | `nest` example, 80 workers in a 7 × 7 nest, 30 min: brood chamber 31 workers of mean age 2.2 d (24 nursing), between 29 of 2.8 d, entrance ring 8 of 4.4 d; age–depth correlation 0.35; no food changes hands directly between the chamber and the ring |
 | Food dissemination (Greenwald et al. 2015) | foragers unload near the entrance and the food percolates inward | 2.0 mg handed on inside per milligram delivered; the chamber's crops as full as the entrance's (0.92 against 0.84) |
 | Undertaking | corpses inside are carried out | 3 corpses placed in the brood chamber are fetched from where they lie and carried out within 30 min |
+| Colony size at a single feeder (Beekman, Sumpter & Ratnieks 2001) | below a critical size a trail cannot be kept and foraging is disordered | trail alone: 5% of trips direct at 10 workers, 96% at 80, per-capita output ×2.4; with memory, 79–94% at any size (see the scale analysis) |
 
 Symmetry breaking on equal branches is a marginal instability, and getting
 it out of an individual-based model says a good deal about what real ants
@@ -386,6 +387,8 @@ cargo run --release --example arena       [turns] [period] [sucker]
 cargo run --release --example surface     [ticks] [seeds]
 cargo run --release --example hive        [epochs] [epoch_seconds]
 cargo run --release --example nest        [minutes]
+cargo run --release --example scale       [minutes]
+cargo bench                               [-- quick | phases]
 ```
 
 `colony` renders the world, compares the four species on one map, sweeps
@@ -395,7 +398,9 @@ rotation and evaluates the untouched instinct against the learned hierarchy
 on fresh episodes. `surface` explores the geometric entropy channels.
 `hive` runs the memory probe and the closed loop of the queen's mind.
 `nest` shows the nest interior: zones by age, food handed inward, and
-undertakers at work.
+undertakers at work. `scale` runs the scale analysis: foraging
+organisation against colony size and the hive's memory against colony
+size and grain. `cargo bench` runs the throughput scan (see below).
 
 ## The arena, turn by turn
 
@@ -452,6 +457,133 @@ and read back by linear readouts, and the colony it thinks through is
 kept foraging by a reserve drain standing for nestmates that are not
 simulated.
 
+## Scale analysis
+
+`cargo run --release --example scale` asks how the colony's behaviour
+changes with its size, and how the hive's memory depends on size and
+grain. Colonies of 10 to 640 workers forage at a single inexhaustible
+feeder 40 cm beyond a 12 cm entrance corridor (the feeder of Beekman,
+Sumpter & Ratnieks 2001), settle for 20 minutes and are measured over the
+next 20. *Ordered* is the share of outbound legs that reached the food no
+more than one and a half times the direct distance: guided rather than
+searched. With the trail the only way to the feeder (no route or site
+memory, no smell; *Monomorium pharaonis*):
+
+```
+  ants    loads  per ant/h  trail mid  ordered
+    10       18       5.40       0.16       5%
+    20       48       7.20       1.95      27%
+    40      110       8.25       4.07      50%
+    80      341      12.79      14.49      96%
+   160      601      11.27       2.82      85%
+   320      780       7.31      29.30      24%
+   640      815       3.82      32.14       9%
+```
+
+This is Beekman's transition: below a few dozen workers the returning
+foragers cannot lay trail faster than it evaporates (the mid-trail
+concentration sits below the perception constant), each forager searches
+for the feeder on its own, and one trip in twenty goes there directly;
+between 20 and 80 workers the trail takes hold and organises the traffic,
+so that per-capita output more than doubles and nearly every trip is
+direct. Beyond 320 workers the entrance corridor jams (Dussutour et al.
+2004), trips detour and per-capita output falls again. With individual
+navigation on, the same species forages as well at any size until the
+jam, and its output is proportional to its size rather than cooperative:
+
+```
+  ants    loads  per ant/h  trail mid  ordered      (Lasius niger: loads  per ant/h  ordered)
+    10       52      15.60       3.00      79%                       47      14.10      94%
+    40      218      16.35      12.01      91%                      192      14.40      94%
+    80      397      14.89      21.57      94%                      386      14.48      95%
+   160      701      13.14      32.65      91%                      712      13.35      93%
+   320      977       9.16      39.74      89%                     1061       9.95      91%
+   640     1226       5.75      44.57      10%                     1722       8.07      78%
+```
+
+Memory removes the size dependence that the trail alone has: a colony of
+ten forages by memory three times better than by trail, and gains
+nothing from growing except a jam. Over 10 to 640 workers the colony's
+output scales as N^0.96 by trail alone and as N^0.79 to N^0.87 by
+memory, sublinear because of the corridor.
+
+The hive's memory (the residual readout of the queen's thought, held-out
+R² by lag; 120 epochs of a minute after a 45-minute warm-up) grows with
+the colony and shrinks with the grain of the reading:
+
+```
+  ants  sector  multiscale   lag 1   lag 2   lag 3  capacity
+    25      16         yes    0.47    0.32    0.12      1.08
+    50      16         yes    0.71    0.24   -0.13      0.94
+   100      16         yes    0.75    0.41    0.24      1.46
+   200      16         yes    0.80    0.34    0.45      1.82
+   100       8         yes    0.88    0.16    0.34      1.49
+   100       8          no    0.87    0.26    0.37      1.60
+   100      32         yes    0.64    0.33    0.22      1.22
+   100      32          no    0.62    0.31    0.19      1.16
+```
+
+More workers write the thought into more movement, so the field carries
+it more faithfully and for longer; a finer grain reads the last epoch
+better (R² 0.88 at 8-cell sectors against 0.64 at 32), and the coarser
+grains above the sectors add little once the sectors are fine.
+
+## Performance and scaling
+
+Every simulation profiles its tick phase by phase (`Simulation::profile`),
+and `cargo bench` (a plain binary, so it runs on stable) sweeps colony
+size and world area with a hungry colony kept foraging, keeping the
+median of several runs and fitting the empirical exponent of the time per
+tick against each dimension. On one core of the development machine, 100
+*Lasius* workers on a 64 × 40 grid with the movement history and the queen
+on run at 3.7 thousand ticks per second, 2.7 µs per ant-tick, divided as:
+
+```
+phase           µs/tick   share
+decisions         134.5   49.8%
+ants               37.2   13.8%
+pheromones         92.7   34.3%
+food                0.5    0.2%
+nest                2.6    0.9%
+history             0.0    0.0%
+queen               2.6    1.0%
+```
+
+A movement decision (perceiving the ring of sixteen headings, scoring it,
+tempering it, selecting) costs about 3 µs, and a walking ant makes one per
+tick; the chemical kinetics cost about 35 ns per cell per tick for the
+three or four channels that carry something. Sweeping colony size on the
+same grid:
+
+```
+    ants   ticks/s  ant-ticks/s   ns/ant  decisions  pheromones
+      25      8907       222674     4491        27%         66%
+     100      4152       415169     2409        50%         36%
+     400      1282       512818     1950        63%         12%
+    1600       280       447555     2234        57%          3%
+```
+
+The decision phase is linear in the number of ants (exponent 1.02), the
+kinetics do not depend on it (0.06), and the cost per ant-tick is flat
+within 25% from 100 to 1600 workers. Sweeping the area at 100 workers:
+
+```
+   cells   ticks/s  ant-ticks/s   ns/ant  decisions  pheromones
+    1024      6117       611695     1635        57%         22%
+    4096      3086       308560     3241        49%         40%
+   16384      1527       152724     6548        25%         68%
+   65536       527        52743    18960        12%         84%
+```
+
+The kinetics are linear in the area (0.91) and dominate beyond ten
+thousand cells; the food kinetics visit only the cells that carry food,
+the movement history forgets lazily (a tick costs nothing), and the nest
+keeps its counts, so none of those grows with the grid or the colony.
+What remains is the sweep of the grid by the chemical channels, which
+cannot be made sparse without changing the dynamics (a trace below a
+millionth of a unit is dropped, and diffusion carries mass that small to
+every cell within an hour), and the decisions, which are the model.
+
 ## Reproducibility and tests
 
 Everything is driven by a single `u64` seed through the crate's own xoshiro
@@ -460,4 +592,5 @@ generator, so simulations, experiments, arenas and learners replay exactly.
 ```
 cargo test
 cargo clippy --all-targets
+cargo bench -- quick
 ```

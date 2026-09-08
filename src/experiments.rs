@@ -13,6 +13,12 @@
 //!   satiation (Mailleux, Deneubourg & Detrain 2003).
 //! * [`run_division_of_labor`]: specialisation with and without response
 //!   threshold reinforcement (Theraulaz, Bonabeau & Deneubourg 1998).
+//! * [`run_colony_size_scan`]: foraging organisation against colony size
+//!   (Beekman, Sumpter & Ratnieks 2001): below a critical size a colony
+//!   cannot keep a trail against evaporation and forages by individual
+//!   search; above it, foraging is organised along the trail.
+//! * [`run_memory_scaling`]: the hive's memory capacity against colony
+//!   size and against the grain of the reading.
 //! * [`run_memory_probe`] and [`run_closed_loop`]: the hive's cognitive
 //!   geometry. A queen writes random thoughts into an entropy dial of a
 //!   colony kept foraging for hours; readouts of the movement history
@@ -889,6 +895,233 @@ pub fn run_division_of_labor(
         with_reinforcement: run(species.clone()),
         without_reinforcement: run(frozen),
     }
+}
+
+/// The single feeder of Beekman, Sumpter & Ratnieks 2001: a nest whose
+/// one entrance is a corridor `stem` cells long opening into an arena,
+/// with an inexhaustible pool of 1 M solution `distance` cells beyond the
+/// corridor's mouth. Every forager leaves and returns through the
+/// corridor, where the trail, if there is one, lies.
+pub fn single_feeder(stem: i32, distance: i32) -> WorldConfig {
+    let margin = 6;
+    let height = (2 * margin + distance + 3) as usize;
+    let nest = Position::new(2, height as i32 / 2);
+    let mouth = nest.x + 2 + stem;
+    let width = (mouth + distance + margin + 1) as usize;
+    WorldConfig {
+        width,
+        height,
+        nest,
+        nest_radius: 1,
+        open: vec![
+            Rect::new(
+                Position::new(nest.x - 1, nest.y - 1),
+                Position::new(nest.x + 1, nest.y + 1),
+            ),
+            Rect::new(
+                Position::new(nest.x + 2, nest.y),
+                Position::new(mouth - 1, nest.y),
+            ),
+            Rect::new(
+                Position::new(mouth, 0),
+                Position::new(width as i32 - 1, height as i32 - 1),
+            ),
+        ],
+        food_sources: vec![FoodSource::pool(
+            Position::new(mouth + distance, nest.y),
+            1,
+            1.0e6,
+            1.0,
+        )],
+        random_food: None,
+        ..WorldConfig::default()
+    }
+}
+
+/// Take a colony's individual navigation away, so that the trail is the
+/// only way to a source (the world of Beekman, Sumpter & Ratnieks 2001):
+/// no route memory, no memory of a site between trips, no smell of
+/// food. Path integration still brings a forager home, and the trail
+/// still evaporates at the species' rate.
+pub fn trail_only(cfg: &mut SimConfig) {
+    cfg.species.route_capacity = 0;
+    cfg.species.fidelity_quality_half = f64::INFINITY;
+    cfg.species.food_odour = crate::pheromone::PheromoneParams::inert();
+    for f in [F_ROUTE, F_ODOUR] {
+        cfg.instinct.weights[f] = 0.0;
+        cfg.instinct.weights[BASE_FEATURES + f] = 0.0;
+    }
+}
+
+/// Foraging at one colony size, measured over a window after the colony
+/// has settled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SizeOutcome {
+    /// Simulated workers.
+    pub ants: usize,
+    /// Loads delivered in the window.
+    pub delivered: u64,
+    /// Trips that came home empty in the window.
+    pub failed_trips: u64,
+    /// Share of trips that brought food home: the order of the foraging
+    /// (individual search fails often; a trail hardly ever).
+    pub success: f64,
+    /// Loads per worker per hour.
+    pub per_capita_per_hour: f64,
+    /// Share of ant-time spent outside.
+    pub outside_fraction: f64,
+    /// Trail concentration halfway between the corridor's mouth and the
+    /// feeder at the end, in units of the perception constant.
+    pub trail_mid: f64,
+    /// Mean direct distance over path length of the trips: one for
+    /// straight trips, small for wandering ones.
+    pub directness: f64,
+    /// Share of the outbound legs that reached the food no more than one
+    /// and a half times the direct distance: the ordered foraging, guided
+    /// by a trail or a memory rather than by search.
+    pub ordered: f64,
+}
+
+/// The colony-size scan: colonies of several sizes at a single feeder,
+/// each settled and then measured over a window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SizeScan {
+    /// The species.
+    pub species: Species,
+    /// Colony sizes to run.
+    pub sizes: Vec<usize>,
+    /// Length of the entrance corridor, cells.
+    pub stem: i32,
+    /// Distance from the corridor's mouth to the feeder, cells.
+    pub distance: i32,
+    /// Time the colony is given to settle before measuring, seconds.
+    pub settle_s: f64,
+    /// The measurement window, seconds.
+    pub window_s: f64,
+    /// Seed of the runs.
+    pub seed: u64,
+    /// Whether the colony has no individual navigation to the feeder
+    /// (see [`trail_only`]).
+    pub trail_only: bool,
+}
+
+impl Default for SizeScan {
+    fn default() -> Self {
+        SizeScan {
+            species: Species::pharaoh(),
+            sizes: vec![10, 20, 40, 80, 160, 320, 640],
+            stem: 6,
+            distance: 20,
+            settle_s: 20.0 * 60.0,
+            window_s: 20.0 * 60.0,
+            seed: 3,
+            trail_only: true,
+        }
+    }
+}
+
+/// Run a colony-size scan.
+pub fn run_colony_size_scan(scan: &SizeScan) -> Vec<SizeOutcome> {
+    scan.sizes
+        .iter()
+        .map(|&ants| {
+            let world = single_feeder(scan.stem, scan.distance);
+            let nest = world.nest;
+            let mid = Position::new(nest.x + 2 + scan.stem + scan.distance / 2, nest.y);
+            let mut cfg = experiment_config(scan.species.clone(), world, ants);
+            cfg.nest.max_ants = cfg.nest.max_ants.max(ants);
+            if scan.trail_only {
+                trail_only(&mut cfg);
+            }
+            let mut sim = Simulation::new(cfg, scan.seed);
+            sim.run_seconds(scan.settle_s);
+            sim.reset_stats();
+            sim.run_seconds(scan.window_s);
+            let s = sim.stats();
+            let trips = s.food_delivered + s.failed_trips;
+            let k = sim.world().channel(Pheromone::Trail).k.max(1e-9);
+            let hours = scan.window_s / 3600.0;
+            SizeOutcome {
+                ants,
+                delivered: s.food_delivered,
+                failed_trips: s.failed_trips,
+                success: if trips == 0 {
+                    0.0
+                } else {
+                    s.food_delivered as f64 / trips as f64
+                },
+                per_capita_per_hour: s.food_delivered as f64 / (ants as f64 * hours).max(1e-9),
+                outside_fraction: s.foraging_fraction(),
+                trail_mid: sim.world().level(mid, Pheromone::Trail) / k,
+                directness: if s.path.trip_length > 0.0 {
+                    s.path.trip_direct / s.path.trip_length
+                } else {
+                    0.0
+                },
+                ordered: s.path.ordered_fraction(),
+            }
+        })
+        .collect()
+}
+
+/// The hive's memory at one colony size and grain of reading.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryScaleOutcome {
+    /// Simulated workers.
+    pub ants: usize,
+    /// Cells per sector side of the reading.
+    pub sector: usize,
+    /// Whether the reading was multi-scale.
+    pub multiscale: bool,
+    /// Memory capacity of the residual component.
+    pub residual: Capacity,
+    /// Held-out R² of the residual readout at lag 1.
+    pub lag1: f64,
+    /// Correlation of the thought with the residual straightness of the
+    /// whole field.
+    pub straightness_correlation: f64,
+}
+
+/// Run the memory probe at each colony size (at the base sector, multi-
+/// scale) and at each sector size (at the base colony, multi-scale and
+/// sector-only).
+pub fn run_memory_scaling(
+    base: &MemoryProbeConfig,
+    sizes: &[usize],
+    sectors: &[usize],
+) -> Vec<MemoryScaleOutcome> {
+    let mut out = Vec::new();
+    let one = |cfg: MemoryProbeConfig| {
+        let probe = run_memory_probe(&cfg);
+        let residual = probe.capacities[1].clone();
+        MemoryScaleOutcome {
+            ants: cfg.ants,
+            sector: cfg.history.sector,
+            multiscale: cfg.history.multiscale,
+            lag1: residual.by_lag.first().copied().unwrap_or(0.0),
+            residual,
+            straightness_correlation: probe.straightness_correlation,
+        }
+    };
+    for &ants in sizes {
+        out.push(one(MemoryProbeConfig {
+            ants,
+            ..base.clone()
+        }));
+    }
+    for &sector in sectors {
+        for multiscale in [true, false] {
+            out.push(one(MemoryProbeConfig {
+                history: HistoryConfig {
+                    sector,
+                    multiscale,
+                    ..base.history.clone()
+                },
+                ..base.clone()
+            }));
+        }
+    }
+    out
 }
 
 /// Pearson correlation of two series.

@@ -406,3 +406,46 @@ fn queen_thoughts_are_written_into_the_non_invariant_flow() {
         "recall drives a thought: {closed:?}"
     );
 }
+
+#[test]
+fn trail_foraging_is_cooperative_while_memory_foraging_is_proportional() {
+    // Beekman, Sumpter & Ratnieks 2001: a colony that reaches its feeder
+    // by trail alone forages poorly when small and well when large, as
+    // the trail's reinforcement outgrows its evaporation; a colony whose
+    // foragers navigate by memory forages as well at any size.
+    let scan = SizeScan {
+        sizes: vec![10, 80],
+        ..SizeScan::default()
+    };
+    let by_trail = run_colony_size_scan(&scan);
+    let by_memory = run_colony_size_scan(&SizeScan {
+        trail_only: false,
+        ..scan
+    });
+    assert!(
+        by_trail[1].per_capita_per_hour > 1.5 * by_trail[0].per_capita_per_hour,
+        "trail foraging gains with size: {:?}",
+        by_trail
+    );
+    assert!(
+        by_trail[1].trail_mid > 5.0 * by_trail[0].trail_mid,
+        "the large colony keeps a trail: {:?}",
+        by_trail
+    );
+    assert!(
+        by_trail[1].ordered > by_trail[0].ordered,
+        "and its trips are ordered: {:?}",
+        by_trail
+    );
+    assert!(
+        by_memory[1].per_capita_per_hour < 1.5 * by_memory[0].per_capita_per_hour,
+        "memory foraging does not: {:?}",
+        by_memory
+    );
+    assert!(
+        by_memory[0].per_capita_per_hour > by_trail[0].per_capita_per_hour,
+        "a small colony forages far better by memory than by trail: {:?} vs {:?}",
+        by_memory[0],
+        by_trail[0]
+    );
+}

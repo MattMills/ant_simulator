@@ -10,5 +10,9 @@ categories = ["simulation", "science"]
 
 [dependencies]
 
+[[bench]]
+name = "scale"
+harness = false
+
 [profile.release]
 opt-level = 3

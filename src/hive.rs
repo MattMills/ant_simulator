@@ -93,13 +93,13 @@ impl Flow {
         self.straight += turn_cos * w;
     }
 
-    fn decay(&mut self, r: f64) {
-        self.weight *= r;
-        self.vx *= r;
-        self.vy *= r;
-        self.cx *= r;
-        self.sx *= r;
-        self.straight *= r;
+    fn scale_in_place(&mut self, k: f64) {
+        self.weight *= k;
+        self.vx *= k;
+        self.vy *= k;
+        self.cx *= k;
+        self.sx *= k;
+        self.straight *= k;
     }
 
     fn scaled(self, k: f64) -> Flow {
@@ -211,6 +211,12 @@ pub struct MovementHistory {
     coarse_fast: Vec<Flow>,
     slow_r: f64,
     fast_r: f64,
+    /// Forgetting is lazy: the accumulators store values divided by the
+    /// running decay factor, so that a tick costs nothing and a value is
+    /// read back as stored × factor. The factor is renormalised into the
+    /// stores before it underflows.
+    slow_g: f64,
+    fast_g: f64,
     cfg: HistoryConfig,
     /// Moves recorded so far.
     pub moves: u64,
@@ -241,9 +247,24 @@ impl MovementHistory {
             coarse_fast: vec![Flow::default(); cols * rows],
             slow_r: retention(cfg.slow_half_life_s),
             fast_r: retention(cfg.fast_half_life_s),
+            slow_g: 1.0,
+            fast_g: 1.0,
             cfg,
             moves: 0,
         }
+    }
+
+    /// Fold the running decay factors into the stores.
+    fn renormalise(&mut self) {
+        let (sg, fg) = (self.slow_g, self.fast_g);
+        for f in self.fine_slow.iter_mut().chain(self.coarse_slow.iter_mut()) {
+            f.scale_in_place(sg);
+        }
+        for f in self.fine_fast.iter_mut().chain(self.coarse_fast.iter_mut()) {
+            f.scale_in_place(fg);
+        }
+        self.slow_g = 1.0;
+        self.fast_g = 1.0;
     }
 
     /// Sectors across and down.
@@ -291,31 +312,36 @@ impl MovementHistory {
         let (ux, uy) = (dx / len, dy / len);
         let turn_cos = turn.cos();
         let cell = to.cell();
+        // Stored at the current scale of each accumulator; a dead
+        // accumulator (no half-life) keeps nothing.
+        let ws = if self.slow_r > 0.0 {
+            len / self.slow_g
+        } else {
+            0.0
+        };
+        let wf = if self.fast_r > 0.0 {
+            len / self.fast_g
+        } else {
+            0.0
+        };
         if let Some(i) = self.cell_index(cell) {
-            self.fine_slow[i].add(ux, uy, turn_cos, len);
-            self.fine_fast[i].add(ux, uy, turn_cos, len);
+            self.fine_slow[i].add(ux, uy, turn_cos, ws);
+            self.fine_fast[i].add(ux, uy, turn_cos, wf);
         }
         if let Some(s) = self.sector_of(cell) {
-            self.coarse_slow[s].add(ux, uy, turn_cos, len);
-            self.coarse_fast[s].add(ux, uy, turn_cos, len);
+            self.coarse_slow[s].add(ux, uy, turn_cos, ws);
+            self.coarse_fast[s].add(ux, uy, turn_cos, wf);
         }
         self.moves += 1;
     }
 
-    /// Let one tick pass: both accumulators forget.
+    /// Let one tick pass: both accumulators forget (lazily, by advancing
+    /// their decay factors).
     pub fn step(&mut self) {
-        let (sr, fr) = (self.slow_r, self.fast_r);
-        for f in self.fine_slow.iter_mut() {
-            f.decay(sr);
-        }
-        for f in self.fine_fast.iter_mut() {
-            f.decay(fr);
-        }
-        for f in self.coarse_slow.iter_mut() {
-            f.decay(sr);
-        }
-        for f in self.coarse_fast.iter_mut() {
-            f.decay(fr);
+        self.slow_g *= self.slow_r;
+        self.fast_g *= self.fast_r;
+        if self.slow_g < 1e-150 || self.fast_g < 1e-150 {
+            self.renormalise();
         }
     }
 
@@ -340,12 +366,12 @@ impl MovementHistory {
 
     /// The invariant flow through a sector, as a steady rate per tick.
     pub fn invariant(&self, sector: usize) -> Flow {
-        self.coarse_slow[sector].scaled(self.slow_norm())
+        self.coarse_slow[sector].scaled(self.slow_g * self.slow_norm())
     }
 
     /// The current flow through a sector, as a rate per tick.
     pub fn current(&self, sector: usize) -> Flow {
-        self.coarse_fast[sector].scaled(self.fast_norm())
+        self.coarse_fast[sector].scaled(self.fast_g * self.fast_norm())
     }
 
     /// The invariant flow over the whole field, as a steady rate per tick.
@@ -359,7 +385,7 @@ impl MovementHistory {
             whole.sx += f.sx;
             whole.straight += f.straight;
         }
-        whole.scaled(self.slow_norm())
+        whole.scaled(self.slow_g * self.slow_norm())
     }
 
     /// The current flow over the whole field, as a rate per tick.
@@ -373,7 +399,7 @@ impl MovementHistory {
             whole.sx += f.sx;
             whole.straight += f.straight;
         }
-        whole.scaled(self.fast_norm())
+        whole.scaled(self.fast_g * self.fast_norm())
     }
 
     /// The non-invariant residual of a sector: the current density minus
@@ -390,14 +416,14 @@ impl MovementHistory {
     /// The invariant flow through a cell, as a steady rate per tick.
     pub fn fine_invariant(&self, cell: Position) -> Flow {
         self.cell_index(cell)
-            .map(|i| self.fine_slow[i].scaled(self.slow_norm()))
+            .map(|i| self.fine_slow[i].scaled(self.slow_g * self.slow_norm()))
             .unwrap_or_default()
     }
 
     /// The current flow through a cell, as a rate per tick.
     pub fn fine_current(&self, cell: Position) -> Flow {
         self.cell_index(cell)
-            .map(|i| self.fine_fast[i].scaled(self.fast_norm()))
+            .map(|i| self.fine_fast[i].scaled(self.fast_g * self.fast_norm()))
             .unwrap_or_default()
     }
 
@@ -449,9 +475,9 @@ impl MovementHistory {
         slow: bool,
     ) -> [f64; Self::READING] {
         let (norm, fine) = if slow {
-            (self.slow_norm(), &self.fine_slow)
+            (self.slow_g * self.slow_norm(), &self.fine_slow)
         } else {
-            (self.fast_norm(), &self.fine_fast)
+            (self.fast_g * self.fast_norm(), &self.fine_fast)
         };
         let (x0, y0, x1, y1) = block;
         let (mut align, mut nematic) = (0.0, 0.0);
@@ -513,7 +539,7 @@ impl MovementHistory {
     /// other cells that channels enclose (regions not reaching the edge
     /// of the world).
     pub fn topology(&self) -> Topology {
-        let norm = self.slow_norm();
+        let norm = self.slow_g * self.slow_norm();
         let channel: Vec<bool> = self
             .fine_slow
             .iter()
@@ -697,7 +723,7 @@ impl MovementHistory {
     /// by the glyph of their flow, other cells with some steady flow as a
     /// dot, the rest blank.
     pub fn render_skeleton(&self) -> String {
-        let norm = self.slow_norm();
+        let norm = self.slow_g * self.slow_norm();
         let mut out = String::with_capacity((self.width + 1) * self.height);
         for y in 0..self.height {
             for x in 0..self.width {
@@ -1220,7 +1246,7 @@ mod tests {
         assert!((f.alignment() - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
         let (mx, my) = f.mean();
         assert!((mx - 0.5).abs() < 1e-12 && (my - 0.5).abs() < 1e-12);
-        f.decay(0.5);
+        f.scale_in_place(0.5);
         assert!((f.weight - 1.0).abs() < 1e-12);
         assert_eq!(Flow::default().alignment(), 0.0);
         // Two-way traffic along one line: no polar alignment, full axial order.

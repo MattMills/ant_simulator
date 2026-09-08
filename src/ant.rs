@@ -11,7 +11,7 @@
 //! familiar places (route memory: Collett & Collett 2002), and carries
 //! individual response thresholds (Bonabeau et al. 1996).
 
-use crate::geometry::{cosine_heading_to, Point, Position};
+use crate::geometry::{Point, Position};
 use crate::landscape::{ring_heading, turn_magnitude, RING, RING_STEP};
 use crate::pheromone::{perceived, Pheromone};
 use crate::rng::Rng;
@@ -695,13 +695,6 @@ impl Observation {
     }
 }
 
-fn cosine(heading: f64, v: Option<(f64, f64)>) -> f64 {
-    match v {
-        Some((x, y)) => cosine_heading_to(heading, x, y),
-        None => 0.0,
-    }
-}
-
 /// Heading persistence of a ring position: a quadratic turning cost,
 /// `1 - (turn / 90°)²`, which agrees with the cosine for moderate turns
 /// (1 straight ahead, 0 at a right angle) but charges a reversal three
@@ -745,35 +738,71 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
     });
     let offset = mode.offset();
     let step = step.max(1e-6);
+    // The believed directions with their lengths, taken once for the ring.
+    let with_len = |v: Option<(f64, f64)>| {
+        v.and_then(|(dx, dy)| {
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-12 {
+                None
+            } else {
+                Some((dx, dy, len))
+            }
+        })
+    };
+    let nest_vec = with_len(nest_dir);
+    let site_vec = with_len(site_dir);
+    let route_vec = route_dir.and_then(|(v, w)| with_len(Some(v)).map(|u| (u, w)));
+    let channels = [
+        (F_TRAIL, Pheromone::Trail),
+        (F_HOME, Pheromone::Home),
+        (F_TERRITORY, Pheromone::Territory),
+        (F_NO_ENTRY, Pheromone::NoEntry),
+        (F_ALARM, Pheromone::Alarm),
+        (F_ODOUR, Pheromone::Odour),
+    ];
     for k in 0..RING {
         let heading = ring_heading(k, ant.heading);
-        let target = ant.position.advanced(heading, step);
+        let (sin, cos) = heading.sin_cos();
+        let along = |d: f64| Point::new(ant.position.x + d * cos, ant.position.y + d * sin);
+        let target = along(step);
         if !world.segment_passable(ant.position, target) {
             continue;
         }
         let target_cell = target.cell();
         obs.valid[k] = true;
         // The antennal probe: one cell ahead, then a second, stopping at
-        // the first wall so nothing is sensed through or around a corner.
-        let (one, _) = world.probe(ant.position, heading, 1.0);
-        let (two, reach) = world.probe(ant.position, heading, 2.0);
+        // the first wall so nothing is sensed through or around a corner
+        // (one sweep of quarter-cell samples serves both).
+        let (one, two, reach) = if !world.has_walls() && world.is_passable_point(along(2.0)) {
+            // Nothing stops the probe in an open world within the grid.
+            (along(1.0), along(2.0), 2.0)
+        } else {
+            let mut one = ant.position;
+            let mut last = (ant.position, 0.0);
+            for i in 1..=8 {
+                let d = 0.25 * i as f64;
+                let p = along(d);
+                if !world.is_passable_point(p) {
+                    break;
+                }
+                last = (p, d);
+                if i <= 4 {
+                    one = p;
+                }
+            }
+            (one, last.0, last.1)
+        };
         let second = species.sense_range >= 2 && reach > 1.0 + 1e-9;
         let ahead = within_antennal_sweep(k);
         let f = &mut obs.features[k][offset..offset + BASE_FEATURES];
-        for (slot, kind) in [
-            (F_TRAIL, Pheromone::Trail),
-            (F_HOME, Pheromone::Home),
-            (F_TERRITORY, Pheromone::Territory),
-            (F_NO_ENTRY, Pheromone::NoEntry),
-            (F_ALARM, Pheromone::Alarm),
-            (F_ODOUR, Pheromone::Odour),
-        ] {
+        for (slot, kind) in channels {
             // Nothing is sensed behind: headings outside the sweep carry
             // no pheromone information, so turning back is governed by the
             // turning cost alone. U-turns then happen where the trail
             // ahead has faded and hardly ever on a strong trail (Beckers,
-            // Deneubourg & Goss 1992, *J. Theor. Biol.* 159:397).
-            let c = if ahead {
+            // Deneubourg & Goss 1992, *J. Theor. Biol.* 159:397). A
+            // channel nothing carries anywhere is not looked at.
+            let c = if ahead && world.channel_present(kind) {
                 let mut c = world.level_at(one, kind);
                 if second {
                     c += 0.5 * world.level_at(two, kind);
@@ -802,11 +831,13 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
         };
         f[F_NEST] = if world.is_nest(target_cell) { 1.0 } else { 0.0 };
         f[F_HEADING] = turn_persistence(k);
-        f[F_HOME_VECTOR] = cosine(heading, nest_dir);
-        f[F_SITE] = cosine(heading, site_dir);
-        f[F_ROUTE] = route_dir
-            .map(|(v, w)| w * cosine(heading, Some(v)))
-            .unwrap_or(0.0);
+        let towards = |v: Option<(f64, f64, f64)>| {
+            v.map(|(dx, dy, len)| (cos * dx + sin * dy) / len)
+                .unwrap_or(0.0)
+        };
+        f[F_HOME_VECTOR] = towards(nest_vec);
+        f[F_SITE] = towards(site_vec);
+        f[F_ROUTE] = route_vec.map(|(u, w)| w * towards(Some(u))).unwrap_or(0.0);
         f[F_RECENT] = if target_cell != here && ant.recently_visited(target_cell) {
             1.0
         } else {

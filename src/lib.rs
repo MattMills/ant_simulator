@@ -65,6 +65,12 @@
 //!   measures how much the field carries, lag by lag, and
 //!   [`experiments::run_closed_loop`] closes the loop.
 //!
+//! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
+//!   every simulation profiles its tick phase by phase; `cargo bench`
+//!   sweeps colony size and world area and fits the cost's exponents; and
+//!   the experiments module scans how foraging organises with colony size
+//!   and how the hive's memory depends on colony size and grain.
+//!
 //! * **Learners and rotating levers** ([`learner`], [`rotation`], [`arena`]):
 //!   several learners each hold a lever. Each turn the arena connects the
 //!   levers to nodes of the hierarchy according to a [`rotation::Rotation`],
@@ -149,6 +155,7 @@ pub mod pheromone;
 pub mod render;
 pub mod rng;
 pub mod rotation;
+pub mod scaling;
 pub mod species;
 pub mod surface;
 pub mod world;
@@ -181,6 +188,10 @@ pub mod prelude {
         run_closed_loop, run_memory_probe, sustained_colony, ClosedLoop, MemoryProbe,
         MemoryProbeConfig,
     };
+    pub use crate::experiments::{
+        run_colony_size_scan, run_memory_scaling, single_feeder, trail_only, MemoryScaleOutcome,
+        SizeOutcome, SizeScan,
+    };
     pub use crate::experiments::{run_communal_nutrition, sugar_and_prey, NutritionOutcome};
     pub use crate::experiments::{run_thermal_tradeoff, ThermalOutcome};
     pub use crate::geometry::{Direction, Point, Position};
@@ -203,6 +214,9 @@ pub mod prelude {
     pub use crate::render::{render, render_surface};
     pub use crate::rng::Rng;
     pub use crate::rotation::{Mapping, Rotation, RotationSchedule};
+    pub use crate::scaling::{
+        ant_scan, area_scan, exponent, measure, Measurement, Phase, Profile, Scan, Workload,
+    };
     pub use crate::species::Species;
     pub use crate::surface::{
         BehavioralSurface, Deformation, ENTROPY_PARAM, PARAM_LEN, REACH_PARAM, ROUGH_PARAM,

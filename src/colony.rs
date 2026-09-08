@@ -26,6 +26,7 @@ use crate::landscape::{
 };
 use crate::pheromone::Pheromone;
 use crate::rng::Rng;
+use crate::scaling::{Phase, Profile};
 use crate::species::Species;
 use crate::surface::{BehavioralSurface, SurfaceError, PARAM_LEN};
 use crate::world::{Nutrient, World, WorldConfig};
@@ -391,6 +392,16 @@ pub struct PathStats {
     pub cell_entries: u64,
     /// Completed food-to-nest trips.
     pub trips: u64,
+    /// Outbound legs completed (departures that found food).
+    pub outbound_trips: u64,
+    /// Their summed path length, cells.
+    pub outbound_length: f64,
+    /// Their summed direct distance from the nest to the food, cells.
+    pub outbound_direct: f64,
+    /// Outbound legs no longer than one and a half times the direct
+    /// distance: the ones a trail or a memory guided, rather than a
+    /// search.
+    pub ordered_trips: u64,
     /// Path length walked on those trips, cells.
     pub trip_length: f64,
     /// Straight-line distance those trips needed, cells.
@@ -408,6 +419,10 @@ impl Default for PathStats {
             revisits: 0,
             cell_entries: 0,
             trips: 0,
+            outbound_trips: 0,
+            outbound_length: 0.0,
+            outbound_direct: 0.0,
+            ordered_trips: 0,
             trip_length: 0.0,
             trip_direct: 0.0,
             ledger: EntropyLedger::default(),
@@ -435,6 +450,25 @@ impl PathStats {
         self.trip_direct += direct;
     }
 
+    fn record_outbound(&mut self, length: f64, direct: f64) {
+        self.outbound_trips += 1;
+        self.outbound_length += length;
+        self.outbound_direct += direct;
+        if length <= 1.5 * direct.max(1e-9) {
+            self.ordered_trips += 1;
+        }
+    }
+
+    /// Share of the outbound legs that went to the food no more than one
+    /// and a half times the direct distance.
+    pub fn ordered_fraction(&self) -> f64 {
+        if self.outbound_trips == 0 {
+            0.0
+        } else {
+            self.ordered_trips as f64 / self.outbound_trips as f64
+        }
+    }
+
     /// Add another record's counts.
     pub fn merge(&mut self, other: &PathStats) {
         self.moves += other.moves;
@@ -447,6 +481,10 @@ impl PathStats {
         self.trips += other.trips;
         self.trip_length += other.trip_length;
         self.trip_direct += other.trip_direct;
+        self.outbound_trips += other.outbound_trips;
+        self.outbound_length += other.outbound_length;
+        self.outbound_direct += other.outbound_direct;
+        self.ordered_trips += other.ordered_trips;
         self.ledger.merge(&other.ledger);
     }
 
@@ -813,10 +851,18 @@ pub struct Simulation {
     surface: Vec<SurfaceRow>,
     history: Option<MovementHistory>,
     mind: Option<Queen>,
+    profile: Profile,
+    decisions_time: std::time::Duration,
     nest: Nest,
     nest_cells: Vec<Position>,
     /// Living workers inside the nest, by world cell index.
     inside_by_cell: Vec<Vec<usize>>,
+    /// Cells with an entry in `inside_by_cell` since the last indexing.
+    inside_cells: Vec<usize>,
+    /// Workers inside at the last indexing.
+    inside_total: usize,
+    /// Workers nursing right now.
+    nurses: usize,
     alive: usize,
     outside: usize,
     next_leaf: usize,
@@ -907,9 +953,14 @@ impl Simulation {
                 .mind
                 .clone()
                 .map(|m| Queen::new(m, &hierarchy_for_queen)),
+            profile: Profile::default(),
+            decisions_time: std::time::Duration::ZERO,
             nest,
             nest_cells,
             inside_by_cell: vec![Vec::new(); world_width * world_height],
+            inside_cells: Vec::new(),
+            inside_total: 0,
+            nurses: 0,
             alive: 0,
             outside: 0,
             next_leaf: 0,
@@ -1123,22 +1174,28 @@ impl Simulation {
 
     /// Rebuild the index of workers inside by cell.
     fn index_inside(&mut self) {
-        for v in self.inside_by_cell.iter_mut() {
-            v.clear();
+        for &k in &self.inside_cells {
+            self.inside_by_cell[k].clear();
         }
+        self.inside_cells.clear();
+        self.inside_total = 0;
         for i in 0..self.ants.len() {
             let a = &self.ants[i];
             if a.alive && a.is_inside() {
                 if let Some(k) = self.world.index(a.cell()) {
+                    if self.inside_by_cell[k].is_empty() {
+                        self.inside_cells.push(k);
+                    }
                     self.inside_by_cell[k].push(i);
+                    self.inside_total += 1;
                 }
             }
         }
     }
 
-    /// Living workers inside the nest.
+    /// Living workers inside the nest at the last indexing.
     fn inside_count(&self) -> usize {
-        self.inside_by_cell.iter().map(|v| v.len()).sum()
+        self.inside_total
     }
 
     /// Workers inside within reach of worker `i`: on its cell or the eight
@@ -1308,6 +1365,9 @@ impl Simulation {
         }
         if let (Some(a), Some(b)) = (self.world.index(from), self.world.index(chosen)) {
             self.inside_by_cell[a].retain(|&j| j != i);
+            if self.inside_by_cell[b].is_empty() {
+                self.inside_cells.push(b);
+            }
             self.inside_by_cell[b].push(i);
         }
         let a = &mut self.ants[i];
@@ -1635,6 +1695,7 @@ impl Simulation {
 
     /// Advance the colony by one tick.
     pub fn step(&mut self) {
+        let t0 = std::time::Instant::now();
         if self.dirty {
             self.recompile();
         }
@@ -1645,13 +1706,18 @@ impl Simulation {
                 self.step_ant(i);
             }
         }
+        let t1 = std::time::Instant::now();
         self.world.step_pheromones();
+        let t2 = std::time::Instant::now();
         self.world
             .step_food(self.species.odour_per_ul_s, self.species.odour_per_mg_s);
+        let t3 = std::time::Instant::now();
         self.nest_step();
+        let t4 = std::time::Instant::now();
         if let Some(h) = &mut self.history {
             h.step();
         }
+        let t5 = std::time::Instant::now();
         self.tick += 1;
         if let (Some(queen), Some(history)) = (&mut self.mind, &self.history) {
             if queen.due(self.tick) {
@@ -1659,6 +1725,17 @@ impl Simulation {
                 self.dirty = true;
             }
         }
+        let t6 = std::time::Instant::now();
+        self.profile.ticks += 1;
+        let decisions = std::mem::take(&mut self.decisions_time);
+        self.profile.add(Phase::Decisions, decisions);
+        self.profile
+            .add(Phase::Ants, (t1 - t0).saturating_sub(decisions));
+        self.profile.add(Phase::Pheromones, t2 - t1);
+        self.profile.add(Phase::Food, t3 - t2);
+        self.profile.add(Phase::Nest, t4 - t3);
+        self.profile.add(Phase::History, t5 - t4);
+        self.profile.add(Phase::Queen, t6 - t5);
         self.stats.ticks += 1;
         self.stats.time_s += self.tick_s;
         self.stats.alive = self.alive;
@@ -1667,6 +1744,18 @@ impl Simulation {
         if self.log_every_ticks > 0 && self.tick.is_multiple_of(self.log_every_ticks) {
             self.snapshot();
         }
+        self.profile.add(Phase::Other, t6.elapsed());
+    }
+
+    /// Wall time per phase of the tick since the start (or the last
+    /// reset).
+    pub fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    /// Start the profile afresh.
+    pub fn reset_profile(&mut self) {
+        self.profile = Profile::default();
     }
 
     /// Advance by `steps` ticks and return the counters.
@@ -1840,10 +1929,7 @@ impl Simulation {
     }
 
     fn nurses_now(&self) -> usize {
-        self.ants
-            .iter()
-            .filter(|a| a.alive && a.activity == Activity::Nursing)
-            .count()
+        self.nurses
     }
 
     /// Response-threshold reinforcement: the threshold of the task being
@@ -1937,6 +2023,7 @@ impl Simulation {
             let a = &mut self.ants[i];
             a.activity = Activity::Nursing;
             a.timer = bout;
+            self.nurses += 1;
         }
     }
 
@@ -1988,6 +2075,7 @@ impl Simulation {
         a.steps_since_nest = 0;
         a.search_steps = 0;
         a.move_credit = 0.0;
+        a.trip_length = 0.0;
         a.laying = if a.corpse {
             None
         } else if (outbound_laying && a.site.is_some()) || exploratory_laying {
@@ -2062,6 +2150,7 @@ impl Simulation {
         a.timer = a.timer.saturating_sub(1);
         if a.timer == 0 || no_larvae {
             a.activity = Activity::Resting;
+            self.nurses = self.nurses.saturating_sub(1);
         }
     }
 
@@ -2461,7 +2550,10 @@ impl Simulation {
                     }
                     _ => Mode::Outbound,
                 };
-                if let Some(ring) = self.decide(i, mode, step) {
+                let decided = std::time::Instant::now();
+                let ring = self.decide(i, mode, step);
+                self.decisions_time += decided.elapsed();
+                if let Some(ring) = ring {
                     self.move_ant(i, ring, step);
                 }
                 if self.check_transitions(i) {
@@ -2768,10 +2860,24 @@ impl Simulation {
         a.pickup = Some(a.position);
         a.laying = None;
         a.steps_since_food = 0;
+        let outbound = (a.trip_length, a.position);
         a.trip_length = 0.0;
+        self.record_outbound(i, outbound);
         self.stats.food_picked += 1;
         let reward = self.config.reward.food_picked;
         self.credit(leaf, reward, false);
+    }
+
+    /// Record the outbound leg that just found food: its path length and
+    /// the direct distance from the nest.
+    fn record_outbound(&mut self, i: usize, (length, pickup): (f64, Point)) {
+        let leaf = self.ants[i].leaf;
+        let nest = Point::center_of(self.world.nest());
+        let direct = (pickup.distance(nest) - self.world.nest_radius().max(0) as f64).max(0.0);
+        self.stats.path.record_outbound(length, direct);
+        for &node in &self.leaf_paths[leaf] {
+            self.stats.path_by_node[node].record_outbound(length, direct);
+        }
     }
 
     /// Start cutting a piece of prey: its value to the colony is its
@@ -2789,7 +2895,9 @@ impl Simulation {
         a.pickup = Some(a.position);
         a.laying = None;
         a.steps_since_food = 0;
+        let outbound = (a.trip_length, a.position);
         a.trip_length = 0.0;
+        self.record_outbound(i, outbound);
         self.stats.food_picked += 1;
         self.stats.prey_picked += 1;
         let reward = self.config.reward.food_picked;
@@ -2842,6 +2950,9 @@ impl Simulation {
         let leaf = self.ants[i].leaf;
         let outside = !self.ants[i].is_inside();
         let cell = self.ants[i].cell();
+        if self.ants[i].activity == Activity::Nursing {
+            self.nurses = self.nurses.saturating_sub(1);
+        }
         self.ants[i].alive = false;
         if self.ants[i].corpse {
             // A carried corpse is dropped where the carrier dies.
@@ -3028,9 +3139,13 @@ impl Simulation {
         } else {
             policy.tempering
         };
+        // The budget is only needed to size a deformation.
+        let deforms =
+            policy.deformation.smooth_share() > 0.0 || policy.deformation.rough_share() > 0.0;
         let h = match tempering {
             Tempering::Entropy(f) => f,
-            Tempering::Temperature(t) => base.entropy_fraction_at(t),
+            Tempering::Temperature(t) if deforms => base.entropy_fraction_at(t),
+            Tempering::Temperature(_) => 0.0,
         };
         let smooth_scale = policy.deformation.smooth_share() * h * self.config.geometry.smooth_max;
         let smoothed = base.smoothed(smooth_scale);

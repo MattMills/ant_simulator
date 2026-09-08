@@ -134,7 +134,10 @@ pub type PheromoneSet = [PheromoneParams; Pheromone::COUNT];
 /// A weight `n` on this feature yields Deneubourg's `(k + C)ⁿ` response
 /// through the softmax (the `kⁿ` factor cancels).
 pub fn perceived(concentration: f64, k: f64) -> f64 {
-    (1.0 + concentration.max(0.0) / k.max(1e-9)).ln()
+    if concentration <= 0.0 {
+        return 0.0;
+    }
+    (1.0 + concentration / k.max(1e-9)).ln()
 }
 
 #[cfg(test)]
