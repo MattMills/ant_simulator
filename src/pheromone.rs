@@ -129,6 +129,14 @@ impl PheromoneParams {
 /// Parameters for all channels, indexed by [`Pheromone::index`].
 pub type PheromoneSet = [PheromoneParams; Pheromone::COUNT];
 
+impl Pheromone {
+    /// Whether the channel spreads through the air (the smell of food,
+    /// alarm) rather than lying on the substrate.
+    pub fn is_volatile(self) -> bool {
+        matches!(self, Pheromone::Alarm | Pheromone::Odour)
+    }
+}
+
 /// Perceived intensity of a concentration: `ln(1 + C/k)`.
 ///
 /// A weight `n` on this feature yields Deneubourg's `(k + C)ⁿ` response

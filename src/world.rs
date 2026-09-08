@@ -300,8 +300,13 @@ pub struct WorldConfig {
     /// `k`, below which a node of that channel may be coarse: a node
     /// whose cells are all below half of it is composed into its mean,
     /// and a coarse node whose mean reaches it is refined into cells
-    /// again.
+    /// again. A coarse node reads as the interpolation of the means
+    /// around it, so the field keeps its gradient at the grain.
     pub coarse_below: f64,
+    /// The same for the volatile channels (the smell of food, alarm),
+    /// which spread through the air over the whole field and are read
+    /// at the grain beyond their near field.
+    pub coarse_below_volatile: f64,
     /// Corpses scattered at random over open cells when the world is built
     /// (the arenas of the cemetery-formation experiments).
     pub scattered_corpses: usize,
@@ -345,6 +350,7 @@ impl Default for WorldConfig {
             kinetics_stride: 1,
             kinetics_grain: 8,
             coarse_below: 0.01,
+            coarse_below_volatile: 2.0,
             capacity_zones: Vec::new(),
             scattered_corpses: 0,
             landmarks: Vec::new(),
@@ -432,7 +438,12 @@ impl Grain {
             corpses: vec![0; n],
         };
         for (k, p) in params.iter().enumerate() {
-            g.threshold[k] = config.coarse_below.max(0.0) * p.k.max(1e-9);
+            let below = if Pheromone::ALL[k].is_volatile() {
+                config.coarse_below_volatile
+            } else {
+                config.coarse_below
+            };
+            g.threshold[k] = below.max(0.0) * p.k.max(1e-9);
         }
         for node in 0..n {
             let (x0, y0, x1, y1) = g.rect(node);
@@ -1071,16 +1082,60 @@ impl World {
     }
 
     /// The field of a channel at a cell: the cell's own value in an
-    /// active node, the node's mean in a coarse one.
+    /// active node; in a coarse one, the means of the nodes around it
+    /// interpolated to the cell (an active node in the stencil counts
+    /// with its cell nearest the reader), so that the field keeps its
+    /// gradient at the grain.
     #[inline]
     fn read(&self, idx: usize, p: Position, k: usize) -> f64 {
         if let Some(g) = &self.grain {
             let node = g.node_of(p.x as usize, p.y as usize);
             if !g.active[node][k] {
-                return g.mean[node][k];
+                return self.read_coarse(g, node, p, k);
             }
         }
         self.cells[idx].pheromone[k]
+    }
+
+    /// The interpolated reading of a coarse node at a cell.
+    fn read_coarse(&self, g: &Grain, node: usize, p: Position, k: usize) -> f64 {
+        let side = (1usize << g.shift) as f64;
+        // Offset of the cell centre from the node centre, in node sides.
+        let col = node % g.cols;
+        let row = node / g.cols;
+        let fx = (p.x as f64 + 0.5 - (col as f64 + 0.5) * side) / side;
+        let fy = (p.y as f64 + 0.5 - (row as f64 + 0.5) * side) / side;
+        let (dc, wx) = if fx >= 0.0 { (1i64, fx) } else { (-1i64, -fx) };
+        let (dr, wy) = if fy >= 0.0 { (1i64, fy) } else { (-1i64, -fy) };
+        let value_of = |c: i64, r: i64| -> f64 {
+            if c < 0 || r < 0 || c >= g.cols as i64 || r >= g.rows as i64 {
+                return g.mean[node][k];
+            }
+            let n = r as usize * g.cols + c as usize;
+            if g.active[n][k] {
+                // The cell of the active node nearest the reader.
+                let (x0, y0, x1, y1) = g.rect(n);
+                let x = (p.x as usize).clamp(x0, x1 - 1);
+                let y = (p.y as usize).clamp(y0, y1 - 1);
+                let c = &self.cells[y * self.config.width + x];
+                if c.terrain == Terrain::Wall {
+                    g.mean[node][k]
+                } else {
+                    c.pheromone[k]
+                }
+            } else {
+                g.mean[n][k]
+            }
+        };
+        let (c0, r0) = (col as i64, row as i64);
+        let v00 = g.mean[node][k];
+        let v10 = value_of(c0 + dc, r0);
+        let v01 = value_of(c0, r0 + dr);
+        let v11 = value_of(c0 + dc, r0 + dr);
+        (1.0 - wx) * (1.0 - wy) * v00
+            + wx * (1.0 - wy) * v10
+            + (1.0 - wx) * wy * v01
+            + wx * wy * v11
     }
 
     /// Refine the node holding a cell for a channel, if it is coarse.
