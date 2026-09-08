@@ -13,10 +13,20 @@
 //!   satiation (Mailleux, Deneubourg & Detrain 2003).
 //! * [`run_division_of_labor`]: specialisation with and without response
 //!   threshold reinforcement (Theraulaz, Bonabeau & Deneubourg 1998).
+//! * [`run_memory_probe`] and [`run_closed_loop`]: the hive's cognitive
+//!   geometry. A queen writes random thoughts into an entropy dial of a
+//!   colony kept foraging for hours; readouts of the movement history
+//!   retrodict them, lag by lag, from the invariant and the non-invariant
+//!   component of the field; and with recall feeding her next thought,
+//!   an alternation is sustained through the colony's movement alone.
 
 use crate::ant::{BASE_FEATURES, F_CROWD, F_ODOUR, F_RECENT, F_ROUTE};
 use crate::colony::{BroodItem, BroodStage, SimConfig, Simulation};
 use crate::geometry::Position;
+use crate::hierarchy::NodeId;
+use crate::hive::{
+    memory_capacity, Capacity, Component, FieldSummary, HistoryConfig, QueenConfig, Recursion,
+};
 use crate::pheromone::Pheromone;
 use crate::species::Species;
 use crate::world::{CapacityZone, Counter, FoodSource, Rect, WorldConfig};
@@ -878,6 +888,262 @@ pub fn run_division_of_labor(
     LaborOutcome {
         with_reinforcement: run(species.clone()),
         without_reinforcement: run(frozen),
+    }
+}
+
+/// Pearson correlation of two series.
+fn correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let mx = x[..n].iter().sum::<f64>() / n as f64;
+    let my = y[..n].iter().sum::<f64>() / n as f64;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (a, b) in x[..n].iter().zip(&y[..n]) {
+        sxy += (a - mx) * (b - my);
+        sxx += (a - mx).powi(2);
+        syy += (b - my).powi(2);
+    }
+    if sxx <= 1e-18 || syy <= 1e-18 {
+        0.0
+    } else {
+        sxy / (sxx * syy).sqrt()
+    }
+}
+
+/// The hive memory probe: a colony kept foraging for hours, whose queen
+/// writes a fresh random thought into an entropy dial each epoch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryProbeConfig {
+    /// The species.
+    pub species: Species,
+    /// Simulated workers.
+    pub ants: usize,
+    /// Epochs recorded after the warm-up.
+    pub epochs: usize,
+    /// Length of an epoch, seconds.
+    pub epoch_s: f64,
+    /// Time the colony is given to settle into its foraging before the
+    /// queen's clock starts, seconds.
+    pub warmup_s: f64,
+    /// Size of the queen's expression: a thought `x` sets a temperature of
+    /// `exp(expression × x)` at the root.
+    pub expression: f64,
+    /// Nodes whose dials she writes; empty means the castes.
+    pub targets: Vec<NodeId>,
+    /// How the movement history is kept (its fast half-life is set to an
+    /// epoch when zero).
+    pub history: HistoryConfig,
+    /// Lags the readouts are fitted for.
+    pub lags: usize,
+    /// Ridge penalty of the readouts, relative to the number of epochs.
+    pub ridge: f64,
+    /// Fraction of the epochs the readouts are fitted on; the rest score
+    /// them.
+    pub train_fraction: f64,
+    /// Steady drain on the nest's reserve per simulated worker,
+    /// milligrams of sugar per hour: the growth of a large brood and the
+    /// metabolism of the nestmates a simulated worker stands for, which
+    /// keeps the foragers trafficking.
+    pub drain_mg_per_ant_per_h: f64,
+    /// Renewal of every food cell, microlitres per second (honeydew that
+    /// keeps flowing).
+    pub renewal_ul_per_s: f64,
+    /// Seed of the map and of the run.
+    pub seed: u64,
+}
+
+impl Default for MemoryProbeConfig {
+    fn default() -> Self {
+        MemoryProbeConfig {
+            species: Species::lasius_niger(),
+            ants: 100,
+            epochs: 180,
+            epoch_s: 60.0,
+            warmup_s: 45.0 * 60.0,
+            expression: 2.0,
+            targets: vec![0],
+            history: HistoryConfig {
+                sector: 16,
+                fast_half_life_s: 0.0,
+                ..HistoryConfig::default()
+            },
+            lags: 6,
+            ridge: 3.0,
+            train_fraction: 2.0 / 3.0,
+            drain_mg_per_ant_per_h: 0.5,
+            renewal_ul_per_s: 0.02,
+            seed: 7,
+        }
+    }
+}
+
+/// A colony that keeps foraging for hours: renewing sources, a steady
+/// drain on the reserve, no mortality, and the movement history kept.
+pub fn sustained_colony(cfg: &MemoryProbeConfig) -> SimConfig {
+    let mut species = cfg.species.clone();
+    species.consumption_mg_per_ant_per_s = cfg.drain_mg_per_ant_per_h / 3600.0;
+    let world = WorldConfig {
+        seed: Some(cfg.seed),
+        ..WorldConfig::default()
+    };
+    let mut sim = experiment_config(species, world, cfg.ants);
+    if let Some(food) = sim.world.random_food.as_mut() {
+        food.renewal_ul_per_s = cfg.renewal_ul_per_s;
+    }
+    for source in sim.world.food_sources.iter_mut() {
+        source.renewal_ul_per_s = cfg.renewal_ul_per_s;
+    }
+    sim.nest.initial_satiation = 0.1;
+    sim.nest.mortality = false;
+    let mut history = cfg.history.clone();
+    if history.fast_half_life_s <= 0.0 {
+        history.fast_half_life_s = cfg.epoch_s;
+    }
+    sim.history = Some(history);
+    sim
+}
+
+/// What the memory probe found.
+pub struct MemoryProbe {
+    /// Epochs recorded.
+    pub epochs: usize,
+    /// Memory capacity of the invariant, the residual and both components.
+    pub capacities: Vec<Capacity>,
+    /// Correlation, over epochs, of the thought with the colony's decision
+    /// entropy: whether the dial took effect.
+    pub entropy_correlation: f64,
+    /// Correlation of the thought with the straightness of the current
+    /// flow over the whole field, minus the invariant one: whether the
+    /// thought reached the non-invariant movement.
+    pub straightness_correlation: f64,
+    /// Mean current density over the epochs, moves per tick.
+    pub mean_density: f64,
+    /// The field at the end.
+    pub summary: FieldSummary,
+    /// The colony as it stands, its queen's epochs recorded, for the
+    /// closed loop.
+    pub simulation: Simulation,
+}
+
+/// Run the memory probe: warm the colony up, let the queen think a random
+/// ±1 per target per epoch, and measure how much of her past thought the
+/// field carries.
+pub fn run_memory_probe(cfg: &MemoryProbeConfig) -> MemoryProbe {
+    let mut sim_cfg = sustained_colony(cfg);
+    let tick_s = sim_cfg.world.tick_s.max(1e-9);
+    sim_cfg.mind = Some(QueenConfig {
+        epoch_ticks: (cfg.epoch_s / tick_s).round().max(1.0) as u64,
+        warmup_ticks: (cfg.warmup_s / tick_s).round().max(0.0) as u64,
+        targets: cfg.targets.clone(),
+        expression: cfg.expression,
+        random_input: true,
+        ridge: cfg.ridge,
+        ..QueenConfig::default()
+    });
+    let mut sim = Simulation::new(sim_cfg, cfg.seed);
+    sim.run_seconds(cfg.warmup_s);
+    let mut thoughts = Vec::with_capacity(cfg.epochs);
+    let mut entropies = Vec::with_capacity(cfg.epochs);
+    let mut straightness = Vec::with_capacity(cfg.epochs);
+    let mut density = 0.0;
+    for _ in 0..cfg.epochs {
+        sim.reset_stats();
+        sim.run_seconds(cfg.epoch_s);
+        let (Some(queen), Some(history)) = (sim.queen(), sim.history()) else {
+            break;
+        };
+        let Some(epoch) = queen.epochs.last() else {
+            break;
+        };
+        thoughts.push(epoch.thought.first().copied().unwrap_or(0.0));
+        entropies.push(sim.stats().mean_entropy());
+        let current = history.current_whole();
+        straightness.push(current.straightness() - history.invariant_whole().straightness());
+        density += current.weight;
+    }
+    let epochs = thoughts.len();
+    let queen = sim.queen().expect("the probe has a queen");
+    let capacities = [Component::Invariant, Component::Residual, Component::Both]
+        .into_iter()
+        .map(|c| memory_capacity(&queen.epochs, c, cfg.lags, cfg.ridge, cfg.train_fraction))
+        .collect();
+    let summary = sim.history().expect("the probe keeps a history").summary();
+    MemoryProbe {
+        epochs,
+        capacities,
+        entropy_correlation: correlation(&thoughts, &entropies),
+        straightness_correlation: correlation(&thoughts, &straightness),
+        mean_density: if epochs > 0 {
+            density / epochs as f64
+        } else {
+            0.0
+        },
+        summary,
+        simulation: sim,
+    }
+}
+
+/// The closed loop: the queen recalls her last thought from the field and
+/// thinks its opposite, so an alternation is sustained only through the
+/// colony's movement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosedLoop {
+    /// Held-out R² of the lag-1 readout the recall uses.
+    pub lag1_r2: f64,
+    /// The thought of the first target after each epoch.
+    pub thoughts: Vec<f64>,
+    /// Sign changes between successive thoughts.
+    pub alternations: usize,
+    /// Mean absolute thought: how decided the queen stayed.
+    pub conviction: f64,
+}
+
+/// Fit the queen's readouts on her recorded epochs, switch her external
+/// input off and recall-driven recursion on, and run `epochs` more
+/// epochs. With `expression` zero the dial is disconnected: she still
+/// recalls and thinks, but nothing she thinks reaches the colony, so the
+/// alternation has nothing to carry it.
+pub fn run_closed_loop(
+    sim: &mut Simulation,
+    epochs: usize,
+    recursion: Recursion,
+    expression: f64,
+    train_fraction: f64,
+) -> ClosedLoop {
+    let epoch_s = {
+        let queen = sim.queen().expect("a queen");
+        queen.config().epoch_ticks as f64 * sim.config().world.tick_s
+    };
+    let lag1_r2 = {
+        let queen = sim.queen_mut().expect("a queen");
+        let cap = queen.fit(recursion.lag.max(1), train_fraction);
+        queen.set_input(Vec::new(), false);
+        queen.set_recursion(Some(recursion));
+        queen.set_expression(expression);
+        cap.by_lag.first().copied().unwrap_or(0.0)
+    };
+    let mut thoughts = Vec::with_capacity(epochs);
+    for _ in 0..epochs {
+        sim.run_seconds(epoch_s);
+        let queen = sim.queen().expect("a queen");
+        thoughts.push(queen.thought.first().copied().unwrap_or(0.0));
+    }
+    let alternations = thoughts
+        .windows(2)
+        .filter(|w| (w[0] > 0.0) != (w[1] > 0.0))
+        .count();
+    let conviction = if thoughts.is_empty() {
+        0.0
+    } else {
+        thoughts.iter().map(|t| t.abs()).sum::<f64>() / thoughts.len() as f64
+    };
+    ClosedLoop {
+        lag1_r2,
+        thoughts,
+        alternations,
+        conviction,
     }
 }
 

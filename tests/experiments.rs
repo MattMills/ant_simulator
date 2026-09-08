@@ -351,3 +351,56 @@ fn pharaoh_ants_mark_exhausted_routes() {
         "no-entry marking should appear once the source is exhausted"
     );
 }
+
+#[test]
+fn queen_thoughts_are_written_into_the_non_invariant_flow() {
+    // The hive's cognitive geometry: a thought expressed in the root
+    // temperature reaches the colony's decisions and the straightness of
+    // its paths, and the readouts and the closed loop run on the record.
+    let cfg = MemoryProbeConfig {
+        ants: 60,
+        epochs: 40,
+        epoch_s: 30.0,
+        warmup_s: 10.0 * 60.0,
+        lags: 2,
+        ..MemoryProbeConfig::default()
+    };
+    let mut probe = run_memory_probe(&cfg);
+    assert_eq!(probe.epochs, 40);
+    assert!(
+        probe.mean_density > 1.0,
+        "the colony keeps moving: {}",
+        probe.mean_density
+    );
+    assert!(
+        probe.entropy_correlation > 0.5,
+        "the dial reaches the decisions: {}",
+        probe.entropy_correlation
+    );
+    assert!(
+        probe.straightness_correlation < -0.3,
+        "a hotter colony walks more tortuously: {}",
+        probe.straightness_correlation
+    );
+    assert_eq!(probe.capacities.len(), 3);
+    assert_eq!(probe.capacities[1].component, Component::Residual);
+    let closed = run_closed_loop(
+        &mut probe.simulation,
+        6,
+        Recursion {
+            lag: 1,
+            gain: -10.0,
+        },
+        cfg.expression,
+        cfg.train_fraction,
+    );
+    assert_eq!(closed.thoughts.len(), 6);
+    assert!(closed
+        .thoughts
+        .iter()
+        .all(|t| t.is_finite() && t.abs() <= 1.0));
+    assert!(
+        closed.conviction > 0.0,
+        "recall drives a thought: {closed:?}"
+    );
+}

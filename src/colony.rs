@@ -20,7 +20,10 @@ use crate::ant::{observe, Activity, Ant, AntId, Mode, SearchTarget, Site, Traits
 use crate::entropy::{entropy, Tempering};
 use crate::geometry::{angle_of, Point, Position};
 use crate::hierarchy::{EffectivePolicy, Hierarchy, HierarchySpec, NodeId};
-use crate::landscape::{ring_heading, turn_magnitude, EntropyLedger, Landscape, Sucker, RING};
+use crate::hive::{HistoryConfig, MovementHistory, Queen, QueenConfig};
+use crate::landscape::{
+    ring_heading, turn_magnitude, EntropyLedger, Landscape, Sucker, RING, RING_STEP,
+};
 use crate::pheromone::Pheromone;
 use crate::rng::Rng;
 use crate::species::Species;
@@ -206,6 +209,11 @@ pub struct SimConfig {
     pub record_surface: Option<AntId>,
     /// Maximum rows kept in the surface recording.
     pub surface_rows: usize,
+    /// Keep the colony's movement history (the hive's cognitive geometry);
+    /// `None` keeps nothing.
+    pub history: Option<HistoryConfig>,
+    /// A queen who thinks through the movement history (needs `history`).
+    pub mind: Option<QueenConfig>,
 }
 
 impl Default for SimConfig {
@@ -238,6 +246,8 @@ impl SimConfig {
             geometry: GeometryConfig::default(),
             record_surface: None,
             surface_rows: 256,
+            history: None,
+            mind: None,
         }
     }
 }
@@ -737,6 +747,8 @@ pub struct Simulation {
     stats: Stats,
     trace: Trace,
     surface: Vec<SurfaceRow>,
+    history: Option<MovementHistory>,
+    mind: Option<Queen>,
     nest: Nest,
     nest_cells: Vec<Position>,
     alive: usize,
@@ -784,6 +796,8 @@ impl Simulation {
         let world = World::new(world_config, &mut rng);
         let tick_s = world.tick_s();
         let cell_cm = world.cell_cm();
+        let (world_width, world_height) = (world.width(), world.height());
+        let hierarchy_for_queen = hierarchy.clone();
         let nodes = hierarchy.len();
         let leaf_paths = hierarchy
             .leaves()
@@ -819,6 +833,14 @@ impl Simulation {
             stats: Stats::new(nodes),
             trace: Trace::new(nodes),
             surface: Vec::new(),
+            history: config
+                .history
+                .clone()
+                .map(|h| MovementHistory::new(world_width, world_height, tick_s, h)),
+            mind: config
+                .mind
+                .clone()
+                .map(|m| Queen::new(m, &hierarchy_for_queen)),
             nest,
             nest_cells,
             alive: 0,
@@ -1002,6 +1024,22 @@ impl Simulation {
         self.dirty = false;
     }
 
+    /// The colony's movement history, if kept.
+    pub fn history(&self) -> Option<&MovementHistory> {
+        self.history.as_ref()
+    }
+
+    /// The queen's mind, if she has one.
+    pub fn queen(&self) -> Option<&Queen> {
+        self.mind.as_ref()
+    }
+
+    /// The queen's mind, mutably (to fit her readouts or change her
+    /// thought).
+    pub fn queen_mut(&mut self) -> Option<&mut Queen> {
+        self.mind.as_mut()
+    }
+
     /// Effective policy of each leaf (as of the last compile).
     pub fn policies(&self) -> &[EffectivePolicy] {
         &self.policies
@@ -1123,7 +1161,16 @@ impl Simulation {
         self.world
             .step_food(self.species.odour_per_ul_s, self.species.odour_per_mg_s);
         self.nest_step();
+        if let Some(h) = &mut self.history {
+            h.step();
+        }
         self.tick += 1;
+        if let (Some(queen), Some(history)) = (&mut self.mind, &self.history) {
+            if queen.due(self.tick) {
+                queen.epoch(self.tick, history, &mut self.hierarchy, &mut self.rng);
+                self.dirty = true;
+            }
+        }
         self.stats.ticks += 1;
         self.stats.time_s += self.tick_s;
         self.stats.alive = self.alive;
@@ -1884,6 +1931,9 @@ impl Simulation {
         let to = from.advanced(heading, step);
         let from_cell = from.cell();
         let to_cell = to.cell();
+        if let Some(h) = &mut self.history {
+            h.record(from, to, turn_magnitude(ring) as f64 * RING_STEP);
+        }
         self.stats.path.record_move(ring, step);
         for &node in &self.leaf_paths[leaf] {
             self.stats.path_by_node[node].record_move(ring, step);

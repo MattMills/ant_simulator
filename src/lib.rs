@@ -51,6 +51,16 @@
 //!   ring for a bounded reach. An entropy ledger says where each decision's
 //!   disorder came from, and path statistics say what it did to the paths.
 //!
+//! * **Hive cognitive geometry** ([`hive`]): the colony's movement history
+//!   collapsed over time, at two grains and two time constants, into an
+//!   invariant skeleton (channels and loops) and a non-invariant residual;
+//!   and a queen who thinks on a coarse clock, expresses her thought in the
+//!   entropy dials, and reads it back from the field through fitted
+//!   readouts, so that what the colony's paths remember of her past
+//!   thoughts feeds her next one. [`experiments::run_memory_probe`]
+//!   measures how much the field carries, lag by lag, and
+//!   [`experiments::run_closed_loop`] closes the loop.
+//!
 //! * **Learners and rotating levers** ([`learner`], [`rotation`], [`arena`]):
 //!   several learners each hold a lever. Each turn the arena connects the
 //!   levers to nodes of the hierarchy according to a [`rotation::Rotation`],
@@ -128,6 +138,7 @@ pub mod entropy;
 pub mod experiments;
 pub mod geometry;
 pub mod hierarchy;
+pub mod hive;
 pub mod landscape;
 pub mod learner;
 pub mod pheromone;
@@ -162,11 +173,19 @@ pub mod prelude {
         LaborOutcome, ProductivityOutcome, SourcesOutcome, Summary,
     };
     pub use crate::experiments::{hidden_source, run_discovery, DiscoveryOutcome};
+    pub use crate::experiments::{
+        run_closed_loop, run_memory_probe, sustained_colony, ClosedLoop, MemoryProbe,
+        MemoryProbeConfig,
+    };
     pub use crate::experiments::{run_communal_nutrition, sugar_and_prey, NutritionOutcome};
     pub use crate::experiments::{run_thermal_tradeoff, ThermalOutcome};
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,
+    };
+    pub use crate::hive::{
+        memory_capacity, Capacity, Component, Epoch, FieldSummary, Flow, HistoryConfig,
+        MovementHistory, Queen, QueenConfig, Readout, Recursion, Topology,
     };
     pub use crate::landscape::{
         ring_heading, ring_index_of, turn_degrees, turn_label, Contributions, EntropyLedger,

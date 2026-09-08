@@ -291,6 +291,70 @@ sucker reach binds the ant to its heading (one ring step of 22.5° per
 proposal, so it can barely turn for home); a long one converges to the
 global draw.
 
+## Hive cognitive geometry: the movement history as the queen's memory
+
+The colony's movements, collapsed over time, are a structure the queen
+can think through. `MovementHistory` keeps every move at two grains
+(cells and sectors) and two time constants: a slow accumulator (one hour
+half-life) that holds the *invariant* skeleton, where ants persistently
+go, and a fast one (one epoch) whose departure from the slow one is the
+*non-invariant* residual, where the colony's disorder lives. Each
+accumulator is a `Flow`: how many moves, their mean direction (polar
+alignment, high on one-way flow), their axial order (high on straight
+two-way traffic), and their straightness (the mean cosine of each move's
+turn from its mover's heading). A reading of the field is multi-scale:
+the same six numbers over the whole field, over quadrants, and over
+sectors. The skeleton's topology is counted as channels (eight-connected
+groups of cells with enough steady, axially ordered flow) and loops (the
+regions they enclose), and `render_skeleton` draws it cell by cell.
+
+The `Queen` acts within time on a coarse clock. Each epoch she reads the
+retrodictive field, forms a thought vector, and expresses it in the
+hierarchy's entropy dials: a component `x` sets the root temperature to
+`exp(expression × x)` (or a relative gain below the root). A `Readout`
+(ridge regression on standardised features) retrodicts her past thoughts
+from the present field, and `memory_capacity` scores it lag by lag on
+held-out epochs for the invariant component, the residual, and both. With
+`Recursion` on, what she recalls from the field feeds her next thought.
+
+`cargo run --release --example hive` runs the memory probe: 100 workers
+kept foraging by renewing sources and a steady drain on the reserve (the
+brood and nestmates a simulated worker stands for), a 45-minute warm-up,
+then 180 one-minute epochs in which the queen thinks a random ±1 and sets
+the root temperature to `e^(2 × thought)`:
+
+```
+the dial in force: corr(thought, decision entropy) = 1.00
+reaching the paths: corr(thought, residual straightness of the whole field) = -0.76
+
+component    lag  1 lag  2 lag  3 lag  4 lag  5 lag  6   capacity
+invariant      0.04   0.03  -0.02  -0.12  -0.17  -0.19   0.07
+residual       0.70   0.38   0.08   0.00  -0.00  -0.02   1.17
+both           0.73   0.42   0.09  -0.08  -0.12  -0.10   1.24
+```
+
+Her thoughts are embedded in the non-invariant output and nowhere else:
+the residual retrodicts the thought of the epoch just ended with R² 0.70,
+the one before with 0.38, the one before that with 0.08, while the
+skeleton carries none of it. What carries the thought is the
+tortuosity of the paths: a hotter colony turns more at every decision.
+The loop then closes. Readouts fitted, external input off, the queen
+recalls her last thought from the field and thinks its opposite (gain
+−10) for 24 more epochs:
+
+```
+dial connected:    -+-+-+-+-+-+-+-+-+-+-+-+  alternations 23 of 23
+dial disconnected: -+-++++++++-++++++++++++  alternations  5 of 23
+```
+
+With the dial connected the alternation is sustained through the colony
+alone: nothing in her state remembers the last thought, only the ants'
+paths do. With the dial disconnected (expression zero) she still recalls
+and thinks, but nothing she thinks reaches the colony, and the field
+recalls only its noise. Cognitive material laid down in the colony's
+movement is thus included self-recursively in future cognition, at the
+epoch scale and over two to three epochs back.
+
 ## Examples
 
 ```
@@ -298,6 +362,7 @@ cargo run --release --example colony      [minutes]
 cargo run --release --example experiments [replicates] [minutes]
 cargo run --release --example arena       [turns] [period] [sucker]
 cargo run --release --example surface     [ticks] [seeds]
+cargo run --release --example hive        [epochs] [epoch_seconds]
 ```
 
 `colony` renders the world, compares the four species on one map, sweeps
@@ -305,6 +370,7 @@ the colony-wide temperature, and heats one caste. `experiments` replicates
 the classic setups. `arena` runs learners over the hierarchy with a hidden
 rotation and evaluates the untouched instinct against the learned hierarchy
 on fresh episodes. `surface` explores the geometric entropy channels.
+`hive` runs the memory probe and the closed loop of the queen's mind.
 
 ## The arena, turn by turn
 
@@ -353,7 +419,11 @@ and a single worker caste per species (body mass varies continuously).
 Temperature acts through Q10 factors, speed, an activity window and a
 thermal limit, without humidity or microclimate. Parameters are
 representative values from the cited studies rather than fits to any one
-dataset.
+dataset. The queen's mind is a probe, not a model of a real queen: a
+thought is a vector on a fixed clock, expressed through the entropy dials
+and read back by linear readouts, and the colony it thinks through is
+kept foraging by a reserve drain standing for nestmates that are not
+simulated.
 
 ## Reproducibility and tests
 
