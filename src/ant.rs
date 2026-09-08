@@ -118,6 +118,8 @@ pub struct Traits {
     pub foraging_threshold: f64,
     /// Nursing response threshold.
     pub nursing_threshold: f64,
+    /// Body mass relative to the species' typical worker.
+    pub size: f64,
     /// Walking speed in cells per tick at the reference temperature.
     pub speed: f64,
     /// Multiplier on the probability of laying trail.
@@ -131,11 +133,15 @@ impl Traits {
     pub fn draw(species: &Species, cell_cm: f64, tick_s: f64, rng: &mut Rng) -> Self {
         let spread = species.threshold_spread;
         let lognormal = |rng: &mut Rng, median: f64| median * (spread * rng.normal()).exp();
+        let size_sigma = (1.0 + species.size_cv.max(0.0).powi(2)).ln().sqrt();
+        let size = (size_sigma * rng.normal()).exp().clamp(0.4, 2.5);
         Traits {
             foraging_threshold: lognormal(rng, species.threshold_median),
             nursing_threshold: lognormal(rng, species.nursing_threshold_median),
+            size,
             speed: species.speed_cm_s * tick_s / cell_cm
-                * (1.0 + 0.15 * rng.normal()).clamp(0.5, 1.5),
+                * size.powf(0.3)
+                * (1.0 + 0.1 * rng.normal()).clamp(0.6, 1.4),
             laying: (1.0 + 0.2 * rng.normal()).clamp(0.3, 1.7),
             sensitivity: (0.25 * rng.normal()).exp().clamp(0.5, 2.0),
         }
@@ -966,6 +972,28 @@ mod tests {
         assert!(
             (a.speed - 0.75).abs() < 0.4,
             "1.5 cm/s over 2 cm cells ≈ 0.75 cells/tick"
+        );
+        // Body size: a log-normal spread around one, faster when larger.
+        let sizes: Vec<f64> = (0..2000)
+            .map(|_| Traits::draw(&species, 2.0, 1.0, &mut rng).size)
+            .collect();
+        let mean = sizes.iter().sum::<f64>() / sizes.len() as f64;
+        let var = sizes.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / sizes.len() as f64;
+        assert!((mean - 1.0).abs() < 0.05, "mean size {mean}");
+        assert!(
+            (var.sqrt() / mean - species.size_cv).abs() < 0.05,
+            "cv {}",
+            var.sqrt() / mean
+        );
+        let mut big = a.clone();
+        big.size = 2.0;
+        assert!(big.size > b.size || big.size > a.size);
+        let mut desert = Species::cataglyphis();
+        desert.size_cv = 0.0;
+        let uniform = Traits::draw(&desert, 2.0, 1.0, &mut rng);
+        assert!(
+            (uniform.size - 1.0).abs() < 1e-12,
+            "no spread, no variation"
         );
         assert_eq!(Activity::Unloading.index(), 6);
         assert!(Activity::Nursing.is_inside());

@@ -1159,10 +1159,6 @@ impl Simulation {
         }
     }
 
-    fn inside_count(&self) -> usize {
-        self.alive.saturating_sub(self.outside)
-    }
-
     fn nurses_now(&self) -> usize {
         self.ants
             .iter()
@@ -1380,8 +1376,9 @@ impl Simulation {
         let cell = self.ants[i].cell();
         let (molarity, quality, crop, want_total) = {
             let a = &self.ants[i];
-            let desired =
-                self.species.crop_capacity_ul * self.species.load_fraction(a.load_quality);
+            let desired = self.species.crop_capacity_ul
+                * a.traits.size
+                * self.species.load_fraction(a.load_quality);
             (a.load_molarity, a.load_quality, a.crop_ul, desired)
         };
         let rate = self.species.intake_rate(molarity) * self.tick_s;
@@ -1431,7 +1428,7 @@ impl Simulation {
         if a.timer > 0 {
             return;
         }
-        let want = self.species.prey_load_mg;
+        let want = self.species.prey_load_mg * self.ants[i].traits.size;
         let taken = self.world.take_prey(cell, want);
         if taken > 0.0 {
             self.ants[i].item_mg = taken;
@@ -1915,8 +1912,14 @@ impl Simulation {
     // ---------------------------------------------------------------
 
     fn nest_step(&mut self) {
-        let inside = self.inside_count() as f64;
-        let consumption = inside
+        // Metabolism scales with body mass to the three quarters.
+        let metabolic_mass: f64 = self
+            .ants
+            .iter()
+            .filter(|a| a.alive && a.is_inside())
+            .map(|a| a.traits.size.powf(0.75))
+            .sum();
+        let consumption = metabolic_mass
             * self.species.consumption_mg_per_ant_per_s
             * self.metabolism_factor
             * self.tick_s;
@@ -2290,9 +2293,13 @@ mod tests {
 
     #[test]
     fn hunger_drives_foraging() {
-        let mut hungry = Simulation::new(hungry_fast(), 3);
+        // No brood, so that sugar hunger is the only foraging stimulus
+        // (larvae would send foragers out for protein regardless).
+        let mut hungry_cfg = hungry_fast();
+        hungry_cfg.nest.initial_brood_per_ant = 0.0;
+        let mut hungry = Simulation::new(hungry_cfg.clone(), 3);
         hungry.run(600);
-        let mut replete_cfg = hungry_fast();
+        let mut replete_cfg = hungry_cfg;
         replete_cfg.nest.initial_satiation = 1.0;
         let mut replete = Simulation::new(replete_cfg, 3);
         replete.run(600);

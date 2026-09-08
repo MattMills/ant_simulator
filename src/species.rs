@@ -211,6 +211,10 @@ pub struct Species {
     pub starvation_s: f64,
 
     // ---- task allocation ----
+    /// Coefficient of variation of worker body mass. Speed scales with
+    /// mass to the 0.3 (longer legs: Hurlbert, Ballantyne & Powell 2008),
+    /// crop and prey loads with mass, metabolism with mass to the 0.75.
+    pub size_cv: f64,
     /// Median foraging response threshold of adult workers.
     pub threshold_median: f64,
     /// Log-normal spread (σ of ln θ) of thresholds across workers.
@@ -396,6 +400,7 @@ impl Species {
             unloading_satiation_factor: 3.0,
             forager_hazard_per_s: 1.0 / day,
             starvation_s: 8.0 * 3600.0,
+            size_cv: 0.15,
             threshold_median: 0.5,
             threshold_spread: lognormal_sigma_for_cv(1.0),
             threshold_exponent: 2.0,
@@ -494,6 +499,9 @@ impl Species {
         s.territory_deposit = 0.0;
         s.territory = PheromoneParams::inert();
         s.heading_persistence_cm = 10.0;
+        // Strongly size-polymorphic foragers (Cerdá & Retana 1997,
+        // *Oecologia* 111:305).
+        s.size_cv = 0.35;
         s.pi_heading_noise_deg = 3.0;
         s.pi_distance_noise = 0.04;
         s.search_time_s = 300.0;
