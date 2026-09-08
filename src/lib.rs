@@ -79,16 +79,18 @@
 //!   stands in for a finer one's worth of transits where its transition
 //!   is coherent.
 //!
-//! * **Multiscale kinetics, the lens and the decision pipeline**
-//!   ([`world`], [`lens`], [`pipeline`]): the chemical field is kept at
+//! * **The field on two structures, the lens and the decision pipeline**
+//!   ([`world`], [`lens`], [`pipeline`]): a substrate mark is kept at
 //!   cell resolution where it has structure and as one mean per node of
-//!   the quadtree where it is faint, with conservative fluxes between
-//!   the two grains; the lens tessellates the tree between two points
-//!   so that the resolution follows the distance to the nearer of them,
-//!   the same from either end, and carries the geodesic round the walls;
-//!   and the pipeline holds an ant's decision for a horizon on invariant,
-//!   straight ground and schedules the rest against a frame budget,
-//!   earliest deadline first in the hierarchy's order.
+//!   the quadtree where it is faint, a volatile lives on the grain
+//!   throughout as volumetric information read as planes, and flat
+//!   coarse nodes merge into blocks, so a large or shaped arena costs its
+//!   structured ground rather than its bounding box; the lens
+//!   tessellates the tree between two points, fine at both ends and
+//!   coarse between, for a geodesic that is the same from either end;
+//!   and the decision pipeline holds an ant's heading where its decision
+//!   would have been the same and schedules the rest against a frame
+//!   budget. `cargo bench -- shapes` measures larger and shaped arenas.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
@@ -251,7 +253,7 @@ pub mod prelude {
     pub use crate::rng::Rng;
     pub use crate::rotation::{Mapping, Rotation, RotationSchedule};
     pub use crate::scaling::{
-        ant_scan, area_scan, exponent, measure, Measurement, Phase, Profile, Scan, Workload,
+        ant_scan, area_scan, exponent, measure, Measurement, Phase, Profile, Scan, Shapes, Workload,
     };
     pub use crate::species::Species;
     pub use crate::surface::{

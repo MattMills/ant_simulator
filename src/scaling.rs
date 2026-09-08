@@ -21,6 +21,7 @@ use crate::hive::{HistoryConfig, QueenConfig};
 use crate::memo::{MemoConfig, TransitConfig};
 use crate::pipeline::PipelineConfig;
 use crate::species::Species;
+use crate::world::Rect;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
@@ -183,6 +184,14 @@ pub struct Workload {
     pub species: Species,
     /// Seed of the map and the run.
     pub seed: u64,
+    /// Side of the kinetics grain's nodes, cells (zero for the dense
+    /// sweep of every cell).
+    pub kinetics_grain: usize,
+    /// The open ground, as rectangles (everything else wall); empty for
+    /// the whole grid. See [`Shapes`] for shapes.
+    pub open: Vec<Rect>,
+    /// Where the nest is (the grid's centre when none).
+    pub nest: Option<Position>,
 }
 
 impl Default for Workload {
@@ -198,6 +207,9 @@ impl Default for Workload {
             kinetics_stride: 1,
             pipeline: false,
             frame_budget: 0,
+            kinetics_grain: 8,
+            open: Vec::new(),
+            nest: None,
             species: Species::lasius_niger(),
             seed: 7,
         }
@@ -221,7 +233,11 @@ impl Workload {
         cfg.ants = self.ants;
         cfg.world.width = self.width;
         cfg.world.height = self.height;
-        cfg.world.nest = Position::new(self.width as i32 / 2, self.height as i32 / 2);
+        cfg.world.nest = self
+            .nest
+            .unwrap_or(Position::new(self.width as i32 / 2, self.height as i32 / 2));
+        cfg.world.open = self.open.clone();
+        cfg.world.kinetics_grain = self.kinetics_grain;
         // A nest that grows with the colony: about twenty workers per cell
         // when everyone is in, three cells of radius at least.
         cfg.world.nest_radius = ((self.ants as f64 / 20.0).sqrt() / 2.0).ceil().max(3.0) as i32;
@@ -265,6 +281,108 @@ impl Workload {
     }
 }
 
+/// Shaped arenas, as the open rectangles of a grid (everything else
+/// wall), for measuring what a shape costs against its bounding box.
+pub struct Shapes;
+
+impl Shapes {
+    /// A disc of the given radius about a centre, row by row.
+    pub fn disc(centre: Position, radius: i32) -> Vec<Rect> {
+        (centre.y - radius..=centre.y + radius)
+            .map(|y| {
+                let dy = (y - centre.y) as f64;
+                let half = ((radius as f64).powi(2) - dy * dy).max(0.0).sqrt() as i32;
+                Rect::new(
+                    Position::new(centre.x - half, y),
+                    Position::new(centre.x + half, y),
+                )
+            })
+            .collect()
+    }
+
+    /// A ring between two radii about a centre, row by row.
+    pub fn ring(centre: Position, outer: i32, inner: i32) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        for y in centre.y - outer..=centre.y + outer {
+            let dy = (y - centre.y) as f64;
+            let ho = ((outer as f64).powi(2) - dy * dy).max(0.0).sqrt() as i32;
+            if dy.abs() < inner as f64 {
+                let hi = ((inner as f64).powi(2) - dy * dy).max(0.0).sqrt() as i32;
+                rects.push(Rect::new(
+                    Position::new(centre.x - ho, y),
+                    Position::new(centre.x - hi - 1, y),
+                ));
+                rects.push(Rect::new(
+                    Position::new(centre.x + hi + 1, y),
+                    Position::new(centre.x + ho, y),
+                ));
+            } else {
+                rects.push(Rect::new(
+                    Position::new(centre.x - ho, y),
+                    Position::new(centre.x + ho, y),
+                ));
+            }
+        }
+        rects
+    }
+
+    /// An L: a bar down the west side and a bar along the south side of
+    /// a `side` × `side` square, each `width` cells wide.
+    pub fn l_shape(side: i32, width: i32) -> Vec<Rect> {
+        vec![
+            Rect::new(Position::new(0, 0), Position::new(width - 1, side - 1)),
+            Rect::new(
+                Position::new(0, side - width),
+                Position::new(side - 1, side - 1),
+            ),
+        ]
+    }
+
+    /// A cross: two bars `width` cells wide through the middle of a
+    /// `side` × `side` square.
+    pub fn cross(side: i32, width: i32) -> Vec<Rect> {
+        let a = (side - width) / 2;
+        vec![
+            Rect::new(Position::new(a, 0), Position::new(a + width - 1, side - 1)),
+            Rect::new(Position::new(0, a), Position::new(side - 1, a + width - 1)),
+        ]
+    }
+
+    /// Rooms joined by corridors: `n` × `n` rooms in a `side` × `side`
+    /// square, each room three quarters of its cell of the grid, the
+    /// corridors an eighth as wide as a room.
+    pub fn rooms(side: i32, n: i32) -> Vec<Rect> {
+        let pitch = side / n.max(1);
+        let room = pitch * 3 / 4;
+        let margin = (pitch - room) / 2;
+        let door = (room / 8).max(2);
+        let mut rects = Vec::new();
+        for ry in 0..n {
+            for rx in 0..n {
+                let (x0, y0) = (rx * pitch + margin, ry * pitch + margin);
+                rects.push(Rect::new(
+                    Position::new(x0, y0),
+                    Position::new(x0 + room - 1, y0 + room - 1),
+                ));
+                let mid = room / 2 - door / 2;
+                if rx + 1 < n {
+                    rects.push(Rect::new(
+                        Position::new(x0 + room, y0 + mid),
+                        Position::new(x0 + pitch - 1, y0 + mid + door - 1),
+                    ));
+                }
+                if ry + 1 < n {
+                    rects.push(Rect::new(
+                        Position::new(x0 + mid, y0 + room),
+                        Position::new(x0 + mid + door - 1, y0 + pitch - 1),
+                    ));
+                }
+            }
+        }
+        rects
+    }
+}
+
 /// What timing a workload found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measurement {
@@ -294,6 +412,8 @@ pub struct Measurement {
     /// Share of the kinetics grain's nodes at which the trail channel
     /// is kept at cell resolution at the end.
     pub active: f64,
+    /// Open cells of the grid (the rest wall).
+    pub open_cells: usize,
     /// The phase breakdown of the median run.
     pub profile: Profile,
 }
@@ -359,6 +479,12 @@ pub fn measure(workload: &Workload, repeats: usize) -> Measurement {
         delivered: sim.stats().food_delivered,
         entropy: sim.stats().mean_entropy(),
         active: sim.world().active_share(crate::pheromone::Pheromone::Trail),
+        open_cells: sim
+            .world()
+            .cells()
+            .iter()
+            .filter(|c| c.terrain != crate::world::Terrain::Wall)
+            .count(),
         profile: sim.profile().clone(),
     }
 }

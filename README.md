@@ -769,33 +769,40 @@ Sweeping the area at 100 workers:
    65536       817        81733    12235        21%         73%     17%
 ```
 
-The field is kept at two grains: the grid is tiled by the quadtree's
-nodes at one level (8 cells across), and for every channel a node is
-either *active*, its cells carrying the field, or *coarse*, one mean
-standing for all of them. Mass moves between cells, between a cell and
-a coarse node, and between coarse nodes by the same conservative shares,
-so the field is exact on and around the trails, where marks land and
-the front of the field reaches, and cheap where it is faint: a node
-whose cells have all faded below a hundredth of the perception constant
-is composed into its mean (fine to coarse), and a coarse node that a
-deposit or the front reaches is refined into cells again (coarse to
-fine). The volatile channels, the smell of food and alarm, spread
-through the air over the whole field and are kept at cell resolution
-only within two perception constants of their sources; beyond, a coarse
-node reads as the plane through its mean with the gradient of its
-neighbours', so a scout still follows the smell (the scouts of the
-discovery experiment find the hidden pool in 40 s with it against 86 s
-without, as before). *Active* above is the share of the nodes at which
-the trail is at cell resolution: a sixth of a 65536-cell world, on
-which the kinetics scale as area^0.76 and the tick as area^0.47, where
-the dense sweep of the previous round ran this world at 527 ticks a
-second and scaled as area^0.91. The food kinetics visit only the cells
-that carry food, the movement history forgets lazily (a tick costs
-nothing), and the nest keeps its counts, so none of those grows with
-the grid or the colony. What remains is the decisions, which are the
-model, and the bookkeeping of every step walked; at colony scale the
-memoized transits and the pipeline stand in for half of the steps (the
-colony-scale table in the memo section above).
+The field is kept on two structures, over the grid tiled by the
+quadtree's nodes at one level (8 cells across). A *substrate mark*
+(trail, home, territory, no entry) lies where ants walked and is read
+within antennal reach, so it is kept at cell resolution where it has
+structure and as one mean per node where it is faint: a node is either
+*active*, its cells carrying the field, or *coarse*. Mass moves between
+cells, between a cell and a coarse node, and between coarse nodes by
+the same conservative shares, so the field is exact on and around the
+trails, where marks land and the front of the field reaches, and cheap
+where it is faint: a node whose cells have all faded below a hundredth
+of the perception constant is composed into its mean (fine to coarse),
+and a coarse node that a deposit or the front reaches is refined into
+cells again (coarse to fine). A *volatile* (the smell of food, alarm)
+is volumetric information that flows through the air, not a mark on
+the ground, and lives on the grain throughout: its sources emit into
+the pools of their nodes, its mass moves between nodes, and a reader
+sees the plane through a node's mean with the gradient of its
+neighbours', never a cell; the scouts of the discovery experiment find
+the hidden pool by its smell in 54 s against 86 s without, 153 against
+250 s from twice as far and 297 against 536 s from three times as far,
+as they did with the smell at cell resolution. On both structures, flat
+coarse nodes merge into blocks of two, four and eight nodes across and
+split again when the field reaches them, so a flat far field costs a
+few blocks. *Active* above is the share of the nodes at which the trail
+is at cell resolution: a sixth of a 65536-cell world, on which the
+kinetics scale as area^0.76 and the tick as area^0.47, where the dense
+sweep of the previous round ran this world at 527 ticks a second and
+scaled as area^0.91. The food kinetics visit only the cells that carry
+food, the movement history forgets lazily (a tick costs nothing), and
+the nest keeps its counts, so none of those grows with the grid or the
+colony. What remains is the decisions, which are the model, and the
+bookkeeping of every step walked; at colony scale the memoized transits
+and the pipeline stand in for half of the steps (the colony-scale table
+in the memo section above).
 
 ## Reproducibility and tests
 
