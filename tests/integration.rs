@@ -276,3 +276,75 @@ fn geometry_bandit_learns_in_a_sucker_arena() {
     assert!(report.learners[0].summary.starts_with("geometry-bandit"));
     assert_eq!(arena.hierarchy().param_len(), 10 * PARAM_LEN);
 }
+
+#[test]
+fn nest_interior_is_structured_by_age() {
+    // Sendova-Franks & Franks 1995; Mersch, Crespi & Keller 2013: workers
+    // keep to zones that drift outward with age, so the young sit with
+    // the brood and the old by the entrance, and food changes hands
+    // mostly within a zone.
+    let mut cfg = SimConfig::default();
+    cfg.world.seed = Some(11);
+    cfg.world.nest_radius = 3;
+    cfg.ants = 60;
+    cfg.nest.initial_satiation = 0.3;
+    cfg.nest.initial_brood_per_ant = 1.0;
+    let mut sim = Simulation::new(cfg, 5);
+    sim.run_seconds(20.0 * 60.0);
+    let r = sim.age_depth_correlation();
+    assert!(r > 0.3, "age–depth correlation {r}");
+    let profile = sim.nest_profile();
+    assert!(
+        profile[0].mean_age_s < profile[2].mean_age_s,
+        "the brood chamber holds the younger workers: {profile:?}"
+    );
+    let contacts = sim.stats().nest_contacts;
+    let assortativity = sim.stats().contact_assortativity();
+    assert!(
+        assortativity > 0.0,
+        "food changes hands within a zone more than chance: {assortativity} {contacts:?}"
+    );
+    assert_eq!(
+        contacts[0][2], 0,
+        "food from the entrance reaches the brood only through the workers between: {contacts:?}"
+    );
+}
+
+#[test]
+fn food_is_handed_inward_and_corpses_carried_out() {
+    // Greenwald, Segre & Feinerman 2015: foragers unload near the
+    // entrance and the food percolates inward by trophallaxis; corpses
+    // inside are fetched from where they lie and carried out.
+    let mut cfg = SimConfig::default();
+    cfg.world.seed = Some(11);
+    cfg.world.nest_radius = 3;
+    cfg.ants = 60;
+    cfg.nest.initial_satiation = 0.05;
+    cfg.nest.initial_brood_per_ant = 1.0;
+    let mut sim = Simulation::new(cfg, 5);
+    let nest = sim.world().nest();
+    for _ in 0..2 {
+        sim.world_mut().add_corpse(nest);
+    }
+    sim.run_seconds(30.0 * 60.0);
+    let s = sim.stats();
+    assert!(s.food_delivered > 0, "{s:?}");
+    assert!(
+        s.trophallaxis_mg > 0.5 * s.sugar_delivered_mg,
+        "the food is handed on: {} mg passed on of {} delivered",
+        s.trophallaxis_mg,
+        s.sugar_delivered_mg
+    );
+    let profile = sim.nest_profile();
+    assert!(
+        profile[0].mean_crop_fill > 0.0,
+        "the chamber is fed: {profile:?}"
+    );
+    assert!(s.activity_ticks[Activity::Nursing.index()] > 0);
+    assert!(
+        s.corpses_fetched >= 2,
+        "undertakers fetch corpses where they lie: {}",
+        s.corpses_fetched
+    );
+    assert_eq!(sim.nest().corpses, 0);
+}

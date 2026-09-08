@@ -14,11 +14,11 @@ use std::fmt::Write as _;
 ///   two, `%` a pile of them, `L` a landmark, `x` an alarm cloud,
 /// * `o` an outbound ant, `<` an inbound ant carrying food, `-` an inbound
 ///   ant returning empty, `?` a searching ant, `f` an ant feeding,
+/// * on the nest's cells, `u` a forager unloading, `n` a nurse, `v` a
+///   worker fetching a corpse or leaving, `w` a worker at rest,
 /// * `@`, `:` and `.` strong, medium and faint recruitment trail,
 ///   `,` home-range marking, `!` no-entry marking,
 /// * space for nothing.
-///
-/// Ants inside the nest are not drawn.
 pub fn render(sim: &Simulation) -> String {
     let world = sim.world();
     let w = world.width();
@@ -32,6 +32,7 @@ pub fn render(sim: &Simulation) -> String {
                 .expect("in bounds");
             *slot = match cell.terrain {
                 Terrain::Wall => '#',
+                Terrain::Nest if cell.corpses > 0 => '+',
                 Terrain::Nest => 'N',
                 Terrain::Open => {
                     let trail = cell.level(Pheromone::Trail);
@@ -63,11 +64,30 @@ pub fn render(sim: &Simulation) -> String {
             grid[l.y as usize][l.x as usize] = 'L';
         }
     }
+    let mut inside_rank = vec![vec![0u8; w]; h];
     for ant in sim.living() {
+        let cell = ant.cell();
         if ant.is_inside() {
+            if cell.x >= 0 && cell.y >= 0 && (cell.y as usize) < h && (cell.x as usize) < w {
+                let rank = match ant.activity {
+                    Activity::Unloading => 4,
+                    Activity::Nursing => 3,
+                    Activity::Fetching | Activity::Leaving => 2,
+                    _ => 1,
+                };
+                let slot = &mut inside_rank[cell.y as usize][cell.x as usize];
+                if rank > *slot {
+                    *slot = rank;
+                    grid[cell.y as usize][cell.x as usize] = match rank {
+                        4 => 'u',
+                        3 => 'n',
+                        2 => 'v',
+                        _ => 'w',
+                    };
+                }
+            }
             continue;
         }
-        let cell = ant.cell();
         if cell.x < 0 || cell.y < 0 {
             continue;
         }

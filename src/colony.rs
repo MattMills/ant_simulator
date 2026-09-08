@@ -617,6 +617,13 @@ pub struct Stats {
     pub trophallaxis_mg: f64,
     /// Unloadings abandoned with a load still in the crop.
     pub failed_unloads: u64,
+    /// Trophallaxis contacts inside the nest by the zones of the two
+    /// workers (0 the brood chamber, 1 between, 2 the entrance ring),
+    /// counted in both directions.
+    pub nest_contacts: [[u64; 3]; 3],
+    /// Corpses fetched from where they lay inside the nest by
+    /// undertakers (`corpses_moved` counts every pick-up, outside too).
+    pub corpses_fetched: u64,
     /// Position fixes taken from familiar landmarks.
     pub landmark_fixes: u64,
     /// Periodic snapshots.
@@ -630,6 +637,27 @@ impl Stats {
             delivered_by_node: vec![0; nodes],
             path_by_node: vec![PathStats::default(); nodes],
             ..Stats::default()
+        }
+    }
+
+    /// Assortativity of the trophallaxis contacts by zone (Newman 2003):
+    /// 1 when workers only exchange food within their own zone, 0 when
+    /// zones mix at random, negative when exchanges cross zones more than
+    /// chance would have them.
+    pub fn contact_assortativity(&self) -> f64 {
+        let total: u64 = self.nest_contacts.iter().flatten().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let e = |i: usize, j: usize| self.nest_contacts[i][j] as f64 / total as f64;
+        let trace: f64 = (0..3).map(|i| e(i, i)).sum();
+        let chance: f64 = (0..3)
+            .map(|i| (0..3).map(|j| e(i, j)).sum::<f64>().powi(2))
+            .sum();
+        if (1.0 - chance).abs() < 1e-12 {
+            0.0
+        } else {
+            (trace - chance) / (1.0 - chance)
         }
     }
 
@@ -732,6 +760,42 @@ enum Cause {
     Heat,
 }
 
+/// The workers inside one zone of the nest.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ZoneProfile {
+    /// Zone: 0 the brood chamber, 1 between, 2 the entrance ring.
+    pub class: usize,
+    /// Workers inside in this class.
+    pub workers: usize,
+    /// Their mean age, seconds.
+    pub mean_age_s: f64,
+    /// Their mean crop fill.
+    pub mean_crop_fill: f64,
+    /// How many of them are nursing.
+    pub nursing: usize,
+}
+
+/// Pearson correlation of two series.
+fn correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let mx = x[..n].iter().sum::<f64>() / n as f64;
+    let my = y[..n].iter().sum::<f64>() / n as f64;
+    let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+    for (a, b) in x[..n].iter().zip(&y[..n]) {
+        sxy += (a - mx) * (b - my);
+        sxx += (a - mx).powi(2);
+        syy += (b - my).powi(2);
+    }
+    if sxx <= 1e-18 || syy <= 1e-18 {
+        0.0
+    } else {
+        sxy / (sxx * syy).sqrt()
+    }
+}
+
 /// A running colony.
 #[derive(Clone, Debug)]
 pub struct Simulation {
@@ -751,6 +815,8 @@ pub struct Simulation {
     mind: Option<Queen>,
     nest: Nest,
     nest_cells: Vec<Position>,
+    /// Living workers inside the nest, by world cell index.
+    inside_by_cell: Vec<Vec<usize>>,
     alive: usize,
     outside: usize,
     next_leaf: usize,
@@ -843,6 +909,7 @@ impl Simulation {
                 .map(|m| Queen::new(m, &hierarchy_for_queen)),
             nest,
             nest_cells,
+            inside_by_cell: vec![Vec::new(); world_width * world_height],
             alive: 0,
             outside: 0,
             next_leaf: 0,
@@ -874,6 +941,7 @@ impl Simulation {
                 .range(0.0, sim.config.nest.initial_age_spread_s.max(0.0));
             let id = sim.spawn_ant();
             sim.ants[id].age = (age_s / tick_s) as u64;
+            sim.place_by_zone(id);
         }
         let brood_items =
             (sim.config.nest.initial_brood_per_ant * sim.config.ants as f64).round() as usize;
@@ -923,6 +991,420 @@ impl Simulation {
         (seconds / self.tick_s).round().max(1.0) as u32
     }
 
+    // ---------------------------------------------------------------
+    // The nest interior
+    // ---------------------------------------------------------------
+
+    /// Depth of a nest cell: 0 at the centre (the brood), 1 on the outer
+    /// ring (the entrance), by Chebyshev distance over the nest radius.
+    pub fn depth_of(&self, cell: Position) -> f64 {
+        let radius = self.world.nest_radius();
+        if radius <= 0 {
+            return 0.0;
+        }
+        let nest = self.world.nest();
+        let d = (cell.x - nest.x).abs().max((cell.y - nest.y).abs());
+        (d as f64 / radius as f64).min(1.0)
+    }
+
+    /// Zone of a depth: 0 the brood chamber, 1 between, 2 the entrance
+    /// ring.
+    pub fn zone_class(&self, depth: f64) -> usize {
+        if depth <= self.species.brood_depth {
+            0
+        } else if depth < 1.0 - 1e-9 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// How much of the brood's demand a worker at a cell perceives: all
+    /// of it in the brood chamber, fading over the species' reach with
+    /// the distance from it. Workers respond to the tasks they
+    /// encounter, so where they stand decides what they do (foraging for
+    /// work, Tofts & Franks 1992).
+    pub fn brood_proximity(&self, cell: Position) -> f64 {
+        let depth = (self.depth_of(cell) - self.species.brood_depth).max(0.0);
+        let distance_cm = depth * self.world.nest_radius().max(0) as f64 * self.world.cell_cm();
+        (-distance_cm / self.species.brood_reach_cm.max(1e-9)).exp()
+    }
+
+    /// The depth a worker keeps to: callow workers sit with the brood and
+    /// drift outward with age, reaching the entrance ring after twice the
+    /// maturation time, each with its own offset.
+    pub fn zone_depth(&self, ant: &Ant) -> f64 {
+        let s = &self.species;
+        let age_s = ant.age as f64 * self.tick_s;
+        let drift = (age_s / (2.0 * s.maturation_s).max(1e-9)).min(1.0);
+        (s.callow_depth + (1.0 - s.callow_depth) * drift + ant.traits.zone_offset).clamp(0.0, 1.0)
+    }
+
+    /// Correlation of age with depth over the workers inside: positive
+    /// when the old sit outward and the young with the brood.
+    pub fn age_depth_correlation(&self) -> f64 {
+        let (ages, depths): (Vec<f64>, Vec<f64>) = self
+            .living()
+            .filter(|a| a.is_inside())
+            .map(|a| (a.age as f64 * self.tick_s, self.depth_of(a.cell())))
+            .unzip();
+        correlation(&ages, &depths)
+    }
+
+    /// The workers inside by zone.
+    pub fn nest_profile(&self) -> [ZoneProfile; 3] {
+        let mut out = [ZoneProfile::default(); 3];
+        for (k, z) in out.iter_mut().enumerate() {
+            z.class = k;
+        }
+        let mut ages = [0.0; 3];
+        let mut fills = [0.0; 3];
+        for a in self.living().filter(|a| a.is_inside()) {
+            let k = self.zone_class(self.depth_of(a.cell()));
+            out[k].workers += 1;
+            ages[k] += a.age as f64 * self.tick_s;
+            fills[k] += a.crop_fill();
+            if a.activity == Activity::Nursing {
+                out[k].nursing += 1;
+            }
+        }
+        for k in 0..3 {
+            if out[k].workers > 0 {
+                out[k].mean_age_s = ages[k] / out[k].workers as f64;
+                out[k].mean_crop_fill = fills[k] / out[k].workers as f64;
+            }
+        }
+        out
+    }
+
+    /// The nest interior as text, one glyph per nest cell: `u` a forager
+    /// unloading, `n` a nurse, `v` a worker fetching a corpse or leaving,
+    /// `w` a worker at rest, `+` a corpse with nobody on it, `:` an empty
+    /// cell of the brood chamber, `.` an empty cell elsewhere.
+    pub fn render_nest(&self) -> String {
+        let nest = self.world.nest();
+        let r = self.world.nest_radius().max(0);
+        let mut out = String::new();
+        for y in nest.y - r..=nest.y + r {
+            for x in nest.x - r..=nest.x + r {
+                let cell = Position::new(x, y);
+                let corpses = self.world.cell(cell).map(|c| c.corpses).unwrap_or(0);
+                let rank = self
+                    .world
+                    .index(cell)
+                    .map(|i| {
+                        self.inside_by_cell[i]
+                            .iter()
+                            .map(|&j| match self.ants[j].activity {
+                                Activity::Unloading => 4,
+                                Activity::Nursing => 3,
+                                Activity::Fetching | Activity::Leaving => 2,
+                                _ => 1,
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let chamber = self.depth_of(cell) <= self.species.brood_depth;
+                out.push(match rank {
+                    4 => 'u',
+                    3 => 'n',
+                    2 => 'v',
+                    1 => 'w',
+                    _ if corpses > 0 => '+',
+                    _ if chamber => ':',
+                    _ => '.',
+                });
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Rebuild the index of workers inside by cell.
+    fn index_inside(&mut self) {
+        for v in self.inside_by_cell.iter_mut() {
+            v.clear();
+        }
+        for i in 0..self.ants.len() {
+            let a = &self.ants[i];
+            if a.alive && a.is_inside() {
+                if let Some(k) = self.world.index(a.cell()) {
+                    self.inside_by_cell[k].push(i);
+                }
+            }
+        }
+    }
+
+    /// Living workers inside the nest.
+    fn inside_count(&self) -> usize {
+        self.inside_by_cell.iter().map(|v| v.len()).sum()
+    }
+
+    /// Workers inside within reach of worker `i`: on its cell or the eight
+    /// around it.
+    fn neighbours_inside(&self, i: usize) -> Vec<usize> {
+        let here = self.ants[i].cell();
+        let mut out = Vec::new();
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(k) = self.world.index(here.offset(dx, dy)) {
+                    out.extend(
+                        self.inside_by_cell[k]
+                            .iter()
+                            .copied()
+                            .filter(|&j| j != i && self.ants[j].alive),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// Count a trophallaxis contact between two workers inside.
+    fn record_contact(&mut self, i: usize, j: usize) {
+        let ci = self.zone_class(self.depth_of(self.ants[i].cell()));
+        let cj = self.zone_class(self.depth_of(self.ants[j].cell()));
+        self.stats.nest_contacts[ci][cj] += 1;
+        self.stats.nest_contacts[cj][ci] += 1;
+    }
+
+    /// Corpses lying on nest cells.
+    fn nest_corpses(&self) -> u32 {
+        self.nest_cells
+            .iter()
+            .map(|&c| self.world.cell(c).map(|c| c.corpses as u32).unwrap_or(0))
+            .sum()
+    }
+
+    /// The nest cell with a corpse nearest to `from`.
+    fn nearest_corpse_cell(&self, from: Position) -> Option<Position> {
+        self.nest_cells
+            .iter()
+            .copied()
+            .filter(|&c| self.world.cell(c).map(|c| c.corpses > 0).unwrap_or(false))
+            .min_by_key(|&c| (c.x - from.x).abs().max((c.y - from.y).abs()))
+    }
+
+    /// A cell of the entrance ring nearest to `from` (any of the nearest,
+    /// at random).
+    fn nearest_exit(&mut self, from: Position) -> Position {
+        let mut best = i32::MAX;
+        let mut candidates = Vec::new();
+        for &c in &self.nest_cells {
+            if self.depth_of(c) < 1.0 - 1e-9 {
+                continue;
+            }
+            let d = (c.x - from.x).abs().max((c.y - from.y).abs());
+            if d < best {
+                best = d;
+                candidates.clear();
+            }
+            if d == best {
+                candidates.push(c);
+            }
+        }
+        if candidates.is_empty() {
+            from
+        } else {
+            candidates[self.rng.below(candidates.len())]
+        }
+    }
+
+    /// Put a worker at a nest cell of its zone's depth.
+    fn place_by_zone(&mut self, i: usize) {
+        let zone = self.zone_depth(&self.ants[i]);
+        let mut best = f64::INFINITY;
+        let mut candidates = Vec::new();
+        for &c in &self.nest_cells {
+            let d = (self.depth_of(c) - zone).abs();
+            if d < best - 1e-9 {
+                best = d;
+                candidates.clear();
+            }
+            if (d - best).abs() <= 1e-9 {
+                candidates.push(c);
+            }
+        }
+        if !candidates.is_empty() {
+            let c = candidates[self.rng.below(candidates.len())];
+            self.ants[i].position = Point::center_of(c);
+        }
+    }
+
+    /// One tick of walking inside the nest: with the probability that the
+    /// inside walking speed gives, step to one of the neighbouring nest
+    /// cells (or stay), drawn by a soft preference for the target depth
+    /// (the worker's zone; the brood for a nurse; near the entrance for a
+    /// forager unloading) or for the goal cell of a worker fetching a
+    /// corpse or leaving.
+    fn walk_inside(&mut self, i: usize) {
+        if self.world.nest_radius() <= 0 {
+            return;
+        }
+        let speed_cells =
+            self.species.nest_speed_cm_s * self.tick_s / self.world.cell_cm().max(1e-9);
+        if !self
+            .rng
+            .chance((speed_cells * self.activity_factor).min(1.0))
+        {
+            return;
+        }
+        let from = self.ants[i].cell();
+        let activity = self.ants[i].activity;
+        let goal = self.ants[i].goal;
+        let zone = self.zone_depth(&self.ants[i]);
+        let spread = self.species.zone_spread.max(1e-3);
+        let mut candidates: Vec<(Position, f64)> = Vec::with_capacity(9);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let c = from.offset(dx, dy);
+                if !self.world.is_nest(c) {
+                    continue;
+                }
+                let depth = self.depth_of(c);
+                let score = match (activity, goal) {
+                    // Anywhere in the brood chamber will do for a nurse.
+                    (Activity::Nursing, _) => -(depth - self.species.brood_depth).max(0.0) / spread,
+                    (Activity::Unloading, _) => {
+                        -(depth - self.species.unloading_depth).abs() / spread
+                    }
+                    (Activity::Fetching | Activity::Leaving, Some(g)) => {
+                        -((c.x - g.x).abs().max((c.y - g.y).abs()) as f64) / spread
+                    }
+                    _ => -(depth - zone).abs() / spread,
+                };
+                candidates.push((c, score));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let top = candidates
+            .iter()
+            .map(|c| c.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = candidates.iter().map(|c| (c.1 - top).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        let mut u = self.rng.next_f64() * total;
+        let mut chosen = candidates[0].0;
+        for (c, w) in candidates.iter().zip(&weights) {
+            if u < *w {
+                chosen = c.0;
+                break;
+            }
+            u -= w;
+        }
+        if chosen == from {
+            return;
+        }
+        let from_point = self.ants[i].position;
+        let to_point = Point::center_of(chosen);
+        let (dx, dy) = from_point.to(to_point);
+        let direction = crate::geometry::angle_of(dx, dy);
+        let turn = crate::geometry::wrap_angle(direction - self.ants[i].heading);
+        if let Some(h) = &mut self.history {
+            h.record(from_point, to_point, turn);
+        }
+        if let (Some(a), Some(b)) = (self.world.index(from), self.world.index(chosen)) {
+            self.inside_by_cell[a].retain(|&j| j != i);
+            self.inside_by_cell[b].push(i);
+        }
+        let a = &mut self.ants[i];
+        a.position = to_point;
+        a.heading = direction;
+    }
+
+    /// The cell of the entrance ring that faces a remembered site: a
+    /// forager that knows where it is going leaves on that side.
+    fn exit_towards(&self, site: (f64, f64)) -> Option<Position> {
+        let len = (site.0 * site.0 + site.1 * site.1).sqrt();
+        if len <= 1e-9 {
+            return None;
+        }
+        let nest = Point::center_of(self.world.nest());
+        let radius = self.world.nest_radius() as f64;
+        let aim = Point::new(
+            nest.x + site.0 / len * radius,
+            nest.y + site.1 / len * radius,
+        );
+        self.nest_cells
+            .iter()
+            .copied()
+            .filter(|&c| self.depth_of(c) >= 1.0 - 1e-9)
+            .min_by(|&a, &b| {
+                let da = Point::center_of(a).distance(aim);
+                let db = Point::center_of(b).distance(aim);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
+    /// Set out for the entrance to go outside: by the ring cell facing a
+    /// remembered site, or the nearest one; a worker in a nest without an
+    /// interior leaves at once.
+    fn start_leaving(&mut self, i: usize) {
+        let here = self.ants[i].cell();
+        if self.world.nest_radius() <= 0 {
+            self.depart(i);
+            return;
+        }
+        let exit = match self.ants[i].site.map(|s| s.vector) {
+            Some(v) if !self.ants[i].corpse => self.exit_towards(v),
+            _ => None,
+        }
+        .unwrap_or_else(|| self.nearest_exit(here));
+        if exit == here {
+            self.depart(i);
+            return;
+        }
+        let a = &mut self.ants[i];
+        a.activity = Activity::Leaving;
+        a.goal = Some(exit);
+    }
+
+    /// A worker on its way to the entrance leaves once it stands on the
+    /// ring cell it was making for (or on any ring cell, when it has no
+    /// goal).
+    fn leave(&mut self, i: usize) {
+        let here = self.ants[i].cell();
+        let arrived = match self.ants[i].goal {
+            Some(goal) => here == goal,
+            None => self.depth_of(here) >= 1.0 - 1e-9,
+        };
+        if self.world.nest_radius() <= 0 || arrived {
+            self.depart(i);
+        }
+    }
+
+    /// A worker on its way to a corpse picks it up where it lies and sets
+    /// out for the entrance with it; if someone else took it, it looks
+    /// for another or goes back to rest.
+    fn fetch(&mut self, i: usize) {
+        let Some(goal) = self.ants[i].goal else {
+            self.ants[i].activity = Activity::Resting;
+            return;
+        };
+        let here = self.ants[i].cell();
+        if here != goal {
+            return;
+        }
+        if self.world.take_corpse(here) {
+            self.ants[i].corpse = true;
+            self.stats.corpses_moved += 1;
+            self.stats.corpses_fetched += 1;
+            self.start_leaving(i);
+        } else {
+            match self.nearest_corpse_cell(here) {
+                Some(c) => self.ants[i].goal = Some(c),
+                None => {
+                    let a = &mut self.ants[i];
+                    a.goal = None;
+                    a.activity = Activity::Resting;
+                }
+            }
+        }
+    }
+
     fn spawn_ant(&mut self) -> usize {
         let id = self.ants.len();
         let heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
@@ -963,6 +1445,11 @@ impl Simulation {
     /// The world.
     pub fn world(&self) -> &World {
         &self.world
+    }
+
+    /// The world, mutably (to place corpses or food during an experiment).
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 
     /// All ants, living and dead.
@@ -1152,6 +1639,7 @@ impl Simulation {
             self.recompile();
         }
         self.update_environment();
+        self.index_inside();
         for i in 0..self.ants.len() {
             if self.ants[i].alive {
                 self.step_ant(i);
@@ -1270,6 +1758,9 @@ impl Simulation {
             if self.ants[i].activity == Activity::Unloading || !self.rng.chance(p_share) {
                 continue;
             }
+            // The reserve is met in proportion to the nestmates it stands
+            // for among all those inside; a simulated nestmate has to be
+            // within reach.
             let others = (inside.len() - 1) as f64;
             let meet_reserve = virtual_nestmates > 0.0
                 && self
@@ -1293,9 +1784,14 @@ impl Simulation {
                 self.ants[i].sugar_mg -= amount;
                 self.nest.store_mg += amount;
                 self.stats.trophallaxis_mg += amount.abs();
-            } else if others > 0.0 {
-                let j = inside[self.rng.below(inside.len())];
-                if j != i && self.ants[j].activity != Activity::Unloading {
+            } else {
+                let near: Vec<usize> = self
+                    .neighbours_inside(i)
+                    .into_iter()
+                    .filter(|&j| self.ants[j].activity != Activity::Unloading)
+                    .collect();
+                if !near.is_empty() {
+                    let j = near[self.rng.below(near.len())];
                     // The transfer that would equalise the two fills.
                     let (sj, cj) = (self.ants[j].sugar_mg, self.ants[j].crop_capacity_mg);
                     let equalising = (si * cj - sj * ci) / (ci + cj).max(1e-12);
@@ -1304,6 +1800,7 @@ impl Simulation {
                         self.ants[i].sugar_mg -= amount;
                         self.ants[j].sugar_mg += amount;
                         self.stats.trophallaxis_mg += amount.abs();
+                        self.record_contact(i, j);
                     }
                 }
             }
@@ -1325,10 +1822,15 @@ impl Simulation {
         self.ants[i].age += 1;
         self.ants[i].excitement *= self.excitation_retention;
         self.reinforce(i, activity);
+        if activity.is_inside() {
+            self.walk_inside(i);
+        }
         match activity {
             Activity::Resting => self.rest(i),
             Activity::Nursing => self.nurse(i),
             Activity::Unloading => self.unload(i),
+            Activity::Fetching => self.fetch(i),
+            Activity::Leaving => self.leave(i),
             Activity::Feeding => self.feed(i),
             Activity::Outbound | Activity::Inbound | Activity::Searching => self.walk(i),
         }
@@ -1361,7 +1863,7 @@ impl Simulation {
         let a = &mut self.ants[i];
         let (f_factor, n_factor) = match activity {
             Activity::Nursing => (forget, learn),
-            Activity::Resting => (forget, forget),
+            Activity::Resting | Activity::Leaving | Activity::Fetching => (forget, forget),
             _ => (learn, forget),
         };
         a.traits.foraging_threshold =
@@ -1408,7 +1910,9 @@ impl Simulation {
             let nurses = self.nurses_now() as f64;
             (larvae / self.species.brood_per_nurse.max(1e-9)) / (nurses + 1.0)
         };
-        let p_nurse = self.species.response(demand, nursing_threshold) * self.decision_prob;
+        let p_nurse = self.species.response(demand, nursing_threshold)
+            * self.decision_prob
+            * self.brood_proximity(self.ants[i].cell());
         // Undertaking: corpses inside are carried out and dropped away
         // from the nest.
         let p_undertake = if self.nest.corpses > 0 {
@@ -1419,13 +1923,15 @@ impl Simulation {
         };
         let u = self.rng.next_f64();
         if u < p_undertake {
-            self.nest.corpses -= 1;
-            self.stats.corpses_moved += 1;
-            self.depart(i);
-            self.ants[i].corpse = true;
-            self.ants[i].laying = None;
+            // Undertaking: go to the corpse where it lies.
+            let here = self.ants[i].cell();
+            if let Some(target) = self.nearest_corpse_cell(here) {
+                let a = &mut self.ants[i];
+                a.activity = Activity::Fetching;
+                a.goal = Some(target);
+            }
         } else if u < p_undertake + p_forage {
-            self.depart(i);
+            self.start_leaving(i);
         } else if u < p_undertake + p_forage + p_nurse {
             let bout = self.seconds_to_ticks(self.species.nursing_bout_s);
             let a = &mut self.ants[i];
@@ -1435,7 +1941,12 @@ impl Simulation {
     }
 
     fn depart(&mut self, i: usize) {
-        let exit = self.nest_cells[self.rng.below(self.nest_cells.len().max(1))];
+        let here = self.ants[i].cell();
+        let exit = if self.world.is_nest(here) {
+            here
+        } else {
+            self.nest_cells[self.rng.below(self.nest_cells.len().max(1))]
+        };
         let heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
         let jitter = (self.rng.range(-0.4, 0.4), self.rng.range(-0.4, 0.4));
         let outbound_laying = self.species.outbound_laying;
@@ -1460,19 +1971,26 @@ impl Simulation {
         a.activity = Activity::Outbound;
         a.accepts_prey = accepts_prey;
         a.item_mg = 0.0;
-        a.corpse = false;
+        a.goal = None;
         if nest_view.is_some() {
             a.nest_view = nest_view;
         }
         let c = Point::center_of(exit);
         a.position = Point::new(c.x + jitter.0, c.y + jitter.1);
         a.heading = heading;
+        // Path integration aims at the nest as a whole: the vector starts
+        // as the exit's offset from the centre, so that a returning
+        // forager heads for the mound and not for the one cell it left by.
         a.reset_home_vector();
+        a.home_vector = a.position.to(Point::center_of(self.world.nest()));
+        a.home_vector = (-a.home_vector.0, -a.home_vector.1);
         a.clear_memory();
         a.steps_since_nest = 0;
         a.search_steps = 0;
         a.move_credit = 0.0;
-        a.laying = if (outbound_laying && a.site.is_some()) || exploratory_laying {
+        a.laying = if a.corpse {
+            None
+        } else if (outbound_laying && a.site.is_some()) || exploratory_laying {
             a.lay_strength = if a.site.is_some() { 0.5 } else { 0.25 };
             Some(Pheromone::Trail)
         } else {
@@ -1487,8 +2005,14 @@ impl Simulation {
     fn nurse(&mut self, i: usize) {
         let rate = self.species.nursing_rate_mg_s * self.tick_s;
         let need_cap = self.species.larva_food_mg;
-        // Larvae are fed from the nurse's own crop.
-        let available = rate.min(self.ants[i].sugar_mg);
+        // Larvae are fed from the nurse's own crop, by a nurse standing in
+        // the brood chamber.
+        let in_chamber = self.depth_of(self.ants[i].cell()) <= self.species.brood_depth;
+        let available = if in_chamber {
+            rate.min(self.ants[i].sugar_mg)
+        } else {
+            0.0
+        };
         if available > 0.0 {
             if let Some(hungriest) = self
                 .nest
@@ -1508,7 +2032,11 @@ impl Simulation {
             }
         }
         // Protein goes to the larva that still needs the most of it.
-        let protein_available = rate.min(self.nest.protein_mg);
+        let protein_available = if in_chamber {
+            rate.min(self.nest.protein_mg)
+        } else {
+            0.0
+        };
         if protein_available > 0.0 {
             let need = self.species.larva_protein_mg;
             if let Some(neediest) = self
@@ -1557,24 +2085,27 @@ impl Simulation {
         let offered = self.ants[i].sugar_mg;
         let mut done = offered <= residual + 1e-12;
         if !done {
-            // Choose a receiver: a simulated nestmate inside, or the reserve.
-            let inside: Vec<usize> = (0..self.ants.len())
-                .filter(|&j| {
-                    j != i
-                        && self.ants[j].alive
-                        && matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing)
-                })
+            // Choose a receiver: the reserve (nestmates not simulated,
+            // met in proportion to their number), or a nestmate within
+            // reach; with nobody within reach the contact passes nothing.
+            let inside_total = self.inside_count().saturating_sub(1) as f64;
+            let receivers: Vec<usize> = self
+                .neighbours_inside(i)
+                .into_iter()
+                .filter(|&j| matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing))
                 .collect();
             let virtual_share = self.nest.virtual_nestmates
-                / (self.nest.virtual_nestmates + inside.len() as f64).max(1e-9);
+                / (self.nest.virtual_nestmates + inside_total).max(1e-9);
             let fraction = self.species.transfer_fraction;
-            let taken = if inside.is_empty() || self.rng.chance(virtual_share) {
+            let taken = if self.rng.chance(virtual_share) {
                 let deficit = self.nest.reserve_deficit_per_nestmate();
                 let amount = (fraction * deficit).min(offered - residual).max(0.0);
                 self.nest.store_mg += amount;
                 amount
+            } else if receivers.is_empty() {
+                0.0
             } else {
-                let j = inside[self.rng.below(inside.len())];
+                let j = receivers[self.rng.below(receivers.len())];
                 let amount = (fraction * self.ants[j].crop_deficit_mg())
                     .min(offered - residual)
                     .max(0.0);
@@ -1584,6 +2115,7 @@ impl Simulation {
                 let share =
                     (amount / (fraction * self.ants[j].crop_capacity_mg).max(1e-12)).min(1.0);
                 self.ants[j].excitement += self.species.excitation_per_contact * quality * share;
+                self.record_contact(i, j);
                 amount
             };
             self.ants[i].sugar_mg -= taken;
@@ -1686,6 +2218,10 @@ impl Simulation {
     /// anywhere); an unladen explorer picks one up, the less likely the
     /// bigger the pile it lies in (Deneubourg et al. 1991).
     fn handle_corpses(&mut self, i: usize, cell: Position) {
+        if self.world.is_nest(cell) {
+            // Corpses on the nest's cells are the undertakers' business.
+            return;
+        }
         let species = &self.species;
         let carrying_corpse = self.ants[i].corpse;
         if carrying_corpse {
@@ -1814,7 +2350,20 @@ impl Simulation {
     }
 
     fn arrive(&mut self, i: usize) {
-        self.drop_corpse_here(i);
+        // A worker that comes home still carrying a corpse turns round at
+        // the entrance and carries it out again.
+        if self.ants[i].corpse {
+            let a = &mut self.ants[i];
+            a.laying = None;
+            a.search_steps = 0;
+            a.steps_since_nest = 0;
+            a.reset_home_vector();
+            a.home_vector = a.position.to(Point::center_of(self.world.nest()));
+            a.home_vector = (-a.home_vector.0, -a.home_vector.1);
+            a.activity = Activity::Outbound;
+            a.heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
+            return;
+        }
         let contact = self.seconds_to_ticks(self.species.contact_interval_s);
         let nest = self.world.nest();
         let cell = self.ants[i].cell();
@@ -1826,7 +2375,8 @@ impl Simulation {
         let nest_radius = self.world.nest_radius().max(0) as f64;
         let trip = {
             let a = &mut self.ants[i];
-            a.position = Point::center_of(nest);
+            a.position = Point::center_of(cell);
+            a.goal = None;
             a.reset_home_vector();
             a.steps_since_nest = 0;
             a.laying = None;
@@ -2294,12 +2844,9 @@ impl Simulation {
         let cell = self.ants[i].cell();
         self.ants[i].alive = false;
         if self.ants[i].corpse {
+            // A carried corpse is dropped where the carrier dies.
             self.ants[i].corpse = false;
-            if outside {
-                self.world.add_corpse(cell);
-            } else {
-                self.nest.corpses += 1;
-            }
+            self.world.add_corpse(cell);
         }
         if outside {
             if let Some(c) = self.world.cell_mut(cell) {
@@ -2313,6 +2860,8 @@ impl Simulation {
                 self.world.add_corpse(cell);
             }
         } else {
+            // The body lies where the worker stood inside.
+            self.world.add_corpse(cell);
             self.nest.corpses += 1;
         }
         self.alive = self.alive.saturating_sub(1);
@@ -2341,6 +2890,7 @@ impl Simulation {
     // ---------------------------------------------------------------
 
     fn nest_step(&mut self) {
+        self.nest.corpses = self.nest_corpses();
         self.share_food();
 
         // Mean excitation of the workers inside, for reporting.
@@ -2728,10 +3278,14 @@ mod tests {
 
     #[test]
     fn entropy_dial_still_controls_decisions() {
-        let mut ordered = Simulation::new(hungry_fast(), 3);
+        // Searching ants deliberately run hotter than the dial says; hold
+        // that at one so the dial alone sets the decision entropy.
+        let mut cfg = hungry_fast();
+        cfg.species.search_temperature_factor = 1.0;
+        let mut ordered = Simulation::new(cfg.clone(), 3);
         ordered.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.05);
         ordered.run(400);
-        let mut chaotic = Simulation::new(hungry_fast(), 3);
+        let mut chaotic = Simulation::new(cfg, 3);
         chaotic.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.98);
         chaotic.run(400);
         let h_low = ordered.stats().mean_entropy();
@@ -2860,7 +3414,10 @@ mod tests {
         cfg.nest.mortality = false;
         cfg.world.random_food = None;
         let mut sim = Simulation::new(cfg, 5);
-        sim.nest_mut().corpses = 5;
+        let nest = sim.world().nest();
+        for _ in 0..5 {
+            sim.world_mut().add_corpse(nest);
+        }
         sim.run(900);
         assert!(sim.stats().corpses_moved >= 5, "{:?}", sim.stats());
         assert_eq!(sim.nest().corpses, 0, "every corpse was taken out");

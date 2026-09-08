@@ -42,11 +42,15 @@ pub enum Activity {
     Searching,
     /// Inside the nest, handing over the load by trophallaxis.
     Unloading,
+    /// Inside the nest, walking to a corpse to carry it out.
+    Fetching,
+    /// Inside the nest, walking to the entrance to go out.
+    Leaving,
 }
 
 impl Activity {
     /// Every activity, in index order.
-    pub const ALL: [Activity; 7] = [
+    pub const ALL: [Activity; 9] = [
         Activity::Resting,
         Activity::Nursing,
         Activity::Outbound,
@@ -54,12 +58,14 @@ impl Activity {
         Activity::Inbound,
         Activity::Searching,
         Activity::Unloading,
+        Activity::Fetching,
+        Activity::Leaving,
     ];
 
     /// Number of activities.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 9;
 
-    /// Index in `0..7`.
+    /// Index in `0..9`.
     pub fn index(self) -> usize {
         Activity::ALL
             .iter()
@@ -77,14 +83,20 @@ impl Activity {
             Activity::Inbound => "inbound",
             Activity::Searching => "searching",
             Activity::Unloading => "unloading",
+            Activity::Fetching => "fetching",
+            Activity::Leaving => "leaving",
         }
     }
 
-    /// Whether the ant is inside the nest (off the grid).
+    /// Whether the ant is inside the nest.
     pub fn is_inside(self) -> bool {
         matches!(
             self,
-            Activity::Resting | Activity::Nursing | Activity::Unloading
+            Activity::Resting
+                | Activity::Nursing
+                | Activity::Unloading
+                | Activity::Fetching
+                | Activity::Leaving
         )
     }
 
@@ -126,6 +138,9 @@ pub struct Traits {
     pub laying: f64,
     /// Multiplier on the pheromone sensitivity constant (`< 1` is keener).
     pub sensitivity: f64,
+    /// Individual offset of the spatial fidelity zone inside the nest, as
+    /// a fraction of the nest's depth.
+    pub zone_offset: f64,
 }
 
 impl Traits {
@@ -144,6 +159,7 @@ impl Traits {
                 * (1.0 + 0.1 * rng.normal()).clamp(0.6, 1.4),
             laying: (1.0 + 0.2 * rng.normal()).clamp(0.3, 1.7),
             sensitivity: (0.25 * rng.normal()).exp().clamp(0.5, 2.0),
+            zone_offset: (0.15 * rng.normal()).clamp(-0.3, 0.3),
         }
     }
 }
@@ -278,6 +294,9 @@ pub struct Ant {
     pub time_foraging: u64,
     /// Ticks spent nursing.
     pub time_nursing: u64,
+    /// Where the ant is going inside the nest (the corpse it fetches, the
+    /// exit it leaves by); none while it keeps to its zone.
+    pub goal: Option<Position>,
     /// Recruitment excitation from contacts with successful foragers.
     pub excitement: f64,
     /// Fractional movement credit (unused sub-cell movement).
@@ -338,6 +357,7 @@ impl Ant {
             pickup: None,
             time_foraging: 0,
             time_nursing: 0,
+            goal: None,
             excitement: 0.0,
             move_credit: 0.0,
             routes: HashMap::new(),

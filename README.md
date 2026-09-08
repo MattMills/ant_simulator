@@ -171,6 +171,25 @@ out by pairwise sharing between nestmates and with a reserve standing for
 the queen, brood and nestmates not simulated (Buffin et al. 2009; Greenwald,
 Segre & Feinerman 2015). Prey goes to a protein store.
 
+**Nest interior.** The nest is a patch of cells whose depth runs from the
+brood chamber at the centre to the entrance ring at the edge, and every
+worker inside stands somewhere on it and walks between neighbouring cells
+in short bouts. Each keeps to a spatial fidelity zone: a depth that is
+near the brood in callow workers and drifts outward with age over the
+maturation time, with an individual offset, so that nurses sit with the
+brood and foragers by the entrance (Sendova-Franks & Franks 1995; Mersch,
+Crespi & Keller 2013). Workers respond to the tasks they meet: the brood's
+demand is felt fully in the chamber and fades with distance from it
+(foraging for work, Tofts & Franks 1992), nurses feed larvae only while
+standing in the chamber, and a worker that sets out to forage walks to the
+entrance ring first. Trophallaxis needs contact: a returning forager
+unloads to nestmates within reach near the entrance, and the receivers
+hand the food inward by pairwise sharing with their own neighbours, so
+food percolates from the entrance to the brood through the workers
+between (Greenwald, Segre & Feinerman 2015). Corpses lie where workers
+die; an undertaker walks to one, picks it up, and carries it out by the
+entrance. The inside walks are part of the colony's movement history.
+
 **Colony.** Departure is gated by the worker's own crop, amplified by the
 hunger it reads off its nestmates: a forager that could not unload stays
 in, which is how foraging winds down as the colony fills (Greenwald et al.
@@ -222,20 +241,23 @@ behavioural clocks.
 `tests/experiments.rs` asserts the same outcomes at smaller size, and the
 unit tests in `src/colony.rs` cover the trophallaxis and heat mechanisms.
 
-| Experiment | Published finding | Here (80 ants unless stated, 30 min, 4 replicates) |
+| Experiment | Published finding | Here (80 ants unless stated, 30 min, 8 replicates) |
 | --- | --- | --- |
-| Double bridge, long branch 2× short (Goss et al. 1989; Beckers et al. 1992) | traffic concentrates on the short branch | short branch carries 97% ± 1% of late traffic (Argentine) and 84% ± 17% (*Lasius*), majority in every run |
-| Equal branches (Deneubourg et al. 1990) | most colonies end up with one branch carrying over 80% | after 60 min the favoured branch carries 69% ± 31% with the full model and 70% ± 30% under the 1990 model's assumptions; one branch exceeds 80% in all and half of the runs |
-| Crowding on a narrow bridge (Dussutour et al. 2004) | one trail at low density; at high density on a narrow bridge both branches, without loss of throughput | 400 ants: mean deviation from an even split 0.22 on the wide bridge, 0.04 on the narrow one, at 219 and 183 crossings/min; 80 ants: 0.27 and 0.09 |
+| Double bridge, long branch 2× short (Goss et al. 1989; Beckers et al. 1992) | traffic concentrates on the short branch | short branch carries 97% ± 2% of late traffic (Argentine) and 89% ± 6% (*Lasius*), majority in every run |
+| Equal branches (Deneubourg et al. 1990) | most colonies end up with one branch carrying over 80% | after 60 min one branch carries over 80% in 4 of 8 runs with the full model and in 5 of 8 under the 1990 model's assumptions; the instability is marginal (see below) |
+| Crowding on a narrow bridge (Dussutour et al. 2004) | one trail at low density; at high density on a narrow bridge both branches, without loss of throughput | 400 ants: mean deviation from an even split 0.15 on the wide bridge, 0.05 on the narrow one, at 212 and 178 crossings/min; 80 ants: 0.25 and 0.07 |
 | Two sources at equal distance, 1.0 vs 0.1 M (Beckers et al. 1990) | the colony focuses on the richer source | 94% ± 1% of the solution taken from the rich source, majority in every run |
-| A dripping source, 0.02 to 10 µl/min (Mailleux et al. 2003) | foraging effort and recruitment match the source's productivity | ants at the source 6.0 → 20.9, mean load 0.06 → 0.41 µl, recruiting returns 11% → 79% |
-| A hidden pool, with and without its smell (Buehlmann et al. 2014) | ants find food by its odour | first find after 101 s without odour, 42 s with |
-| Colony satiation 0.05 → 1.0 (Mailleux et al. 2006) | starved colonies forage and recruit more | ant-time outside falls monotonically from 47% to 0% |
+| A dripping source, 0.02 to 10 µl/min (Mailleux et al. 2003) | foraging effort and recruitment match the source's productivity | ants at the source 6.5 → 20.6, mean load 0.06 → 0.40 µl, recruiting returns 19% → 81% |
+| A hidden pool, with and without its smell (Buehlmann et al. 2014) | ants find food by its odour | a party of 20 scouts: first find after 127 s without odour, 94 s with (with 40 scouts leaving at once, one walks into it within a minute either way) |
+| Colony satiation 0.05 → 1.0 (Mailleux et al. 2006) | starved colonies forage and recruit more | ant-time outside falls monotonically from 50% to 0% |
 | Unloading as the colony fills (Greenwald et al. 2018) | receivers take less as their crops fill; foragers that cannot unload stop | unit test: contacts per return rise, foraging falls by more than half, no hungry worker left inside; crop loads even out by sharing |
-| Sugar or prey, with and without larvae (Dussutour & Simpson 2009) | larvae turn the colony to protein | protein share of what is collected 0.08 without larvae, 0.47 with |
-| Desert ants against the heat (Cerdá et al. 1998) | mortality rises steeply towards the thermal limit while speed still rises | 60 *Cataglyphis*, 30 min: at 40 °C speed ×1.25, 267 loads, nobody killed; at 52 °C ×1.85, 254 loads, 14 killed; at 54 °C ×1.95, 98 loads, 26 killed; at 55 °C the colony stays in |
-| 300 scattered corpses, 60 workers (Theraulaz et al. 2002) | corpses are gathered into a few piles | piles fall from about 120 to 25 to 33 within the hour; the largest grows two- to threefold |
-| Threshold reinforcement (Theraulaz et al. 1998) | specialisation | division-of-labour index 0.77 with reinforcement, 0.53 without |
+| Sugar or prey, with and without larvae (Dussutour & Simpson 2009) | larvae turn the colony to protein | protein share of what is collected 0.04 without larvae, 0.46 with |
+| Desert ants against the heat (Cerdá et al. 1998) | mortality rises steeply towards the thermal limit while speed still rises | 60 *Cataglyphis*, 30 min: at 40 °C speed ×1.25, 303 loads, nobody killed; at 52 °C ×1.85, 262 loads, 9 killed; at 54 °C ×1.95, 132 loads, 26 killed; at 55 °C the colony stays in |
+| 300 scattered corpses, 60 workers (Theraulaz et al. 2002) | corpses are gathered into a few piles | piles fall from about 120 to 30 within the hour; the largest grows two- to threefold |
+| Threshold reinforcement (Theraulaz et al. 1998) | specialisation | division-of-labour index 0.72 with reinforcement, 0.43 without |
+| Spatial fidelity zones and social groups (Sendova-Franks & Franks 1995; Mersch et al. 2013) | young workers with the brood, old by the entrance; contacts mostly within a group | `nest` example, 80 workers in a 7 × 7 nest, 30 min: brood chamber 31 workers of mean age 2.2 d (24 nursing), between 29 of 2.8 d, entrance ring 8 of 4.4 d; age–depth correlation 0.35; no food changes hands directly between the chamber and the ring |
+| Food dissemination (Greenwald et al. 2015) | foragers unload near the entrance and the food percolates inward | 2.0 mg handed on inside per milligram delivered; the chamber's crops as full as the entrance's (0.92 against 0.84) |
+| Undertaking | corpses inside are carried out | 3 corpses placed in the brood chamber are fetched from where they lie and carried out within 30 min |
 
 Symmetry breaking on equal branches is a marginal instability, and getting
 it out of an individual-based model says a good deal about what real ants
@@ -325,26 +347,26 @@ the root temperature to `e^(2 × thought)`:
 
 ```
 the dial in force: corr(thought, decision entropy) = 1.00
-reaching the paths: corr(thought, residual straightness of the whole field) = -0.76
+reaching the paths: corr(thought, residual straightness of the whole field) = -0.79
 
 component    lag  1 lag  2 lag  3 lag  4 lag  5 lag  6   capacity
-invariant      0.04   0.03  -0.02  -0.12  -0.17  -0.19   0.07
-residual       0.70   0.38   0.08   0.00  -0.00  -0.02   1.17
-both           0.73   0.42   0.09  -0.08  -0.12  -0.10   1.24
+invariant      0.31   0.03   0.04   0.05   0.02  -0.02   0.45
+residual       0.79   0.55   0.27   0.12   0.11   0.10   1.95
+both           0.84   0.59   0.27   0.13   0.13   0.11   2.07
 ```
 
-Her thoughts are embedded in the non-invariant output and nowhere else:
-the residual retrodicts the thought of the epoch just ended with R² 0.70,
-the one before with 0.38, the one before that with 0.08, while the
-skeleton carries none of it. What carries the thought is the
-tortuosity of the paths: a hotter colony turns more at every decision.
-The loop then closes. Readouts fitted, external input off, the queen
-recalls her last thought from the field and thinks its opposite (gain
-−10) for 24 more epochs:
+Her thoughts are embedded in the non-invariant output: the residual
+retrodicts the thought of the epoch just ended with R² 0.79, the one
+before with 0.55, the one before that with 0.27, and a trace of the two
+before those, while the skeleton carries a shadow of the last epoch alone.
+What carries the thought is the tortuosity of the paths: a hotter colony
+turns more at every decision. The loop then closes. Readouts fitted,
+external input off, the queen recalls her last thought from the field and
+thinks its opposite (gain −10) for 24 more epochs:
 
 ```
-dial connected:    -+-+-+-+-+-+-+-+-+-+-+-+  alternations 23 of 23
-dial disconnected: -+-++++++++-++++++++++++  alternations  5 of 23
+dial connected:    +-+-+-+-+-+-+-+-+-+-+-+-  alternations 23 of 23
+dial disconnected: ++++++++++++++++++++++++  alternations  0 of 23
 ```
 
 With the dial connected the alternation is sustained through the colony
@@ -353,7 +375,7 @@ paths do. With the dial disconnected (expression zero) she still recalls
 and thinks, but nothing she thinks reaches the colony, and the field
 recalls only its noise. Cognitive material laid down in the colony's
 movement is thus included self-recursively in future cognition, at the
-epoch scale and over two to three epochs back.
+epoch scale and over three to four epochs back.
 
 ## Examples
 
@@ -363,6 +385,7 @@ cargo run --release --example experiments [replicates] [minutes]
 cargo run --release --example arena       [turns] [period] [sucker]
 cargo run --release --example surface     [ticks] [seeds]
 cargo run --release --example hive        [epochs] [epoch_seconds]
+cargo run --release --example nest        [minutes]
 ```
 
 `colony` renders the world, compares the four species on one map, sweeps
@@ -371,6 +394,8 @@ the classic setups. `arena` runs learners over the hierarchy with a hidden
 rotation and evaluates the untouched instinct against the learned hierarchy
 on fresh episodes. `surface` explores the geometric entropy channels.
 `hive` runs the memory probe and the closed loop of the queen's mind.
+`nest` shows the nest interior: zones by age, food handed inward, and
+undertakers at work.
 
 ## The arena, turn by turn
 
@@ -408,8 +433,10 @@ seeds.
 Space is a plane with a 2-cm substrate grid. Vision is limited to point
 landmarks seen within a species distance; there are no panoramic views,
 no walls that block sight, and no sun compass. The nest interior is a
-well-mixed chamber: workers, brood, stores and corpses inside have no
-positions, and trophallaxis meets nestmates at random. Trails are laid on
+flat patch whose depth is the distance from the centre, without chambers
+or tunnels; the brood, the stores and the queen have no positions within
+the brood chamber, and the reserve that stands for nestmates not simulated
+is met anywhere inside. Trails are laid on
 the substrate and sensed as patches within antennal reach; smells spread
 by diffusion without wind, and the death cue of a corpse is not modelled
 chemically. Prey is dead insects, not hunted. There is one colony: no

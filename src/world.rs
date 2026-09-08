@@ -292,7 +292,7 @@ impl Default for WorldConfig {
             cell_cm: 2.0,
             tick_s: 1.0,
             nest: Position::new(32, 20),
-            nest_radius: 2,
+            nest_radius: 3,
             food_sources: Vec::new(),
             random_food: Some(RandomFood {
                 clusters: 3,

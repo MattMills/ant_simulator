@@ -1129,7 +1129,8 @@ impl Queen {
 
     /// Close an epoch: record the field with the thought that was in
     /// force, form the next thought from the input and (with recursion)
-    /// what the field recalls, and express it in the dials.
+    /// what the field recalls, clamped to `-1..=1`, and express it in the
+    /// dials.
     pub fn epoch(
         &mut self,
         tick: u64,
@@ -1165,7 +1166,7 @@ impl Queen {
         };
         for j in 0..dim {
             let drive = input[j] + recalled.as_ref().map(|v| v[j]).unwrap_or(0.0);
-            self.thought[j] = drive.tanh();
+            self.thought[j] = drive.clamp(-1.0, 1.0);
         }
         self.express(hierarchy);
         self.epoch_count += 1;

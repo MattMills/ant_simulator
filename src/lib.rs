@@ -21,8 +21,12 @@
 //!   load, collect sugar or protein as the larvae demand, and engage in
 //!   tasks by reinforced response thresholds. Every worker carries its own
 //!   crop; food spreads by trophallaxis, and a forager whose nestmates will
-//!   not take its load stays in. The nest keeps a protein store, lays eggs
-//!   and raises brood through egg, larva and pupa. The [`experiments`]
+//!   not take its load stays in. The nest has an interior: workers inside
+//!   stand on its cells and keep to zones that drift from the brood chamber
+//!   to the entrance with age, nurse the brood where it lies, hand food on
+//!   to neighbours only, fetch corpses from where they fall, and leave by
+//!   the entrance ring. The nest keeps a protein store, lays eggs and
+//!   raises brood through egg, larva and pupa. The [`experiments`]
 //!   module reproduces the classic double-bridge, equal-bridge,
 //!   crowded-bridge, two-source, dripping-source, odour, hunger,
 //!   communal-nutrition, thermal, cemetery and division-of-labour setups.

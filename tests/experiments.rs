@@ -201,13 +201,15 @@ fn corpses_are_gathered_into_piles() {
 #[test]
 fn food_odour_speeds_up_discovery() {
     // Buehlmann et al. 2014: ants locate food by its smell; here a hidden
-    // pool is found sooner when it gives off an odour.
+    // pool is found sooner by a party of scouts when it gives off an
+    // odour (with many more scouts leaving at once, one of them walks
+    // straight into it either way).
     let seeds = [1u64, 2, 3];
     let time = |odour: bool| -> f64 {
         seeds
             .iter()
             .map(|&s| {
-                run_discovery(Species::lasius_niger(), 40, odour, 20.0 * 60.0, s)
+                run_discovery(Species::lasius_niger(), 20, odour, 20.0 * 60.0, s)
                     .first_find_s
                     .unwrap_or(20.0 * 60.0)
             })

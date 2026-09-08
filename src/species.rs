@@ -295,6 +295,33 @@ pub struct Species {
     /// Larvae one nurse can tend: the nursing stimulus is the larval load
     /// per nurse already at work, so recruitment of nurses damps it.
     pub brood_per_nurse: f64,
+    /// Walking speed inside the nest, centimetres per second: workers
+    /// inside move in short bouts between rests, far slower than a
+    /// forager on a trail.
+    pub nest_speed_cm_s: f64,
+    /// Width of a worker's spatial fidelity zone, as a fraction of the
+    /// nest's depth: zones are fuzzy and overlap (Sendova-Franks & Franks
+    /// 1995, *Behav. Ecol. Sociobiol.* 36:269).
+    pub zone_spread: f64,
+    /// Depth (0 the brood at the centre, 1 the entrance ring) that callow
+    /// workers keep to. Zones drift outward with age, reaching the
+    /// entrance after twice `maturation_s`, so that nurses sit with the
+    /// brood and foragers by the entrance (Sendova-Franks & Franks 1995;
+    /// Mersch, Crespi & Keller 2013, *Science* 340:1090).
+    pub callow_depth: f64,
+    /// Depth within which the brood lies: the brood chamber. Larvae are
+    /// fed only by nurses standing in it.
+    pub brood_depth: f64,
+    /// Distance from the chamber, centimetres, over which the brood's
+    /// demand fades for a worker standing outside it: contact range,
+    /// about half a body length, so that workers do the tasks they meet
+    /// where they stand (foraging for work, Tofts & Franks 1992, *Anim.
+    /// Behav.* 43:1).
+    pub brood_reach_cm: f64,
+    /// Depth to which a returning forager goes in to hand over its load:
+    /// unloading happens near the entrance, and the receivers carry the
+    /// food inward (Greenwald, Segre & Feinerman 2015, *eLife* 4:e07128).
+    pub unloading_depth: f64,
     /// Foraging stimulus bonus for a worker remembering a source of unit
     /// quality (site fidelity).
     pub reforage_bonus: f64,
@@ -488,6 +515,12 @@ impl Species {
             nursing_threshold_median: 0.5,
             nursing_bout_s: 300.0,
             brood_per_nurse: 5.0,
+            nest_speed_cm_s: 0.5,
+            zone_spread: 0.15,
+            callow_depth: 0.1,
+            brood_depth: 0.5,
+            brood_reach_cm: 1.0,
+            unloading_depth: 0.75,
             reforage_bonus: 1.0,
             threshold_learning_s: 10.0 * 60.0,
             threshold_forgetting_s: 3600.0,
