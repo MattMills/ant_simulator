@@ -805,6 +805,50 @@ bookkeeping of every step walked; at colony scale the memoized transits
 and the pipeline stand in for half of the steps (the colony-scale table
 in the memo section above).
 
+`cargo bench -- shapes` asks what larger and shaped environments cost:
+200 workers for ten minutes, the field on its grain against the dense
+sweep of every cell, on squares up to 1024 × 1024, a strip, and arenas
+cut into a 512 × 512 grid by walls (a disc, a ring, an L, a cross, and
+sixteen rooms joined by corridors); *open* is the share of the grid
+that is not wall, *kinetics* and *decide* are microseconds per tick,
+*trail* the share of the nodes at which the trail is at cell
+resolution:
+
+```
+  arena      cells  open |  dense/s  kinetics decide |  grain/s  kinetics  trail decide |  gain
+ square    256x256  100% |      436      1727    444 |      889       547    23%    455 |  2.04
+ square    512x512  100% |       93      9930    499 |      708       721     4%    442 |  7.64
+ square  1024x1024  100% |       21     45120    381 |      386      1435     1%    376 | 18.24
+  strip    1024x64  100% |      445      1616    516 |     1169       307    12%    439 |  2.63
+   disc    512x512   69% |      101      8557    588 |      486       639     6%    622 |  4.82
+   ring    512x512   55% |      103      8226    522 |      453       580     7%    560 |  4.42
+      L    512x512   44% |      117      7749    481 |      934       392     6%    417 |  8.01
+  cross    512x512   44% |      120      7596    408 |     1051       321     5%    376 |  8.77
+  rooms    512x512   60% |      108      8126    562 |      699       455     4%    488 |  6.47
+```
+
+The gain grows with the world, because the colony's trails occupy the
+same ground whatever the grid: the dense sweep costs the area, the
+grain costs the structured ground and a few blocks for the rest, so a
+1024 × 1024 world runs eighteen times faster and its kinetics fall from
+45 to 1.4 ms a tick, with the trail at cell resolution on 1% of the
+nodes. A shape costs its open ground and not its bounding box: the
+nodes with no open cell are never visited, the nodes along a wall
+coarsen like any other once faint, and the L and the cross, open on 44%
+of their grid, run as a square of that area would. What the walls do
+cost is perception, since an antennal probe stops at a wall and is
+swept cell by cell wherever there is one, so the decisions of the disc
+and the ring run a third dearer than in the open. The smell of food is
+what made the sweep scale with the area before this: the bench scales
+food clusters with the grid, so the smell spans the whole of it, and on
+the substrate structure a third of the nodes were at cell resolution
+for it; on its own structure it costs the nodes of its sources and the
+blocks between them. Beyond 512 × 512 the movement history and the
+behavioural memo are the next cost, since their quadtrees reach down
+to the cells (the memo's two trees would take some 800 MB at
+1024 × 1024); they are off in these rows, and keeping them from their
+grain up is the natural next step.
+
 ## Reproducibility and tests
 
 Everything is driven by a single `u64` seed through the crate's own xoshiro
