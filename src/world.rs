@@ -45,12 +45,32 @@ pub struct Cell {
     /// Number of living ants currently in the cell (ants inside the nest
     /// are not on the grid).
     pub occupancy: u16,
+    /// How many ants the cell comfortably holds: beyond it ants slow down,
+    /// push, and steer away.
+    pub capacity: u16,
 }
 
 impl Cell {
     /// Concentration of one channel.
     pub fn level(&self, kind: Pheromone) -> f64 {
         self.pheromone[kind.index()]
+    }
+
+    /// Whether the cell is below capacity.
+    pub fn has_room(&self) -> bool {
+        self.occupancy < self.capacity
+    }
+
+    /// Crowding: occupancy over capacity (1 at capacity, above it when
+    /// overfilled), not counting one ant (the observer) when
+    /// `excluding_self`.
+    pub fn crowding(&self, excluding_self: bool) -> f64 {
+        let others = if excluding_self {
+            self.occupancy.saturating_sub(1)
+        } else {
+            self.occupancy
+        };
+        others as f64 / self.capacity.max(1) as f64
     }
 
     /// Whether any food remains.
@@ -94,6 +114,16 @@ impl Rect {
     pub fn contains(&self, p: Position) -> bool {
         p.x >= self.min.x && p.x <= self.max.x && p.y >= self.min.y && p.y <= self.max.y
     }
+}
+
+/// A region whose cells hold a different number of ants than the rest of
+/// the world: a narrow bridge, or a chamber with room for everyone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapacityZone {
+    /// The cells concerned.
+    pub rect: Rect,
+    /// Ants per cell.
+    pub capacity: u16,
 }
 
 /// Randomly placed food clusters, generated when the world is built.
@@ -147,6 +177,13 @@ pub struct WorldConfig {
     pub open: Vec<Rect>,
     /// Crossing counters.
     pub counters: Vec<Counter>,
+    /// Ants that fit in an ordinary cell (about two per square centimetre
+    /// on the default grid: the density at which trail traffic on a
+    /// 6-mm bridge begins to push, Dussutour, Fourcassié, Helbing &
+    /// Deneubourg 2004, *Nature* 428:70). Nest cells hold any number.
+    pub cell_capacity: u16,
+    /// Regions with their own capacity.
+    pub capacity_zones: Vec<CapacityZone>,
     /// Pheromone kinetics; `None` takes them from the species.
     pub pheromones: Option<PheromoneSet>,
     /// Seed for random food placement. `None` uses the simulation's generator,
@@ -174,6 +211,8 @@ impl Default for WorldConfig {
             walls: Vec::new(),
             open: Vec::new(),
             counters: Vec::new(),
+            cell_capacity: 8,
+            capacity_zones: Vec::new(),
             pheromones: None,
             seed: None,
         }
@@ -285,6 +324,24 @@ impl World {
                 if let Some(c) = self.cell_mut(nest.offset(dx, dy)) {
                     c.terrain = Terrain::Nest;
                 }
+            }
+        }
+        let default_capacity = self.config.cell_capacity;
+        let zones = self.config.capacity_zones.clone();
+        for y in 0..self.config.height as i32 {
+            for x in 0..self.config.width as i32 {
+                let p = Position::new(x, y);
+                let capacity = if self.is_nest(p) {
+                    u16::MAX
+                } else {
+                    zones
+                        .iter()
+                        .rev()
+                        .find(|z| z.rect.contains(p))
+                        .map(|z| z.capacity)
+                        .unwrap_or(default_capacity)
+                };
+                self.cell_mut(p).unwrap().capacity = capacity;
             }
         }
     }
@@ -948,6 +1005,34 @@ mod tests {
         world.step_pheromones();
         assert_eq!(world.level(Position::new(9, 4), Pheromone::Trail), 0.0);
         assert!(world.level(Position::new(7, 4), Pheromone::Trail) > 0.0);
+    }
+
+    #[test]
+    fn capacity_zones_and_crowding() {
+        let cfg = WorldConfig {
+            cell_capacity: 8,
+            capacity_zones: vec![CapacityZone {
+                rect: Rect::new(Position::new(0, 0), Position::new(3, 3)),
+                capacity: 2,
+            }],
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        assert_eq!(world.cell(Position::new(1, 1)).unwrap().capacity, 2);
+        assert_eq!(world.cell(Position::new(5, 0)).unwrap().capacity, 8);
+        assert_eq!(
+            world.cell(Position::new(6, 5)).unwrap().capacity,
+            u16::MAX,
+            "nest cells hold anyone"
+        );
+        let c = world.cell_mut(Position::new(1, 1)).unwrap();
+        c.occupancy = 3;
+        assert!(!c.has_room());
+        assert!((c.crowding(false) - 1.5).abs() < 1e-12);
+        assert!((c.crowding(true) - 1.0).abs() < 1e-12);
+        let empty = world.cell(Position::new(5, 0)).unwrap();
+        assert!(empty.has_room());
+        assert_eq!(empty.crowding(true), 0.0);
     }
 
     #[test]

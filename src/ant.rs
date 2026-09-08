@@ -151,16 +151,25 @@ pub struct Site {
     pub quality: f64,
 }
 
-/// Local vectors remembered at a familiar place.
+/// What an ant remembers at a familiar place: the local vectors of a
+/// route (the direction it walked from here on the way home and on the way
+/// out, learned on successful trips, one-way as ant routes are: Collett,
+/// Collett, Bisch & Wehner 1998, *Nature* 394:269; Wehner, Boyer, Loertscher,
+/// Sommer & Menzi 2006, *Curr. Biol.* 16:75) and the path-integration
+/// estimate it had here, against which a later estimate is recalibrated.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Route {
-    /// Remembered vector from this place to the nest, in cells.
-    pub home: (f64, f64),
-    /// Visits on which the homeward vector was learned.
+    /// Remembered path-integration vector from this place to the nest, in
+    /// cells.
+    pub home_estimate: (f64, f64),
+    /// Unit direction walked from this place on the way home.
+    pub home_dir: (f64, f64),
+    /// Homeward passes on which this place was learned.
     pub home_strength: f32,
-    /// Remembered vector from this place to the food site, in cells.
-    pub out: (f64, f64),
-    /// Visits on which the outward vector was learned.
+    /// Unit direction walked from this place on the way out to a known
+    /// source.
+    pub out_dir: (f64, f64),
+    /// Outward passes on which this place was learned.
     pub out_strength: f32,
     last_used: u64,
 }
@@ -381,9 +390,10 @@ impl Ant {
             }
         }
         let entry = self.routes.entry(cell).or_insert(Route {
-            home: (0.0, 0.0),
+            home_estimate: (0.0, 0.0),
+            home_dir: (0.0, 0.0),
             home_strength: 0.0,
-            out: (0.0, 0.0),
+            out_dir: (0.0, 0.0),
             out_strength: 0.0,
             last_used: now,
         });
@@ -391,35 +401,54 @@ impl Ant {
         entry
     }
 
-    /// Learn the homeward local vector at a cell from the current estimate.
-    pub fn learn_route_home(
+    /// Remember the path-integration estimate of the nest's position as
+    /// seen from a cell (moved towards the current estimate by `rate`).
+    pub fn learn_home_estimate(
         &mut self,
         cell: Position,
-        home: (f64, f64),
+        estimate: (f64, f64),
         rate: f64,
         capacity: usize,
     ) {
         let now = self.age;
         let r = self.route_entry(cell, capacity, now);
-        if r.home_strength <= 0.0 {
-            r.home = home;
+        if r.home_estimate == (0.0, 0.0) {
+            r.home_estimate = estimate;
         } else {
-            r.home.0 += rate * (home.0 - r.home.0);
-            r.home.1 += rate * (home.1 - r.home.1);
+            r.home_estimate.0 += rate * (estimate.0 - r.home_estimate.0);
+            r.home_estimate.1 += rate * (estimate.1 - r.home_estimate.1);
         }
+    }
+
+    /// Learn the homeward local vector at a cell: the direction just walked
+    /// from it on the way home.
+    pub fn learn_route_home(
+        &mut self,
+        cell: Position,
+        dir: (f64, f64),
+        rate: f64,
+        capacity: usize,
+    ) {
+        let now = self.age;
+        let r = self.route_entry(cell, capacity, now);
+        r.home_dir = blend_direction(
+            r.home_dir,
+            dir,
+            if r.home_strength <= 0.0 { 1.0 } else { rate },
+        );
         r.home_strength += 1.0;
     }
 
-    /// Learn the outward local vector at a cell from the current estimate.
-    pub fn learn_route_out(&mut self, cell: Position, out: (f64, f64), rate: f64, capacity: usize) {
+    /// Learn the outward local vector at a cell: the direction just walked
+    /// from it on the way out to a known source.
+    pub fn learn_route_out(&mut self, cell: Position, dir: (f64, f64), rate: f64, capacity: usize) {
         let now = self.age;
         let r = self.route_entry(cell, capacity, now);
-        if r.out_strength <= 0.0 {
-            r.out = out;
-        } else {
-            r.out.0 += rate * (out.0 - r.out.0);
-            r.out.1 += rate * (out.1 - r.out.1);
-        }
+        r.out_dir = blend_direction(
+            r.out_dir,
+            dir,
+            if r.out_strength <= 0.0 { 1.0 } else { rate },
+        );
         r.out_strength += 1.0;
     }
 
@@ -437,11 +466,24 @@ impl Ant {
         r.last_used = now;
         let w =
             correction.clamp(0.0, 1.0) * (r.home_strength as f64 / (r.home_strength as f64 + 2.0));
-        let target = (-r.home.0, -r.home.1);
+        let target = (-r.home_estimate.0, -r.home_estimate.1);
         self.home_vector.0 += w * (target.0 - self.home_vector.0);
         self.home_vector.1 += w * (target.1 - self.home_vector.1);
         self.lost = false;
         true
+    }
+}
+
+/// Move a remembered unit direction towards a new one by `rate` and
+/// renormalise (a zero result keeps the new direction).
+fn blend_direction(old: (f64, f64), new: (f64, f64), rate: f64) -> (f64, f64) {
+    let x = old.0 + rate * (new.0 - old.0);
+    let y = old.1 + rate * (new.1 - old.1);
+    let len = (x * x + y * y).sqrt();
+    if len < 1e-9 {
+        new
+    } else {
+        (x / len, y / len)
     }
 }
 
@@ -599,10 +641,10 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
     let here = ant.cell();
     let route_dir = ant.route(here).and_then(|r| match mode {
         Mode::Inbound if r.home_strength > 0.0 => {
-            Some((r.home, (r.home_strength as f64 / 3.0).min(1.0)))
+            Some((r.home_dir, (r.home_strength as f64 / 3.0).min(1.0)))
         }
         Mode::Outbound if r.out_strength > 0.0 && ant.site.is_some() => {
-            Some((r.out, (r.out_strength as f64 / 3.0).min(1.0)))
+            Some((r.out_dir, (r.out_strength as f64 / 3.0).min(1.0)))
         }
         _ => None,
     });
@@ -614,8 +656,8 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
         if !world.segment_passable(ant.position, target) {
             continue;
         }
-        obs.valid[k] = true;
         let target_cell = target.cell();
+        obs.valid[k] = true;
         // The antennal probe: one cell ahead, then a second, stopping at
         // the first wall so nothing is sensed through or around a corner.
         let (one, _) = world.probe(ant.position, heading, 1.0);
@@ -667,10 +709,11 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
         } else {
             0.0
         };
-        f[F_CROWD] = world
-            .cell(target_cell)
-            .map(|c| c.occupancy.min(4) as f64 / 4.0)
-            .unwrap_or(0.0);
+        // Crowding ahead: the patch to be entered and the one the probe
+        // reaches, whichever is denser (a jam at a bridge entrance pushes
+        // arriving ants to the other branch: Dussutour et al. 2004).
+        let crowd_at = |p: Position| world.cell(p).map(|c| c.crowding(p == here)).unwrap_or(0.0);
+        f[F_CROWD] = crowd_at(target_cell).max(crowd_at(one.cell()));
         f[F_WALL] = if reach < 2.0 - 1e-9 { 1.0 } else { 0.0 };
     }
     obs
@@ -755,6 +798,33 @@ mod tests {
     }
 
     #[test]
+    fn crowding_is_seen_ahead_relative_to_capacity() {
+        let mut w = world();
+        let species = Species::lasius_niger();
+        let ant = ant_at(Position::new(5, 5), 0.0);
+        // Four ants in the cell straight ahead, capacity eight: half crowded.
+        w.cell_mut(Position::new(6, 5)).unwrap().occupancy = 4;
+        let obs = observe(&ant, &w, &species, Mode::Outbound, 0.75);
+        assert!((obs.features[0][F_CROWD] - 0.5).abs() < 1e-12);
+        // The probe also looks a cell on: a jam in the next cell but one
+        // counts even when the step itself stays in the current cell.
+        w.cell_mut(Position::new(6, 5)).unwrap().occupancy = 0;
+        let mut far = ant_at(Position::new(6, 5), 0.0);
+        far.position = Point::new(6.1, 5.5);
+        w.cell_mut(Position::new(7, 5)).unwrap().occupancy = 8;
+        let obs = observe(&far, &w, &species, Mode::Outbound, 0.5);
+        assert!(
+            (obs.features[0][F_CROWD] - 1.0).abs() < 1e-12,
+            "{}",
+            obs.features[0][F_CROWD]
+        );
+        // The ant's own presence does not count.
+        w.cell_mut(Position::new(5, 5)).unwrap().occupancy = 1;
+        let obs = observe(&ant, &w, &species, Mode::Outbound, 0.2);
+        assert_eq!(obs.features[0][F_CROWD], 0.0);
+    }
+
+    #[test]
     fn food_memory_route_and_wall_features() {
         let w = world();
         let species = Species::lasius_niger();
@@ -826,11 +896,21 @@ mod tests {
     fn route_memory_learns_and_recalibrates() {
         let mut ant = ant_at(Position::new(4, 4), 0.0);
         let c = Position::new(4, 4);
-        ant.learn_route_home(c, (-4.0, 0.0), 0.5, 3);
-        assert_eq!(ant.route(c).unwrap().home, (-4.0, 0.0));
-        ant.learn_route_home(c, (-2.0, 0.0), 0.5, 3);
-        assert!((ant.route(c).unwrap().home.0 + 3.0).abs() < 1e-12);
-        assert_eq!(ant.route(c).unwrap().home_strength, 2.0);
+        ant.learn_route_home(c, (-1.0, 0.0), 0.5, 3);
+        ant.learn_home_estimate(c, (-4.0, 0.0), 0.5, 3);
+        assert_eq!(ant.route(c).unwrap().home_dir, (-1.0, 0.0));
+        assert_eq!(ant.route(c).unwrap().home_estimate, (-4.0, 0.0));
+        ant.learn_route_home(c, (0.0, -1.0), 0.5, 3);
+        ant.learn_home_estimate(c, (-2.0, 0.0), 0.5, 3);
+        let r = ant.route(c).unwrap();
+        assert!((r.home_estimate.0 + 3.0).abs() < 1e-12);
+        let norm = (r.home_dir.0.powi(2) + r.home_dir.1.powi(2)).sqrt();
+        assert!((norm - 1.0).abs() < 1e-12, "directions stay unit length");
+        assert!(
+            r.home_dir.0 < 0.0 && r.home_dir.1 < 0.0,
+            "blended between west and north"
+        );
+        assert_eq!(r.home_strength, 2.0);
         // Capacity evicts the least recently used place.
         ant.age = 10;
         ant.learn_route_home(Position::new(1, 1), (0.0, 0.0), 0.5, 3);
@@ -842,10 +922,11 @@ mod tests {
         assert!(ant.route(c).is_none(), "the oldest place was forgotten");
         // Recalibration pulls the estimate towards the remembered vector.
         let d = Position::new(7, 7);
-        ant.learn_route_home(d, (-7.0, -7.0), 0.5, 10);
+        ant.learn_home_estimate(d, (-7.0, -7.0), 0.5, 10);
+        ant.learn_route_home(d, (-0.7, -0.7), 0.5, 10);
         ant.home_vector = (10.0, 10.0);
         assert!(!ant.recalibrate(d, 0.5), "one visit is not enough");
-        ant.learn_route_home(d, (-7.0, -7.0), 0.5, 10);
+        ant.learn_route_home(d, (-0.7, -0.7), 0.5, 10);
         ant.lost = true;
         assert!(ant.recalibrate(d, 0.5));
         assert!(!ant.lost);

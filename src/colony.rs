@@ -1412,11 +1412,17 @@ impl Simulation {
 
     fn walk(&mut self, i: usize) {
         // Speed: cells per tick at the current temperature, faster on a
-        // strong trail, slower when loaded.
+        // strong trail, slower when loaded and in a crowd.
         let speed = {
             let a = &self.ants[i];
-            let trail = self.world.level(a.cell(), Pheromone::Trail);
+            let here = a.cell();
+            let trail = self.world.level(here, Pheromone::Trail);
             let k = self.world.channel(Pheromone::Trail).k;
+            let crowding = self
+                .world
+                .cell(here)
+                .map(|c| c.crowding(true))
+                .unwrap_or(0.0);
             let mut speed = a.traits.speed * self.speed_factor;
             if a.carrying() {
                 speed *= self.species.loaded_speed_factor;
@@ -1424,6 +1430,7 @@ impl Simulation {
             if trail > k {
                 speed *= self.species.trail_speed_factor;
             }
+            speed *= (1.0 - self.species.crowding_slowdown * crowding).max(0.2);
             speed
         };
         self.ants[i].move_credit += speed;
@@ -1505,11 +1512,18 @@ impl Simulation {
             let home = species.uses_home_pheromone && a.activity == Activity::Outbound;
             (a.laying, a.lay_strength, home, a.activity)
         };
+        // Crowding on the patch reduces deposition (Czaczkes et al. 2013).
+        let crowding = self
+            .world
+            .cell(to_cell)
+            .map(|c| c.crowding(true))
+            .unwrap_or(0.0);
+        let crowd_factor = 1.0 / (1.0 + species.crowding_deposition * crowding);
         match laying {
             Some(Pheromone::Trail) => self.world.deposit(
                 to_cell,
                 Pheromone::Trail,
-                species.trail_deposit * strength * step,
+                species.trail_deposit * strength * step * crowd_factor,
             ),
             Some(Pheromone::NoEntry) => self.world.deposit(
                 to_cell,
@@ -1530,22 +1544,27 @@ impl Simulation {
                 species.territory_deposit * step,
             );
         }
-        // Route memory: learn local vectors at places passed with a working
-        // estimate; recognise familiar places to recalibrate.
+        // Route memory: the direction just walked from the place left is
+        // its local vector for this leg; the place entered records the
+        // current home estimate; familiar places recalibrate it.
         if entered {
             let capacity = species.route_capacity;
             let rate = species.route_learning_rate;
             let correction = species.route_pi_correction;
+            let dir = {
+                let (dx, dy) = from.to(to);
+                let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+                (dx / len, dy / len)
+            };
             let a = &mut self.ants[i];
             match activity {
                 Activity::Inbound if !a.lost => {
                     let home_vec = (-a.home_vector.0, -a.home_vector.1);
-                    a.learn_route_home(to_cell, home_vec, rate, capacity);
+                    a.learn_route_home(from_cell, dir, rate, capacity);
+                    a.learn_home_estimate(to_cell, home_vec, rate, capacity);
                 }
-                Activity::Outbound if !a.lost => {
-                    if let Some(dir) = a.site_direction() {
-                        a.learn_route_out(to_cell, dir, rate, capacity);
-                    }
+                Activity::Outbound if !a.lost && a.site.is_some() => {
+                    a.learn_route_out(from_cell, dir, rate, capacity);
                 }
                 Activity::Searching | Activity::Inbound => {
                     // Recognising a familiar place corrects the home vector;

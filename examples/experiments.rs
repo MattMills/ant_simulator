@@ -70,6 +70,29 @@ fn main() {
         );
     }
 
+    println!("\n== crowding on a narrow bridge (Dussutour et al. 2004) ==");
+    println!("equal branches; a wide bridge holds 64 ants per cell, a narrow one 8\n");
+    for (n, cap) in [(80usize, 64u16), (80, 8), (400, 64), (400, 8)] {
+        let outcomes: Vec<BridgeOutcome> = seeds
+            .iter()
+            .map(|&seed| run_crowded_bridge(Species::lasius_niger(), n, cap, seconds, window, seed))
+            .collect();
+        let dev = outcomes
+            .iter()
+            .map(|o| (o.short_fraction - 0.5).abs())
+            .sum::<f64>()
+            / outcomes.len() as f64;
+        let traffic = outcomes
+            .iter()
+            .map(|o| (o.short_crossings + o.long_crossings) as f64 / (window / 60.0))
+            .sum::<f64>()
+            / outcomes.len() as f64;
+        println!(
+            "   {n:>3} ants, {:<6} bridge: mean |share - ½| {dev:.2}, traffic {traffic:.0} crossings/min",
+            if cap > 16 { "wide" } else { "narrow" }
+        );
+    }
+
     println!("\n== two sources at equal distance, quality 1.0 vs 0.1 (Beckers et al. 1990) ==");
     let mut fractions = Vec::new();
     for &seed in &seeds {

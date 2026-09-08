@@ -47,6 +47,21 @@ pub struct Species {
     /// Speed multiplier on a strong trail (ants on established trails walk
     /// straighter and faster).
     pub trail_speed_factor: f64,
+    /// Fraction of speed lost in a cell at capacity: ant traffic slows only
+    /// mildly with density and does not jam (John, Schadschneider, Chowdhury
+    /// & Nishinari 2009, *Phys. Rev. Lett.* 102:108001), but pushes and
+    /// stalls at the densities of a crowded bridge (Dussutour et al. 2004).
+    pub crowding_slowdown: f64,
+    /// Trail deposition falls with crowding (occupancy over capacity):
+    /// `1 / (1 + crowding_deposition × crowding)`, half at capacity
+    /// (Czaczkes, Grüter & Ratnieks 2013, *Proc. R. Soc. B* 280:20122540:
+    /// head-on encounters on a crowded trail reduce pheromone deposition).
+    pub crowding_deposition: f64,
+    /// Weight against entering a crowded patch, per unit of crowding
+    /// (occupancy over capacity): at a jammed entrance it outweighs the
+    /// trail, which is how a crowded colony comes to use both branches
+    /// of a narrow bridge (Dussutour et al. 2004).
+    pub crowding_avoidance: f64,
     /// Temperature below which walking stops, °C (speed rises linearly from
     /// here to the reference temperature: Hurlbert, Ballantyne & Powell
     /// 2008, *Ecol. Entomol.* 33:144).
@@ -66,11 +81,10 @@ pub struct Species {
     /// Whether naive ants lay (weakly) while exploring, as Argentine ants
     /// do (Aron, Pasteels & Deneubourg 1989, *Biol. Behav.* 14:207).
     pub exploratory_laying: bool,
-    /// Trail weight on the way home as a fraction of the choice exponent:
-    /// mass recruiters read the trail in both directions, ants that
-    /// navigate home by path integration and route memory read it less
-    /// (Grüter, Czaczkes & Ratnieks 2011, *Behav. Ecol. Sociobiol.*
-    /// 65:141: private information overrides the trail in *Lasius niger*).
+    /// Trail weight on the way home as a fraction of the choice exponent.
+    /// Trail-laying species read the trail in both directions (the
+    /// bidirectional models of Beckers, Deneubourg & Goss 1992); path
+    /// integration and route memory act alongside it inbound.
     pub inbound_trail_factor: f64,
     /// Food quality (0..1) at which the probability of laying trail on the
     /// way home is half its maximum.
@@ -279,6 +293,9 @@ impl Species {
             speed_cm_s: 1.5,
             loaded_speed_factor: 0.8,
             trail_speed_factor: 1.15,
+            crowding_slowdown: 0.5,
+            crowding_deposition: 1.0,
+            crowding_avoidance: 2.0,
             speed_t_min_c: 5.0,
             speed_t_ref_c: Self::REFERENCE_C,
             // A substrate deposit: it evaporates but hardly spreads sideways
@@ -293,9 +310,12 @@ impl Species {
             },
             choice_exponent: 2.0,
             trail_deposit: 1.0,
-            outbound_laying: false,
+            // Foragers lay on the return trip and, less intensely, on the
+            // way out to a source they know (Beckers, Deneubourg & Goss
+            // 1992, *Insectes Soc.* 39:59).
+            outbound_laying: true,
             exploratory_laying: false,
-            inbound_trail_factor: 0.5,
+            inbound_trail_factor: 1.0,
             lay_quality_half: 0.3,
             lay_exponent: 2.0,
             lay_max_probability: 0.9,
@@ -614,7 +634,7 @@ impl Species {
         out[F_SITE] = 2.0;
         out[F_ROUTE] = self.route_weight;
         out[F_RECENT] = -0.5;
-        out[F_CROWD] = -0.1;
+        out[F_CROWD] = -self.crowding_avoidance;
         out[F_WALL] = -1.0;
         let inb = &mut weights[BASE_FEATURES..];
         inb[F_TRAIL] = self.inbound_trail_factor * n;
@@ -629,7 +649,7 @@ impl Species {
         inb[F_SITE] = 0.0;
         inb[F_ROUTE] = self.route_weight;
         inb[F_RECENT] = -0.5;
-        inb[F_CROWD] = -0.1;
+        inb[F_CROWD] = -self.crowding_avoidance;
         inb[F_WALL] = -1.0;
         BehavioralSurface {
             weights,

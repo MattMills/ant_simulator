@@ -78,6 +78,51 @@ fn equal_branches_break_symmetry_under_pure_pheromone_feedback() {
 }
 
 #[test]
+fn crowding_spreads_traffic_over_a_narrow_bridge() {
+    // Dussutour, Fourcassié, Helbing & Deneubourg 2004: at high traffic a
+    // narrow bridge is used symmetrically, and throughput is not lost.
+    let ants = 240;
+    let run = |cap: u16, seed: u64| {
+        run_crowded_bridge(
+            Species::lasius_niger(),
+            ants,
+            cap,
+            20.0 * 60.0,
+            5.0 * 60.0,
+            seed,
+        )
+    };
+    let narrow: Vec<BridgeOutcome> = [1, 2].iter().map(|&s| run(6, s)).collect();
+    let wide: Vec<BridgeOutcome> = [1, 2].iter().map(|&s| run(64, s)).collect();
+    let dev = |o: &[BridgeOutcome]| {
+        o.iter()
+            .map(|o| (o.short_fraction - 0.5).abs())
+            .sum::<f64>()
+            / o.len() as f64
+    };
+    let traffic = |o: &[BridgeOutcome]| {
+        o.iter()
+            .map(|o| (o.short_crossings + o.long_crossings) as f64)
+            .sum::<f64>()
+            / o.len() as f64
+    };
+    assert!(
+        dev(&narrow) < 0.08,
+        "narrow bridge should split evenly: {narrow:?}"
+    );
+    assert!(
+        dev(&wide) > dev(&narrow),
+        "the wide bridge should keep more of its asymmetry: wide {wide:?} narrow {narrow:?}"
+    );
+    assert!(
+        traffic(&narrow) > 0.7 * traffic(&wide),
+        "throughput should not collapse: narrow {} wide {}",
+        traffic(&narrow),
+        traffic(&wide)
+    );
+}
+
+#[test]
 fn richer_source_wins_the_colony() {
     // Beckers, Deneubourg, Goss & Pasteels 1990: two sources at equal
     // distance; quality-modulated trail laying and site fidelity focus the

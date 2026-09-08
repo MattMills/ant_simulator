@@ -19,7 +19,7 @@ use crate::colony::{SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::pheromone::Pheromone;
 use crate::species::Species;
-use crate::world::{Counter, FoodSource, Rect, WorldConfig};
+use crate::world::{CapacityZone, Counter, FoodSource, Rect, WorldConfig};
 
 /// Geometry of a double bridge, in cells.
 ///
@@ -135,6 +135,66 @@ pub fn double_bridge(spec: &BridgeSpec) -> WorldConfig {
     }
 }
 
+/// The equal double bridge with branches of a given width, expressed as
+/// the number of ants a branch cell holds; the nest and food chambers hold
+/// any number (Dussutour, Fourcassié, Helbing & Deneubourg 2004: bridges
+/// of 10 and 6 mm).
+pub fn crowded_bridge(spec: &BridgeSpec, branch_capacity: u16) -> WorldConfig {
+    let mut world = double_bridge(spec);
+    let up = spec.long_excursion.max(1) as i32;
+    let down = spec.short_excursion.max(1) as i32;
+    let y_mid = up + 3;
+    let x_j1 = 4 + spec.stem as i32;
+    let x_j2 = x_j1 + spec.span as i32 + 1;
+    let x_food = x_j2 + spec.stem as i32 + 1;
+    world.capacity_zones = vec![
+        // stems and junctions
+        CapacityZone {
+            rect: Rect::new(Position::new(4, y_mid), Position::new(x_food - 1, y_mid)),
+            capacity: branch_capacity,
+        },
+        // branches
+        CapacityZone {
+            rect: Rect::new(
+                Position::new(x_j1, y_mid - up),
+                Position::new(x_j2, y_mid - 1),
+            ),
+            capacity: branch_capacity,
+        },
+        CapacityZone {
+            rect: Rect::new(
+                Position::new(x_j1, y_mid + 1),
+                Position::new(x_j2, y_mid + down),
+            ),
+            capacity: branch_capacity,
+        },
+        CapacityZone {
+            rect: Rect::new(
+                Position::new(x_food, y_mid - 1),
+                Position::new(x_food + 2, y_mid + 1),
+            ),
+            capacity: u16::MAX,
+        },
+    ];
+    world
+}
+
+/// Run one crowded equal-bridge replicate: `ants` foragers on branches
+/// holding `branch_capacity` ants per cell. Returns the lower branch as
+/// "short".
+pub fn run_crowded_bridge(
+    species: Species,
+    ants: usize,
+    branch_capacity: u16,
+    seconds: f64,
+    window_s: f64,
+    seed: u64,
+) -> BridgeOutcome {
+    let world = crowded_bridge(&BridgeSpec::equal(), branch_capacity);
+    let cfg = experiment_config(species, world, ants);
+    run_double_bridge_configured(cfg, seconds, window_s, seed)
+}
+
 /// Outcome of one double-bridge replicate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BridgeOutcome {
@@ -186,6 +246,9 @@ pub fn pure_pheromone_feedback(cfg: &mut SimConfig) {
     world_pheromones[Pheromone::Trail.index()].half_life_s = f64::INFINITY;
     cfg.world.pheromones = Some(world_pheromones);
     cfg.species.route_capacity = 0;
+    cfg.world.cell_capacity = u16::MAX;
+    cfg.species.crowding_slowdown = 0.0;
+    cfg.species.crowding_deposition = 0.0;
     for f in [F_CROWD, F_RECENT, F_ROUTE] {
         cfg.instinct.weights[f] = 0.0;
         cfg.instinct.weights[BASE_FEATURES + f] = 0.0;

@@ -148,10 +148,10 @@ pub mod prelude {
     };
     pub use crate::entropy::{EntropyControl, Tempering};
     pub use crate::experiments::{
-        double_bridge, experiment_config, pure_pheromone_feedback, run_division_of_labor,
-        run_double_bridge, run_double_bridge_configured, run_double_bridge_once,
-        run_hunger_response, run_two_sources_once, summarize, two_sources, BridgeOutcome,
-        BridgeSpec, HungerOutcome, LaborOutcome, SourcesOutcome, Summary,
+        crowded_bridge, double_bridge, experiment_config, pure_pheromone_feedback,
+        run_crowded_bridge, run_division_of_labor, run_double_bridge, run_double_bridge_configured,
+        run_double_bridge_once, run_hunger_response, run_two_sources_once, summarize, two_sources,
+        BridgeOutcome, BridgeSpec, HungerOutcome, LaborOutcome, SourcesOutcome, Summary,
     };
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
