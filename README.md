@@ -636,33 +636,38 @@ loads against 4064 in full and 4027 with the grain alone, at a decision
 entropy of 1.64 against 1.54 and 1.61: the coarser the kernel, the more
 its outcomes lag the trail as it strengthens.
 
-`cargo bench -- colony` sets the memoized colony against the full one at
-colony scale: 400, 1600 and 6400 workers for a simulated hour on a
-128 × 128 world, the transits memoized and the field's kinetics stepped
-every four ticks, the kernels learning as they go (so the replayed share
-is that of the whole hour, and higher by its end):
+`cargo bench -- colony` sets the approximated colony against the full
+one at colony scale: 400, 1600 and 6400 workers for a simulated hour on
+a 128 × 128 world, in full, then with the transits memoized (the
+kernels learning as they go, so the replayed share is that of the whole
+hour and higher by its end) and the decision pipeline (below) holding a
+quarter of the steps, then with the field's kinetics stepped every four
+ticks as well:
 
 ```
-         memoized transits, field every 4 ticks        |  full simulation
-  ants   ticks/s  ns/ant  replayed  delivered  entropy | ticks/s  ns/ant  delivered  entropy
-   400      1379    1813       33%       3697    1.597 |     764    3274       3589    1.530
-  1600       432    1445       42%      15684    1.459 |     278    2249      15234    1.396
-  6400        99    1578       42%      56026    1.496 |      64    2461      52984    1.478
+                       full simulation      |   memoized transits and the pipeline     |  and the field every 4 ticks
+  ants   ticks/s  ns/ant  delivered  entropy | ticks/s  ns/ant  replayed  held  delivered  entropy | ticks/s  ns/ant  delivered  entropy
+   400       821    3044       3603    1.520 |     924    2705       30%   24%       3967    1.778 |    1637    1528       3697    1.781
+  1600       269    2323      15069    1.414 |     426    1468       37%   26%      15617    1.697 |     533    1173      15672    1.678
+  6400        61    2546      52833    1.483 |      94    1656       36%   20%      56399    1.632 |      99    1575      56726    1.646
 ```
 
-The memoized colony is the full one within a few percent, at 1.5 to 1.8
-times the throughput: it delivers 3 to 6% more and decides 1 to 4%
-hotter, with the same share of ant-time outside, and its cost per
-ant-tick is flat from 400 to 6400 workers (the time per tick scales as
-N^0.95). On one core, 6400 workers live an hour in 36 seconds. What is
-approximated: a replayed ant walks the straight line between its entry
-and its exit for the purposes of laying and of the history, learns no
-route inside the node, and carries the outcome of another ant of its
-kind; the kernels lag a changing field by their memory, and the strided
-field evaporates in steps, which together leave the memoized colony a
-little hotter and a little more productive than the full one. What
-remains is the three fifths of the decisions still simulated, which is
-where the time goes at every size.
+The approximated colony runs at 1.5 to 2 times the throughput of the
+full one and forages as it does: over eight seeds of the 400-worker
+hour the transits alone deliver within 1% of the full simulation and
+the pipeline within 2% (single runs, as above, scatter by ±5% and lean
+a few percent above the full one, since the kernels lag the trail as it
+strengthens and a strided field evaporates in steps). The entropy per
+decision rises because the decisions no longer made are the easy ones,
+on straight invariant ground, while those still made are the doubtful
+ones. On one core, 6400 workers live an hour in 36 seconds. What is
+approximated: a replayed ant walks the waypoints of another ant of its
+kind for the purposes of laying and of the history, learns no route
+inside the node, and carries that ant's outcome; and a held ant walks
+straight where it would most probably have walked straight. What
+remains is the share of the steps still decided, three fifths at 6400
+workers, and the bookkeeping of every step walked, which together are
+nine tenths of the tick at that size.
 
 ## The lens: a two-position structure on the quadtree
 
@@ -710,7 +715,12 @@ deadline first and, among equal deadlines, in the hierarchy's order (the
 castes the queen put first are served first), and an ant not served
 holds its heading a little longer, within its slack. The frames' ledger
 (`Stats::frames`) counts the decisions made, the steps held and
-deferred, the frames overrun and the mean horizon.
+deferred, the frames overrun and the mean horizon. In the colony-scale
+bench above the pipeline holds a fifth to a quarter of the steps on top
+of the transits' replays, and over eight seeds of a 400-worker hour it
+costs 2% of the deliveries; a budget of fifty decisions a frame for
+four hundred workers defers a further fifth of the steps within their
+slack for the same cost.
 
 ## Performance and scaling
 
@@ -720,55 +730,71 @@ size and world area with a hungry colony kept foraging, keeping the
 median of several runs and fitting the empirical exponent of the time per
 tick against each dimension. On one core of the development machine, 100
 *Lasius* workers on a 64 × 40 grid with the movement history and the queen
-on run at 3.7 thousand ticks per second, 2.7 µs per ant-tick, divided as:
+on run at 4.2 thousand ticks per second, 2.4 µs per ant-tick, divided as:
 
 ```
 phase           µs/tick   share
-decisions         134.5   49.8%
-ants               37.2   13.8%
-pheromones         92.7   34.3%
-food                0.5    0.2%
-nest                2.6    0.9%
+decisions         131.3   55.3%
+ants               33.4   14.1%
+pheromones         69.8   29.4%
+food                0.6    0.2%
+nest                1.9    0.8%
 history             0.0    0.0%
-queen               2.6    1.0%
+queen               0.3    0.1%
 ```
 
 A movement decision (perceiving the ring of sixteen headings, scoring it,
 tempering it, selecting) costs about 3 µs, and a walking ant makes one per
-tick; the chemical kinetics cost about 35 ns per cell per tick for the
-three or four channels that carry something. Sweeping colony size on the
-same grid:
+tick; the chemical kinetics cost under 30 ns per cell per tick where the
+field is at cell resolution. Sweeping colony size on the same grid:
 
 ```
     ants   ticks/s  ant-ticks/s   ns/ant  decisions  pheromones
-      25      8907       222674     4491        27%         66%
-     100      4152       415169     2409        50%         36%
-     400      1282       512818     1950        63%         12%
-    1600       280       447555     2234        57%          3%
+      25     11918       297945     3356        29%         62%
+     100      4287       428681     2333        57%         30%
+     400      1378       551123     1814        72%         11%
+    1600       384       614108     1628        77%          3%
 ```
 
-The decision phase is linear in the number of ants (exponent 1.02), the
-kinetics do not depend on it (0.06), and the cost per ant-tick is flat
-within 25% from 100 to 1600 workers. Sweeping the area at 100 workers:
+The decision phase is linear in the number of ants (exponent 1.03), the
+kinetics do not depend on it (0.10), and the cost per ant-tick falls by
+a third from 100 to 1600 workers as the kinetics are shared out.
+Sweeping the area at 100 workers:
 
 ```
-   cells   ticks/s  ant-ticks/s   ns/ant  decisions  pheromones
-    1024      6117       611695     1635        57%         22%
-    4096      3086       308560     3241        49%         40%
-   16384      1527       152724     6548        25%         68%
-   65536       527        52743    18960        12%         84%
+   cells   ticks/s  ant-ticks/s   ns/ant  decisions  pheromones  active
+    1024      5761       576146     1736        61%         22%     88%
+    4096      3582       358161     2792        51%         37%     52%
+   16384      1815       181475     5510        39%         53%     34%
+   65536       817        81733    12235        21%         73%     17%
 ```
 
-The kinetics are linear in the area (0.91) and dominate beyond ten
-thousand cells; the food kinetics visit only the cells that carry food,
-the movement history forgets lazily (a tick costs nothing), and the nest
-keeps its counts, so none of those grows with the grid or the colony.
-What remains is the sweep of the grid by the chemical channels, which
-cannot be made sparse without changing the dynamics (a trace below a
-millionth of a unit is dropped, and diffusion carries mass that small to
-every cell within an hour), and the decisions, which are the model. At
-colony scale the strided field takes the kinetics out of the picture and
-the memoized transits stand in for two fifths of the decisions (the
+The field is kept at two grains: the grid is tiled by the quadtree's
+nodes at one level (8 cells across), and for every channel a node is
+either *active*, its cells carrying the field, or *coarse*, one mean
+standing for all of them. Mass moves between cells, between a cell and
+a coarse node, and between coarse nodes by the same conservative shares,
+so the field is exact on and around the trails, where marks land and
+the front of the field reaches, and cheap where it is faint: a node
+whose cells have all faded below a hundredth of the perception constant
+is composed into its mean (fine to coarse), and a coarse node that a
+deposit or the front reaches is refined into cells again (coarse to
+fine). The volatile channels, the smell of food and alarm, spread
+through the air over the whole field and are kept at cell resolution
+only within two perception constants of their sources; beyond, a coarse
+node reads as the plane through its mean with the gradient of its
+neighbours', so a scout still follows the smell (the scouts of the
+discovery experiment find the hidden pool in 40 s with it against 86 s
+without, as before). *Active* above is the share of the nodes at which
+the trail is at cell resolution: a sixth of a 65536-cell world, on
+which the kinetics scale as area^0.76 and the tick as area^0.47, where
+the dense sweep of the previous round ran this world at 527 ticks a
+second and scaled as area^0.91. The food kinetics visit only the cells
+that carry food, the movement history forgets lazily (a tick costs
+nothing), and the nest keeps its counts, so none of those grows with
+the grid or the colony. What remains is the decisions, which are the
+model, and the bookkeeping of every step walked; at colony scale the
+memoized transits and the pipeline stand in for half of the steps (the
 colony-scale table in the memo section above).
 
 ## Reproducibility and tests
