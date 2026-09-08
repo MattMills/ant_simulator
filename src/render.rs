@@ -196,14 +196,21 @@ mod tests {
     fn renders_surface_rows() {
         let mut cfg = SimConfig {
             selection: Selection::Sucker { reach: 3 },
-            record_surface: Some(0),
             ..SimConfig::default()
         };
         cfg.nest.initial_satiation = 0.0;
         let mut sim = Simulation::new(cfg, 2);
-        // Ant 0 leaves the nest when its own threshold lets it; wait for it.
+        // Record whichever ant leaves the nest first.
+        for _ in 0..4000 {
+            sim.step();
+            let first_out = sim.living().find(|a| !a.is_inside()).map(|a| a.id);
+            if let Some(id) = first_out {
+                sim.set_record_surface(Some(id));
+                break;
+            }
+        }
         for _ in 0..40 {
-            sim.run(100);
+            sim.run(50);
             if sim.surface_trace().len() >= 5 {
                 break;
             }

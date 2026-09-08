@@ -130,6 +130,34 @@ fn main() {
         );
     }
 
+    println!("\n== finding a hidden pool by its smell (Buehlmann et al. 2014) ==");
+    for odour in [false, true] {
+        let times: Vec<f64> = seeds
+            .iter()
+            .map(|&seed| {
+                run_discovery(
+                    Species::lasius_niger(),
+                    40,
+                    odour,
+                    seconds.min(1200.0),
+                    seed,
+                )
+                .first_find_s
+                .unwrap_or(seconds.min(1200.0))
+            })
+            .collect();
+        println!(
+            "   {:<14} first find after {:.0} s on average (seeds: {})",
+            if odour { "with odour:" } else { "no odour:" },
+            times.iter().sum::<f64>() / times.len() as f64,
+            times
+                .iter()
+                .map(|t| format!("{t:.0}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
     println!("\n== foraging activity against colony satiation (Mailleux et al. 2006) ==");
     for o in run_hunger_response(
         &Species::lasius_niger(),

@@ -540,7 +540,7 @@ fn blend_direction(old: (f64, f64), new: (f64, f64), rate: f64) -> (f64, f64) {
 }
 
 /// Number of sensory features per candidate heading in one mode.
-pub const BASE_FEATURES: usize = 14;
+pub const BASE_FEATURES: usize = 15;
 
 /// Total features per candidate heading: one block for outbound movement
 /// and one for inbound movement, so behaviour differs by mode.
@@ -574,6 +574,8 @@ pub const F_RECENT: usize = 11;
 pub const F_CROWD: usize = 12;
 /// Index of the wall-ahead feature.
 pub const F_WALL: usize = 13;
+/// Index of the food-odour feature.
+pub const F_ODOUR: usize = 14;
 
 /// Human-readable feature names, indexed like a surface's weight vector.
 pub const FEATURE_NAMES: [&str; FEATURES] = [
@@ -591,6 +593,7 @@ pub const FEATURE_NAMES: [&str; FEATURES] = [
     "out:recently_visited",
     "out:crowding",
     "out:wall_ahead",
+    "out:food_odour",
     "in:trail",
     "in:home_trail",
     "in:territory",
@@ -605,6 +608,7 @@ pub const FEATURE_NAMES: [&str; FEATURES] = [
     "in:recently_visited",
     "in:crowding",
     "in:wall_ahead",
+    "in:food_odour",
 ];
 
 /// Which block of the surface a movement decision uses.
@@ -723,6 +727,7 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
             (F_TERRITORY, Pheromone::Territory),
             (F_NO_ENTRY, Pheromone::NoEntry),
             (F_ALARM, Pheromone::Alarm),
+            (F_ODOUR, Pheromone::Odour),
         ] {
             // Nothing is sensed behind: headings outside the sweep carry
             // no pheromone information, so turning back is governed by the

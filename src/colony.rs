@@ -1112,7 +1112,8 @@ impl Simulation {
             }
         }
         self.world.step_pheromones();
-        self.world.step_food();
+        self.world
+            .step_food(self.species.odour_per_ul_s, self.species.odour_per_mg_s);
         self.nest_step();
         self.tick += 1;
         self.stats.ticks += 1;
@@ -2798,19 +2799,25 @@ mod tests {
             let var = fills.iter().map(|f| (f - mean).powi(2)).sum::<f64>() / n;
             (mean, var.sqrt())
         };
-        sim.run(1200);
+        // The spread peaks as the first loads come in, then sharing
+        // evens the crops out.
+        let mut peak = 0.0f64;
+        for _ in 0..40 {
+            sim.run(30);
+            peak = peak.max(spread(&sim).1);
+        }
         assert!(sim.stats().food_delivered > 0);
+        assert!(peak > 0.02, "loads should first make crops uneven: {peak}");
+        sim.run(2400);
         assert!(
             !sim.world().cell(Position::new(26, 15)).unwrap().has_food(),
             "pool drunk up"
         );
-        let (mean_then, sd_then) = spread(&sim);
-        sim.run(2400);
         let (mean_now, sd_now) = spread(&sim);
-        assert!(mean_then > 0.0 && mean_now > 0.0);
+        assert!(mean_now > 0.0);
         assert!(
-            sd_now < 0.5 * sd_then,
-            "crop fills should even out: sd {sd_then:.3} → {sd_now:.3}"
+            sd_now < 0.5 * peak,
+            "crop fills should even out: peak sd {peak:.3} → {sd_now:.3}"
         );
         assert!(sim.stats().trophallaxis_mg > 0.0);
     }

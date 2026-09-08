@@ -22,7 +22,7 @@
 
 use crate::ant::{
     BASE_FEATURES, FEATURES, F_ALARM, F_CROWD, F_FOOD, F_HEADING, F_HOME, F_HOME_VECTOR, F_NEST,
-    F_NO_ENTRY, F_RECENT, F_ROUTE, F_SITE, F_TERRITORY, F_TRAIL, F_WALL,
+    F_NO_ENTRY, F_ODOUR, F_RECENT, F_ROUTE, F_SITE, F_TERRITORY, F_TRAIL, F_WALL,
 };
 use crate::entropy::EntropyControl;
 use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
@@ -126,6 +126,13 @@ pub struct Species {
     pub alarm: PheromoneParams,
     /// Alarm released at the death of a worker.
     pub alarm_release: f64,
+    /// Kinetics of the smell of food in the air.
+    pub food_odour: PheromoneParams,
+    /// Odour given off per microlitre of solution per second (a drop's
+    /// surface saturates: only the first few microlitres count).
+    pub odour_per_ul_s: f64,
+    /// Odour given off per milligram of prey per second.
+    pub odour_per_mg_s: f64,
 
     // ---- sensing ----
     /// Cells ahead an antennal sweep integrates (1 or 2).
@@ -405,6 +412,14 @@ impl Species {
                 k: 5.0,
             },
             alarm_release: 60.0,
+            food_odour: PheromoneParams {
+                half_life_s: 60.0,
+                diffusion_per_s: 0.3,
+                cap: 500.0,
+                k: 5.0,
+            },
+            odour_per_ul_s: 0.5,
+            odour_per_mg_s: 0.5,
             sense_range: 2,
             heading_persistence_cm: 5.0,
             pi_heading_noise_deg: 4.0,
@@ -578,6 +593,7 @@ impl Species {
             self.territory.clone(),
             self.no_entry.clone(),
             self.alarm.clone(),
+            self.food_odour.clone(),
         ];
         if !self.uses_home_pheromone {
             set[Pheromone::Home.index()] = PheromoneParams::inert();
@@ -709,6 +725,7 @@ impl Species {
         out[F_TERRITORY] = 0.3;
         out[F_NO_ENTRY] = -2.0;
         out[F_ALARM] = -2.0;
+        out[F_ODOUR] = 1.5;
         out[F_FOOD] = 4.0;
         out[F_NEST] = -1.0;
         out[F_HEADING] = 1.0;
@@ -724,6 +741,7 @@ impl Species {
         inb[F_TERRITORY] = 0.5;
         inb[F_NO_ENTRY] = 0.0;
         inb[F_ALARM] = -2.0;
+        inb[F_ODOUR] = 0.0;
         inb[F_FOOD] = 0.0;
         inb[F_NEST] = 4.0;
         inb[F_HEADING] = 0.8;

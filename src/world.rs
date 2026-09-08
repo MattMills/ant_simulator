@@ -490,12 +490,23 @@ impl World {
         }
     }
 
-    /// Refill renewing sources by one tick.
-    pub fn step_food(&mut self) {
+    /// Refill renewing sources by one tick and let food give off its
+    /// smell: `odour_per_ul_s` per microlitre of solution (the first five
+    /// count, a drop's surface being what evaporates) and `odour_per_mg_s`
+    /// per milligram of prey (the first thirty), into the odour channel.
+    pub fn step_food(&mut self, odour_per_ul_s: f64, odour_per_mg_s: f64) {
         let tick_s = self.config.tick_s;
+        let cap = self.params[Pheromone::Odour.index()].cap;
+        let active = self.retention[Pheromone::Odour.index()] > 0.0;
         for c in self.cells.iter_mut() {
             if c.renewal_ul_per_s > 0.0 && c.food_ul < c.food_capacity_ul {
                 c.food_ul = (c.food_ul + c.renewal_ul_per_s * tick_s).min(c.food_capacity_ul);
+            }
+            if active && c.has_food() {
+                let emission =
+                    odour_per_ul_s * c.food_ul.min(5.0) + odour_per_mg_s * c.prey_mg.min(30.0);
+                let slot = &mut c.pheromone[Pheromone::Odour.index()];
+                *slot = (*slot + emission * tick_s).min(cap);
             }
         }
     }
@@ -1268,10 +1279,10 @@ mod tests {
         assert_eq!(world.cell(c).unwrap().food_capacity_ul, 0.5);
         let (taken, _) = world.take_food(c, 0.4);
         assert!((taken - 0.4).abs() < 1e-12);
-        world.step_food();
+        world.step_food(0.0, 0.0);
         assert!((world.cell(c).unwrap().food_ul - 0.2).abs() < 1e-12);
         for _ in 0..10 {
-            world.step_food();
+            world.step_food(0.0, 0.0);
         }
         assert!(
             (world.cell(c).unwrap().food_ul - 0.5).abs() < 1e-12,
@@ -1280,7 +1291,7 @@ mod tests {
         // A plain pool does not refill.
         let (taken, _) = world.take_food(Position::new(0, 0), 5.0);
         assert!((taken - 5.0).abs() < 1e-12);
-        world.step_food();
+        world.step_food(0.0, 0.0);
         assert!(!world.cell(Position::new(0, 0)).unwrap().has_food());
     }
 
@@ -1338,6 +1349,56 @@ mod tests {
             .all(|c| c.corpses == 0 || c.terrain == Terrain::Open));
         let lay = |w: &World| w.cells().iter().map(|c| c.corpses).collect::<Vec<_>>();
         assert_eq!(lay(&w1), lay(&w2));
+    }
+
+    #[test]
+    fn food_gives_off_an_odour_that_spreads_and_fades() {
+        let cfg = WorldConfig {
+            food_sources: vec![
+                FoodSource::pool(Position::new(2, 7), 0, 100.0, 1.0),
+                FoodSource::prey(Position::new(7, 7), 0, 100.0),
+            ],
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        world.step_food(0.5, 0.5);
+        let sugar = world.level(Position::new(2, 7), Pheromone::Odour);
+        let prey = world.level(Position::new(7, 7), Pheromone::Odour);
+        assert!(
+            (sugar - 2.5).abs() < 1e-9,
+            "five microlitres count: {sugar}"
+        );
+        assert!(
+            (prey - 15.0).abs() < 1e-9,
+            "thirty milligrams count: {prey}"
+        );
+        for _ in 0..20 {
+            world.step_pheromones();
+            world.step_food(0.5, 0.5);
+        }
+        assert!(
+            world.level(Position::new(6, 7), Pheromone::Odour) > 0.0,
+            "the smell spreads"
+        );
+        assert!(world.level(Position::new(7, 7), Pheromone::Odour) < 500.0 + 1e-9);
+        // Without food the smell fades within minutes.
+        let mut bare = World::new(small_config(), &mut Rng::seed_from_u64(1));
+        bare.deposit(Position::new(4, 4), Pheromone::Odour, 100.0);
+        for _ in 0..300 {
+            bare.step_pheromones();
+        }
+        assert!(bare.total_pheromone(Pheromone::Odour) < 5.0);
+        // Inert odour: nothing is given off.
+        let mut quiet = Species::lasius_niger();
+        quiet.food_odour = PheromoneParams::inert();
+        let cfg = WorldConfig {
+            pheromones: Some(quiet.pheromones()),
+            food_sources: vec![FoodSource::prey(Position::new(7, 7), 0, 100.0)],
+            ..small_config()
+        };
+        let mut silent = World::new(cfg, &mut Rng::seed_from_u64(1));
+        silent.step_food(0.5, 0.5);
+        assert_eq!(silent.total_pheromone(Pheromone::Odour), 0.0);
     }
 
     #[test]

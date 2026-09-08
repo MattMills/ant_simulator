@@ -14,7 +14,7 @@
 //! * [`run_division_of_labor`]: specialisation with and without response
 //!   threshold reinforcement (Theraulaz, Bonabeau & Deneubourg 1998).
 
-use crate::ant::{BASE_FEATURES, F_CROWD, F_RECENT, F_ROUTE};
+use crate::ant::{BASE_FEATURES, F_CROWD, F_ODOUR, F_RECENT, F_ROUTE};
 use crate::colony::{BroodItem, BroodStage, SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::pheromone::Pheromone;
@@ -249,7 +249,8 @@ pub fn pure_pheromone_feedback(cfg: &mut SimConfig) {
     cfg.world.cell_capacity = u16::MAX;
     cfg.species.crowding_slowdown = 0.0;
     cfg.species.crowding_deposition = 0.0;
-    for f in [F_CROWD, F_RECENT, F_ROUTE] {
+    cfg.species.food_odour = crate::pheromone::PheromoneParams::inert();
+    for f in [F_CROWD, F_RECENT, F_ROUTE, F_ODOUR] {
         cfg.instinct.weights[f] = 0.0;
         cfg.instinct.weights[BASE_FEATURES + f] = 0.0;
     }
@@ -731,6 +732,70 @@ pub fn run_cemetery(
         largest_start: start.first().copied().unwrap_or(0),
         largest_end: end.first().copied().unwrap_or(0),
         corpses_moved: sim.stats().corpses_moved,
+    }
+}
+
+/// A world with one small pool of sugar solution off to one side of the
+/// nest, for timing its discovery.
+pub fn hidden_source(distance: i32) -> WorldConfig {
+    let margin = 6;
+    let side = (2 * distance + 2 * margin + 1) as usize;
+    let nest = Position::new(distance + margin, distance + margin);
+    let off = ((distance as f64) / std::f64::consts::SQRT_2).round() as i32;
+    WorldConfig {
+        width: side,
+        height: side,
+        nest,
+        nest_radius: 1,
+        food_sources: vec![FoodSource::pool(
+            Position::new(nest.x + off, nest.y - off),
+            1,
+            1.0e6,
+            1.0,
+        )],
+        random_food: None,
+        ..WorldConfig::default()
+    }
+}
+
+/// Outcome of one discovery replicate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscoveryOutcome {
+    /// Whether the food gave off an odour.
+    pub odour: bool,
+    /// Time of the first feeding visit, seconds, if any.
+    pub first_find_s: Option<f64>,
+    /// Loads delivered by the end.
+    pub delivered: u64,
+}
+
+/// Time the first discovery of a hidden source by `ants` workers of
+/// `species`, with the food's odour switched on or off.
+pub fn run_discovery(
+    species: Species,
+    ants: usize,
+    odour: bool,
+    seconds: f64,
+    seed: u64,
+) -> DiscoveryOutcome {
+    let mut species = species;
+    if !odour {
+        species.food_odour = crate::pheromone::PheromoneParams::inert();
+    }
+    let cfg = experiment_config(species, hidden_source(14), ants);
+    let mut sim = Simulation::new(cfg, seed);
+    let steps = (seconds / sim.tick_s()).round().max(1.0) as usize;
+    let mut first_find_s = None;
+    for _ in 0..steps {
+        sim.step();
+        if first_find_s.is_none() && sim.stats().food_picked > 0 {
+            first_find_s = Some(sim.time_s());
+        }
+    }
+    DiscoveryOutcome {
+        odour,
+        first_find_s,
+        delivered: sim.stats().food_delivered,
     }
 }
 

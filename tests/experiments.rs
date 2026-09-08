@@ -199,6 +199,30 @@ fn corpses_are_gathered_into_piles() {
 }
 
 #[test]
+fn food_odour_speeds_up_discovery() {
+    // Buehlmann et al. 2014: ants locate food by its smell; here a hidden
+    // pool is found sooner when it gives off an odour.
+    let seeds = [1u64, 2, 3];
+    let time = |odour: bool| -> f64 {
+        seeds
+            .iter()
+            .map(|&s| {
+                run_discovery(Species::lasius_niger(), 40, odour, 20.0 * 60.0, s)
+                    .first_find_s
+                    .unwrap_or(20.0 * 60.0)
+            })
+            .sum::<f64>()
+            / seeds.len() as f64
+    };
+    let with = time(true);
+    let without = time(false);
+    assert!(
+        with < 0.75 * without,
+        "odour should shorten discovery: {with:.0} s with, {without:.0} s without"
+    );
+}
+
+#[test]
 fn richer_source_wins_the_colony() {
     // Beckers, Deneubourg, Goss & Pasteels 1990: two sources at equal
     // distance; quality-modulated trail laying and site fidelity focus the

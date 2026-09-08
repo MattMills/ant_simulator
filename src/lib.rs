@@ -158,6 +158,7 @@ pub mod prelude {
         run_two_sources_once, summarize, two_sources, BridgeOutcome, BridgeSpec, HungerOutcome,
         LaborOutcome, ProductivityOutcome, SourcesOutcome, Summary,
     };
+    pub use crate::experiments::{hidden_source, run_discovery, DiscoveryOutcome};
     pub use crate::experiments::{run_communal_nutrition, sugar_and_prey, NutritionOutcome};
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{

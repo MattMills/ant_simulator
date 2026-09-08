@@ -36,20 +36,27 @@ pub enum Pheromone {
     /// which foragers far from the nest avoid (Hölldobler & Wilson 1990,
     /// *The Ants*, ch. 7).
     Alarm = 4,
+    /// The smell of food: volatiles given off by sugar solution (weakly)
+    /// and by dead insects (strongly), spreading through the air and gone
+    /// within minutes. Searching ants climb its gradient and so find food
+    /// from a distance (Buehlmann, Graham, Hansson & Knaden 2014, *Curr.
+    /// Biol.* 24:960: desert ants locate food by its odour).
+    Odour = 5,
 }
 
 impl Pheromone {
     /// Every channel, in index order.
-    pub const ALL: [Pheromone; 5] = [
+    pub const ALL: [Pheromone; 6] = [
         Pheromone::Trail,
         Pheromone::Home,
         Pheromone::Territory,
         Pheromone::NoEntry,
         Pheromone::Alarm,
+        Pheromone::Odour,
     ];
 
     /// Number of channels.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     /// Index into a [`PheromoneSet`] or a cell's pheromone array.
     pub const fn index(self) -> usize {
@@ -64,6 +71,7 @@ impl Pheromone {
             Pheromone::Territory => "territory",
             Pheromone::NoEntry => "no-entry",
             Pheromone::Alarm => "alarm",
+            Pheromone::Odour => "odour",
         }
     }
 }
