@@ -271,6 +271,12 @@ pub struct WorldConfig {
     /// Corpses scattered at random over open cells when the world is built
     /// (the arenas of the cemetery-formation experiments).
     pub scattered_corpses: usize,
+    /// Conspicuous objects (stones, tufts) that ants can see from a
+    /// distance and take views of.
+    pub landmarks: Vec<Position>,
+    /// Landmarks placed at random over open cells when the world is built,
+    /// in addition to `landmarks`.
+    pub random_landmarks: usize,
     /// Pheromone kinetics; `None` takes them from the species.
     pub pheromones: Option<PheromoneSet>,
     /// Seed for random food placement. `None` uses the simulation's generator,
@@ -304,6 +310,8 @@ impl Default for WorldConfig {
             cell_capacity: 8,
             capacity_zones: Vec::new(),
             scattered_corpses: 0,
+            landmarks: Vec::new(),
+            random_landmarks: 0,
             pheromones: None,
             seed: None,
         }
@@ -325,6 +333,7 @@ pub struct World {
     config: WorldConfig,
     cells: Vec<Cell>,
     scratch: Vec<[f64; Pheromone::COUNT]>,
+    landmarks: Vec<Position>,
     params: PheromoneSet,
     base_retention: [f64; Pheromone::COUNT],
     retention: [f64; Pheromone::COUNT],
@@ -368,6 +377,7 @@ impl World {
         let mut world = World {
             cells: vec![Cell::default(); n],
             scratch: vec![[0.0; Pheromone::COUNT]; n],
+            landmarks: config.landmarks.clone(),
             params,
             base_retention: retention,
             retention,
@@ -403,7 +413,52 @@ impl World {
             };
             world.scatter_corpses(world.config.scattered_corpses, r);
         }
+        if world.config.random_landmarks > 0 {
+            let mut local;
+            let r: &mut Rng = match world.config.seed {
+                Some(seed) => {
+                    local = Rng::seed_from_u64(seed ^ 0x2545_f491_4f6c_dd1d);
+                    &mut local
+                }
+                None => rng,
+            };
+            let w = world.config.width as i32;
+            let h = world.config.height as i32;
+            let mut placed = 0;
+            for _attempt in 0..world.config.random_landmarks * 50 {
+                if placed >= world.config.random_landmarks {
+                    break;
+                }
+                let p = Position::new(r.below(w as usize) as i32, r.below(h as usize) as i32);
+                let open = world
+                    .cell(p)
+                    .map(|c| c.terrain == Terrain::Open)
+                    .unwrap_or(false);
+                if open && !world.landmarks.contains(&p) {
+                    world.landmarks.push(p);
+                    placed += 1;
+                }
+            }
+        }
         world
+    }
+
+    /// The landmarks of this world.
+    pub fn landmarks(&self) -> &[Position] {
+        &self.landmarks
+    }
+
+    /// The nearest landmark within `sight` cells of a point, with its
+    /// index.
+    pub fn nearest_landmark(&self, from: Point, sight: f64) -> Option<(usize, Position)> {
+        let mut best: Option<(usize, Position, f64)> = None;
+        for (i, &l) in self.landmarks.iter().enumerate() {
+            let d = from.distance(Point::center_of(l));
+            if d <= sight && best.map(|b| d < b.2).unwrap_or(true) {
+                best = Some((i, l, d));
+            }
+        }
+        best.map(|(i, l, _)| (i, l))
     }
 
     fn scatter_corpses(&mut self, count: usize, rng: &mut Rng) {
@@ -1399,6 +1454,36 @@ mod tests {
         let mut silent = World::new(cfg, &mut Rng::seed_from_u64(1));
         silent.step_food(0.5, 0.5);
         assert_eq!(silent.total_pheromone(Pheromone::Odour), 0.0);
+    }
+
+    #[test]
+    fn landmarks_are_placed_and_seen_within_sight() {
+        let cfg = WorldConfig {
+            landmarks: vec![Position::new(2, 2), Position::new(8, 8)],
+            random_landmarks: 3,
+            seed: Some(4),
+            ..small_config()
+        };
+        let world = World::new(cfg.clone(), &mut Rng::seed_from_u64(1));
+        assert_eq!(world.landmarks().len(), 5);
+        assert!(world
+            .landmarks()
+            .iter()
+            .all(|&l| world.cell(l).unwrap().terrain == Terrain::Open));
+        let again = World::new(cfg, &mut Rng::seed_from_u64(2));
+        assert_eq!(
+            world.landmarks(),
+            again.landmarks(),
+            "placement follows the config seed"
+        );
+        let from = Point::new(3.5, 3.5);
+        assert_eq!(
+            world.nearest_landmark(from, 2.0),
+            Some((0, Position::new(2, 2)))
+        );
+        assert_eq!(world.nearest_landmark(from, 0.5), None);
+        let near_far = world.nearest_landmark(Point::new(7.5, 7.5), 2.0);
+        assert_eq!(near_far, Some((1, Position::new(8, 8))));
     }
 
     #[test]

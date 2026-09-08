@@ -137,6 +137,15 @@ pub struct Species {
     // ---- sensing ----
     /// Cells ahead an antennal sweep integrates (1 or 2).
     pub sense_range: usize,
+    /// Distance at which a landmark can be seen, cm. Ants take a view of
+    /// the landmarks around the nest and around a food site and fix their
+    /// position from them when the same landmark comes into view again
+    /// (Wehner & Räber 1979, *Experientia* 35:1569; Collett 1992, *J.
+    /// Comp. Physiol. A* 170:435).
+    pub sight_cm: f64,
+    /// How far the path-integration estimate moves towards the position
+    /// a familiar landmark gives, per sighting.
+    pub landmark_correction: f64,
 
     // ---- navigation ----
     /// Persistence length of the direction of travel, cm: the heading an
@@ -421,6 +430,8 @@ impl Species {
             odour_per_ul_s: 0.5,
             odour_per_mg_s: 0.5,
             sense_range: 2,
+            sight_cm: 20.0,
+            landmark_correction: 0.8,
             heading_persistence_cm: 5.0,
             pi_heading_noise_deg: 4.0,
             pi_distance_noise: 0.05,
@@ -555,6 +566,8 @@ impl Species {
         // Strongly size-polymorphic foragers (Cerdá & Retana 1997,
         // *Oecologia* 111:305).
         s.size_cv = 0.35;
+        // Landmarks are read at a distance in open desert.
+        s.sight_cm = 60.0;
         s.pi_heading_noise_deg = 3.0;
         s.pi_distance_noise = 0.04;
         s.search_time_s = 300.0;

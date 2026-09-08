@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 /// Render the world as ASCII art, one character per cell.
 ///
 /// * `#` wall, `N` nest, `F` sugar solution, `P` prey, `+` a corpse or
-///   two, `%` a pile of them, `x` an alarm cloud,
+///   two, `%` a pile of them, `L` a landmark, `x` an alarm cloud,
 /// * `o` an outbound ant, `<` an inbound ant carrying food, `-` an inbound
 ///   ant returning empty, `?` a searching ant, `f` an ant feeding,
 /// * `@`, `:` and `.` strong, medium and faint recruitment trail,
@@ -56,6 +56,11 @@ pub fn render(sim: &Simulation) -> String {
                     }
                 }
             };
+        }
+    }
+    for &l in world.landmarks() {
+        if l.x >= 0 && l.y >= 0 && (l.y as usize) < h && (l.x as usize) < w {
+            grid[l.y as usize][l.x as usize] = 'L';
         }
     }
     for ant in sim.living() {

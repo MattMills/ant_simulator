@@ -16,7 +16,7 @@
 //! larval and pupal stages, and temperature scales walking, evaporation,
 //! development and metabolism.
 
-use crate::ant::{observe, Activity, Ant, AntId, Mode, SearchTarget, Site, Traits, FEATURES};
+use crate::ant::{observe, Activity, Ant, AntId, Mode, SearchTarget, Site, Traits, View, FEATURES};
 use crate::entropy::{entropy, Tempering};
 use crate::geometry::{angle_of, Point, Position};
 use crate::hierarchy::{EffectivePolicy, Hierarchy, HierarchySpec, NodeId};
@@ -605,6 +605,8 @@ pub struct Stats {
     pub trophallaxis_mg: f64,
     /// Unloadings abandoned with a load still in the crop.
     pub failed_unloads: u64,
+    /// Position fixes taken from familiar landmarks.
+    pub landmark_fixes: u64,
     /// Periodic snapshots.
     pub log: Vec<Snapshot>,
 }
@@ -1388,11 +1390,26 @@ impl Simulation {
         let demand = self.nest.protein_demand(self.species.larva_protein_mg);
         let base = self.species.protein_acceptance_base;
         let accepts_prey = self.rng.chance(base + (1.0 - base) * demand);
+        let sight = self.species.sight_cm / self.world.cell_cm().max(1e-9);
+        let exit_point = {
+            let c = Point::center_of(exit);
+            Point::new(c.x + jitter.0, c.y + jitter.1)
+        };
+        let nest_view = self
+            .world
+            .nearest_landmark(exit_point, sight)
+            .map(|(landmark, l)| View {
+                landmark,
+                offset: exit_point.to(Point::center_of(l)),
+            });
         let a = &mut self.ants[i];
         a.activity = Activity::Outbound;
         a.accepts_prey = accepts_prey;
         a.item_mg = 0.0;
         a.corpse = false;
+        if nest_view.is_some() {
+            a.nest_view = nest_view;
+        }
         let c = Point::center_of(exit);
         a.position = Point::new(c.x + jitter.0, c.y + jitter.1);
         a.heading = heading;
@@ -1694,6 +1711,15 @@ impl Simulation {
             self.stats.recruiting_trips += 1;
         }
         self.ants[i].load_fill = fill;
+        let sight = self.species.sight_cm / self.world.cell_cm().max(1e-9);
+        let here = self.ants[i].position;
+        let site_view = self
+            .world
+            .nearest_landmark(here, sight)
+            .map(|(landmark, l)| View {
+                landmark,
+                offset: here.to(Point::center_of(l)),
+            });
         let a = &mut self.ants[i];
         a.steps_since_food = 0;
         a.trip_length = 0.0;
@@ -1702,6 +1728,7 @@ impl Simulation {
             quality,
             nutrient: a.load_kind,
         });
+        a.site_view = site_view;
         a.heading = crate::geometry::wrap_angle(a.heading + std::f64::consts::PI);
         a.activity = Activity::Inbound;
         a.search_steps = 0;
@@ -1964,7 +1991,63 @@ impl Simulation {
                 }
                 _ => {}
             }
+            self.fix_position_by_landmarks(i);
             self.handle_corpses(i, to_cell);
+        }
+    }
+
+    /// View-based position fixing: when the landmark of a stored view is
+    /// in sight, the ant knows where it stands relative to the place the
+    /// view was taken at, and pulls its path-integration estimate towards
+    /// that (Wehner & Räber 1979; Collett 1992).
+    fn fix_position_by_landmarks(&mut self, i: usize) {
+        if self.world.landmarks().is_empty() {
+            return;
+        }
+        let sight = self.species.sight_cm / self.world.cell_cm().max(1e-9);
+        let correction = self.species.landmark_correction.clamp(0.0, 1.0);
+        let (position, activity, target, site, nest_view, site_view) = {
+            let a = &self.ants[i];
+            (
+                a.position,
+                a.activity,
+                a.search_target,
+                a.site,
+                a.nest_view,
+                a.site_view,
+            )
+        };
+        let homeward = matches!(
+            (activity, target),
+            (Activity::Inbound, _) | (Activity::Searching, SearchTarget::Nest)
+        );
+        // Prefer the view that belongs to the current leg.
+        let nest_candidate = nest_view.map(|v| (v, (0.0, 0.0)));
+        let site_candidate = site.zip(site_view).map(|(s, v)| (v, s.vector));
+        let candidates = if homeward {
+            [nest_candidate, site_candidate]
+        } else {
+            [site_candidate, nest_candidate]
+        };
+        for (view, place_vector) in candidates.into_iter().flatten() {
+            let Some(&landmark) = self.world.landmarks().get(view.landmark) else {
+                continue;
+            };
+            let l = Point::center_of(landmark);
+            if position.distance(l) > sight {
+                continue;
+            }
+            // Where the ant stands relative to the place: the landmark's
+            // offset from the place minus its offset from the ant.
+            let (rx, ry) = position.to(l);
+            let relative = (view.offset.0 - rx, view.offset.1 - ry);
+            let fixed = (place_vector.0 + relative.0, place_vector.1 + relative.1);
+            let a = &mut self.ants[i];
+            a.home_vector.0 += correction * (fixed.0 - a.home_vector.0);
+            a.home_vector.1 += correction * (fixed.1 - a.home_vector.1);
+            a.lost = false;
+            self.stats.landmark_fixes += 1;
+            break;
         }
     }
 

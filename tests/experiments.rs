@@ -223,6 +223,44 @@ fn food_odour_speeds_up_discovery() {
 }
 
 #[test]
+fn landmarks_shorten_the_search_for_the_nest() {
+    // Wehner & Räber 1979; Collett 1992: a desert ant that has taken a view
+    // of the landmarks around its nest fixes its position from them and
+    // needs less searching to find the entrance. Path integration is made
+    // noisier than the species default so that the search phase matters.
+    let mut species = Species::cataglyphis();
+    species.pi_heading_noise_deg = 8.0;
+    species.pi_distance_noise = 0.1;
+    let searching_per_trip = |landmarks: usize| -> (f64, u64) {
+        let mut ticks = 0.0;
+        let mut fixes = 0;
+        for seed in 1..=3u64 {
+            let world = WorldConfig {
+                seed: Some(seed),
+                random_landmarks: landmarks,
+                ..WorldConfig::default()
+            };
+            let cfg = experiment_config(species.clone(), world, 40);
+            let mut sim = Simulation::new(cfg, seed);
+            sim.run_seconds(20.0 * 60.0);
+            let s = sim.stats();
+            assert!(s.food_delivered > 20, "{s:?}");
+            ticks += s.activity_ticks[Activity::Searching.index()] as f64 / s.food_delivered as f64;
+            fixes += s.landmark_fixes;
+        }
+        (ticks / 3.0, fixes)
+    };
+    let (bare, no_fixes) = searching_per_trip(0);
+    let (marked, fixes) = searching_per_trip(12);
+    assert_eq!(no_fixes, 0);
+    assert!(fixes > 0);
+    assert!(
+        marked < 0.8 * bare,
+        "landmarks should cut the search: {marked:.2} vs {bare:.2} searching ticks per trip"
+    );
+}
+
+#[test]
 fn richer_source_wins_the_colony() {
     // Beckers, Deneubourg, Goss & Pasteels 1990: two sources at equal
     // distance; quality-modulated trail laying and site fidelity focus the

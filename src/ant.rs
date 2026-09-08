@@ -148,6 +148,17 @@ impl Traits {
     }
 }
 
+/// A view of a landmark taken at a place worth returning to: which
+/// landmark, and where it stood relative to the place. Seeing the landmark
+/// again tells the ant where it is relative to that place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    /// Index of the landmark in the world's list.
+    pub landmark: usize,
+    /// Vector from the place to the landmark, in cells.
+    pub offset: (f64, f64),
+}
+
 /// A remembered food location.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Site {
@@ -212,6 +223,12 @@ pub struct Ant {
     pub accepts_prey: bool,
     /// Whether the ant is carrying a dead nestmate.
     pub corpse: bool,
+    /// A view taken at the nest: the landmark seen from the nest exit and
+    /// its position relative to the exit, in cells.
+    pub nest_view: Option<View>,
+    /// A view taken at the food site: the landmark seen there and its
+    /// position relative to the site.
+    pub site_view: Option<View>,
     /// Seconds of reserve before starvation once the crop is empty.
     pub energy: f64,
     /// Sugar in the crop, milligrams (the ant's own reserve, and on the
@@ -295,6 +312,8 @@ impl Ant {
             item_mg: 0.0,
             accepts_prey: false,
             corpse: false,
+            nest_view: None,
+            site_view: None,
             energy,
             sugar_mg: 0.0,
             crop_capacity_mg,
