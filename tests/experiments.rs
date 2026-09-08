@@ -185,6 +185,20 @@ fn larvae_turn_foraging_towards_protein() {
 }
 
 #[test]
+fn corpses_are_gathered_into_piles() {
+    // Deneubourg et al. 1991; Theraulaz et al. 2002: workers pick up lone
+    // corpses and drop them where corpses lie, so scattered corpses end
+    // up in a few piles.
+    let o = run_cemetery(Species::lasius_niger(), 60, 300, 40.0 * 60.0, 1);
+    assert!(o.corpses_moved > 100, "{o:?}");
+    assert!(
+        o.clusters_end * 2 < o.clusters_start,
+        "piles should merge: {o:?}"
+    );
+    assert!(o.largest_end > o.largest_start, "{o:?}");
+}
+
+#[test]
 fn richer_source_wins_the_colony() {
     // Beckers, Deneubourg, Goss & Pasteels 1990: two sources at equal
     // distance; quality-modulated trail laying and site fidelity focus the

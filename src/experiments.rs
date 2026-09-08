@@ -675,6 +675,65 @@ pub fn run_communal_nutrition(
     }
 }
 
+/// An open arena of `side` cells with `corpses` dead ants scattered over
+/// it and a nest in the middle (Theraulaz et al. 2002: corpses in a
+/// circular arena are gathered into a few piles).
+pub fn cemetery_arena(side: usize, corpses: usize, seed: u64) -> WorldConfig {
+    let mid = (side / 2) as i32;
+    WorldConfig {
+        width: side,
+        height: side,
+        nest: Position::new(mid, mid),
+        nest_radius: 1,
+        food_sources: Vec::new(),
+        random_food: None,
+        scattered_corpses: corpses,
+        seed: Some(seed),
+        ..WorldConfig::default()
+    }
+}
+
+/// Outcome of one cemetery replicate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CemeteryOutcome {
+    /// Piles at the start (eight-connected groups of cells holding
+    /// corpses).
+    pub clusters_start: usize,
+    /// Piles at the end.
+    pub clusters_end: usize,
+    /// Corpses in the largest pile at the start.
+    pub largest_start: u32,
+    /// Corpses in the largest pile at the end.
+    pub largest_end: u32,
+    /// Corpses picked up over the run.
+    pub corpses_moved: u64,
+}
+
+/// Run one cemetery replicate: `ants` hungry workers of `species` with no
+/// food to find, roaming an arena with `corpses` dead nestmates.
+pub fn run_cemetery(
+    species: Species,
+    ants: usize,
+    corpses: usize,
+    seconds: f64,
+    seed: u64,
+) -> CemeteryOutcome {
+    let world = cemetery_arena(40, corpses, seed);
+    let mut cfg = experiment_config(species, world, ants);
+    cfg.nest.mortality = false;
+    let mut sim = Simulation::new(cfg, seed);
+    let start = sim.world().corpse_clusters();
+    sim.run_seconds(seconds);
+    let end = sim.world().corpse_clusters();
+    CemeteryOutcome {
+        clusters_start: start.len(),
+        clusters_end: end.len(),
+        largest_start: start.first().copied().unwrap_or(0),
+        largest_end: end.first().copied().unwrap_or(0),
+        corpses_moved: sim.stats().corpses_moved,
+    }
+}
+
 /// Division of labour with and without threshold reinforcement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaborOutcome {

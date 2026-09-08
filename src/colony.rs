@@ -275,6 +275,8 @@ pub struct Nest {
     pub capacity_mg: f64,
     /// Protein (prey) in store, milligrams.
     pub protein_mg: f64,
+    /// Dead nestmates inside, waiting to be carried out.
+    pub corpses: u32,
     /// Developing brood.
     pub brood: Vec<BroodItem>,
     /// Mean recruitment excitation of the workers inside.
@@ -525,6 +527,8 @@ pub struct Stats {
     pub prey_picked: u64,
     /// Protein delivered, milligrams.
     pub protein_delivered_mg: f64,
+    /// Corpses picked up (in the nest or outside).
+    pub corpses_moved: u64,
     /// Outbound trips abandoned without food.
     pub failed_trips: u64,
     /// Workers that died.
@@ -747,6 +751,7 @@ impl Simulation {
             store_mg: capacity * config.nest.initial_satiation.clamp(0.0, 1.0),
             capacity_mg: capacity,
             protein_mg: 0.0,
+            corpses: 0,
             brood: Vec::new(),
             excitation: 0.0,
             eggs_laid: 0,
@@ -1225,10 +1230,24 @@ impl Simulation {
             (larvae / self.species.brood_per_nurse.max(1e-9)) / (nurses + 1.0)
         };
         let p_nurse = self.species.response(demand, nursing_threshold) * self.decision_prob;
+        // Undertaking: corpses inside are carried out and dropped away
+        // from the nest.
+        let p_undertake = if self.nest.corpses > 0 {
+            let stimulus = self.species.undertaking_gain * self.nest.corpses as f64;
+            self.species.response(stimulus, threshold) * self.decision_prob
+        } else {
+            0.0
+        };
         let u = self.rng.next_f64();
-        if u < p_forage {
+        if u < p_undertake {
+            self.nest.corpses -= 1;
+            self.stats.corpses_moved += 1;
             self.depart(i);
-        } else if u < p_forage + p_nurse {
+            self.ants[i].corpse = true;
+            self.ants[i].laying = None;
+        } else if u < p_undertake + p_forage {
+            self.depart(i);
+        } else if u < p_undertake + p_forage + p_nurse {
             let bout = self.seconds_to_ticks(self.species.nursing_bout_s);
             let a = &mut self.ants[i];
             a.activity = Activity::Nursing;
@@ -1250,6 +1269,7 @@ impl Simulation {
         a.activity = Activity::Outbound;
         a.accepts_prey = accepts_prey;
         a.item_mg = 0.0;
+        a.corpse = false;
         let c = Point::center_of(exit);
         a.position = Point::new(c.x + jitter.0, c.y + jitter.1);
         a.heading = heading;
@@ -1419,6 +1439,59 @@ impl Simulation {
         }
     }
 
+    /// Necrophoresis on entering a cell: a carrier drops its corpse where
+    /// corpses already lie (and, past the refuse distance, now and then
+    /// anywhere); an unladen explorer picks one up, the less likely the
+    /// bigger the pile it lies in (Deneubourg et al. 1991).
+    fn handle_corpses(&mut self, i: usize, cell: Position) {
+        let species = &self.species;
+        let carrying_corpse = self.ants[i].corpse;
+        if carrying_corpse {
+            let near = self.world.corpses_near(cell) as f64;
+            let far_enough = {
+                let d = Point::center_of(self.world.nest()).distance(self.ants[i].position);
+                d * self.world.cell_cm() >= species.refuse_distance_cm
+            };
+            let p_pile = (near / (species.corpse_drop_k + near)).powi(2);
+            let p = if far_enough {
+                p_pile.max(species.corpse_base_drop)
+            } else {
+                p_pile
+            };
+            if self.rng.chance(p) {
+                self.world.add_corpse(cell);
+                self.ants[i].corpse = false;
+            }
+            return;
+        }
+        let here = self.world.cell(cell).map(|c| c.corpses).unwrap_or(0);
+        if here == 0 {
+            return;
+        }
+        let a = &self.ants[i];
+        let explorer = matches!(a.activity, Activity::Outbound | Activity::Searching)
+            && a.site.is_none()
+            && !a.carrying();
+        if !explorer {
+            return;
+        }
+        let near = self.world.corpses_near(cell) as f64;
+        let p = (species.corpse_pickup_k / (species.corpse_pickup_k + near)).powi(2);
+        if self.rng.chance(p) && self.world.take_corpse(cell) {
+            self.ants[i].corpse = true;
+            self.stats.corpses_moved += 1;
+        }
+    }
+
+    /// Put a carried corpse down here (an ant does not bring one home).
+    fn drop_corpse_here(&mut self, i: usize) {
+        if self.ants[i].corpse {
+            let cell = self.ants[i].cell();
+            self.world.add_corpse(cell);
+            self.ants[i].corpse = false;
+        }
+    }
+
     /// Cutting a piece of prey takes a handling time; then the piece is
     /// carried home like a crop load.
     fn cut_prey(&mut self, i: usize) {
@@ -1471,6 +1544,7 @@ impl Simulation {
     }
 
     fn give_up(&mut self, i: usize) {
+        self.drop_corpse_here(i);
         let uses_no_entry = self.species.uses_no_entry;
         let a = &mut self.ants[i];
         a.failed_trips += 1;
@@ -1488,6 +1562,7 @@ impl Simulation {
     }
 
     fn arrive(&mut self, i: usize) {
+        self.drop_corpse_here(i);
         let satiation = self.nest.satiation();
         let unloading = self.seconds_to_ticks(self.species.unloading_time(satiation));
         let nest = self.world.nest();
@@ -1547,7 +1622,7 @@ impl Simulation {
                 .map(|c| c.crowding(true))
                 .unwrap_or(0.0);
             let mut speed = a.traits.speed * self.speed_factor;
-            if a.carrying() {
+            if a.carrying() || a.corpse {
                 speed *= self.species.loaded_speed_factor;
             }
             if trail > k {
@@ -1703,6 +1778,7 @@ impl Simulation {
                 }
                 _ => {}
             }
+            self.handle_corpses(i, to_cell);
         }
     }
 
@@ -1723,10 +1799,12 @@ impl Simulation {
         match (activity, target) {
             (Activity::Outbound, _) | (Activity::Searching, SearchTarget::Food) => {
                 if solution_here && !self.ants[i].carrying() {
+                    self.drop_corpse_here(i);
                     self.start_feeding(i, molarity);
                     return true;
                 }
                 if prey_here && !self.ants[i].carrying() {
+                    self.drop_corpse_here(i);
                     self.start_cutting(i);
                     return true;
                 }
@@ -1877,6 +1955,14 @@ impl Simulation {
         let outside = !self.ants[i].is_inside();
         let cell = self.ants[i].cell();
         self.ants[i].alive = false;
+        if self.ants[i].corpse {
+            self.ants[i].corpse = false;
+            if outside {
+                self.world.add_corpse(cell);
+            } else {
+                self.nest.corpses += 1;
+            }
+        }
         if outside {
             if let Some(c) = self.world.cell_mut(cell) {
                 c.occupancy = c.occupancy.saturating_sub(1);
@@ -1885,7 +1971,11 @@ impl Simulation {
             if cause == Cause::Predation {
                 self.world
                     .deposit(cell, Pheromone::Alarm, self.species.alarm_release);
+            } else {
+                self.world.add_corpse(cell);
             }
+        } else {
+            self.nest.corpses += 1;
         }
         self.alive = self.alive.saturating_sub(1);
         self.stats.deaths += 1;
@@ -2433,6 +2523,34 @@ mod tests {
         assert_eq!(starved.stats().prey_picked, 0);
         assert_eq!(starved.nest().count(BroodStage::Pupa), 0);
         assert!(starved.stats().food_delivered > 0);
+    }
+
+    #[test]
+    fn undertakers_carry_the_dead_out_of_the_nest() {
+        let mut cfg = hungry_fast();
+        cfg.nest.initial_brood_per_ant = 0.0;
+        cfg.nest.mortality = false;
+        cfg.world.random_food = None;
+        let mut sim = Simulation::new(cfg, 5);
+        sim.nest_mut().corpses = 5;
+        sim.run(900);
+        assert!(sim.stats().corpses_moved >= 5, "{:?}", sim.stats());
+        assert_eq!(sim.nest().corpses, 0, "every corpse was taken out");
+        let carried = sim.living().filter(|a| a.corpse).count() as u32;
+        assert_eq!(sim.world().total_corpses() + carried, 5);
+        // Refuse lies away from the nest.
+        let nest = Point::center_of(sim.world().nest());
+        for (i, c) in sim.world().cells().iter().enumerate() {
+            if c.corpses > 0 {
+                let w = sim.world().width() as i32;
+                let p = Position::new(i as i32 % w, i as i32 / w);
+                let d = nest.distance(Point::center_of(p)) * sim.world().cell_cm();
+                assert!(
+                    d >= sim.species().refuse_distance_cm - 2.0,
+                    "corpse at {p:?}, {d} cm"
+                );
+            }
+        }
     }
 
     #[test]

@@ -210,6 +210,8 @@ pub struct Ant {
     /// Whether the ant will take prey this trip (decided on leaving the
     /// nest from the colony's protein demand).
     pub accepts_prey: bool,
+    /// Whether the ant is carrying a dead nestmate.
+    pub corpse: bool,
     /// Seconds of reserve before starvation.
     pub energy: f64,
     /// Ticks lived.
@@ -284,6 +286,7 @@ impl Ant {
             load_kind: Nutrient::Sugar,
             item_mg: 0.0,
             accepts_prey: false,
+            corpse: false,
             energy,
             age: 0,
             alive: true,

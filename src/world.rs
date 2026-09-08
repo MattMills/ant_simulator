@@ -68,6 +68,8 @@ pub struct Cell {
     pub renewal_ul_per_s: f64,
     /// Mass of protein prey lying here (a dead insect), milligrams.
     pub prey_mg: f64,
+    /// Dead nestmates lying here.
+    pub corpses: u16,
     /// Concentration of every pheromone channel, indexed by
     /// [`Pheromone::index`].
     pub pheromone: [f64; Pheromone::COUNT],
@@ -266,6 +268,9 @@ pub struct WorldConfig {
     pub cell_capacity: u16,
     /// Regions with their own capacity.
     pub capacity_zones: Vec<CapacityZone>,
+    /// Corpses scattered at random over open cells when the world is built
+    /// (the arenas of the cemetery-formation experiments).
+    pub scattered_corpses: usize,
     /// Pheromone kinetics; `None` takes them from the species.
     pub pheromones: Option<PheromoneSet>,
     /// Seed for random food placement. `None` uses the simulation's generator,
@@ -298,6 +303,7 @@ impl Default for WorldConfig {
             counters: Vec::new(),
             cell_capacity: 8,
             capacity_zones: Vec::new(),
+            scattered_corpses: 0,
             pheromones: None,
             seed: None,
         }
@@ -386,7 +392,38 @@ impl World {
             };
             world.place_random_food(&random, r);
         }
+        if world.config.scattered_corpses > 0 {
+            let mut local;
+            let r: &mut Rng = match world.config.seed {
+                Some(seed) => {
+                    local = Rng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15);
+                    &mut local
+                }
+                None => rng,
+            };
+            world.scatter_corpses(world.config.scattered_corpses, r);
+        }
         world
+    }
+
+    fn scatter_corpses(&mut self, count: usize, rng: &mut Rng) {
+        let w = self.config.width as i32;
+        let h = self.config.height as i32;
+        let mut placed = 0;
+        for _attempt in 0..count * 50 {
+            if placed >= count {
+                break;
+            }
+            let p = Position::new(rng.below(w as usize) as i32, rng.below(h as usize) as i32);
+            if self
+                .cell(p)
+                .map(|c| c.terrain == Terrain::Open)
+                .unwrap_or(false)
+            {
+                self.add_corpse(p);
+                placed += 1;
+            }
+        }
     }
 
     fn lay_terrain(&mut self) {
@@ -894,6 +931,78 @@ impl World {
         total
     }
 
+    /// Lay a corpse down on cell `p`.
+    pub fn add_corpse(&mut self, p: Position) {
+        if let Some(c) = self.cell_mut(p) {
+            c.corpses = c.corpses.saturating_add(1);
+        }
+    }
+
+    /// Pick a corpse up from cell `p`; false if there was none.
+    pub fn take_corpse(&mut self, p: Position) -> bool {
+        match self.cell_mut(p) {
+            Some(c) if c.corpses > 0 => {
+                c.corpses -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Corpses on cell `p` and its eight neighbours.
+    pub fn corpses_near(&self, p: Position) -> u32 {
+        let mut n = 0u32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                n += self
+                    .cell(p.offset(dx, dy))
+                    .map(|c| c.corpses as u32)
+                    .unwrap_or(0);
+            }
+        }
+        n
+    }
+
+    /// Total corpses lying on the grid.
+    pub fn total_corpses(&self) -> u32 {
+        self.cells.iter().map(|c| c.corpses as u32).sum()
+    }
+
+    /// Sizes (in corpses) of the piles on the grid: eight-connected groups
+    /// of cells holding at least one corpse, largest first.
+    pub fn corpse_clusters(&self) -> Vec<u32> {
+        let w = self.config.width;
+        let h = self.config.height;
+        let mut seen = vec![false; w * h];
+        let mut sizes = Vec::new();
+        for start in 0..w * h {
+            if seen[start] || self.cells[start].corpses == 0 {
+                continue;
+            }
+            let mut size = 0u32;
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(i) = stack.pop() {
+                size += self.cells[i].corpses as u32;
+                let (x, y) = ((i % w) as i32, (i / w) as i32);
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let p = Position::new(x + dx, y + dy);
+                        if let Some(j) = self.index(p) {
+                            if !seen[j] && self.cells[j].corpses > 0 {
+                                seen[j] = true;
+                                stack.push(j);
+                            }
+                        }
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        sizes
+    }
+
     /// Total prey over the grid, milligrams.
     pub fn total_prey(&self) -> f64 {
         self.cells.iter().map(|c| c.prey_mg).sum()
@@ -1195,6 +1304,40 @@ mod tests {
             0.0,
             "a solution cell has no prey"
         );
+    }
+
+    #[test]
+    fn corpses_pile_and_cluster() {
+        let mut world = World::new(small_config(), &mut Rng::seed_from_u64(1));
+        let a = Position::new(2, 7);
+        let b = Position::new(3, 8);
+        let far = Position::new(7, 1);
+        world.add_corpse(a);
+        world.add_corpse(a);
+        world.add_corpse(b);
+        world.add_corpse(far);
+        assert_eq!(world.total_corpses(), 4);
+        assert_eq!(world.corpses_near(a), 3, "a diagonal neighbour counts");
+        assert_eq!(world.corpses_near(far), 1);
+        assert_eq!(world.corpse_clusters(), vec![3, 1]);
+        assert!(world.take_corpse(far));
+        assert!(!world.take_corpse(far));
+        assert_eq!(world.corpse_clusters(), vec![3]);
+        // Scattering at construction is reproducible from the config seed.
+        let cfg = WorldConfig {
+            scattered_corpses: 20,
+            seed: Some(3),
+            ..small_config()
+        };
+        let w1 = World::new(cfg.clone(), &mut Rng::seed_from_u64(9));
+        let w2 = World::new(cfg, &mut Rng::seed_from_u64(10));
+        assert_eq!(w1.total_corpses(), 20);
+        assert!(w1
+            .cells()
+            .iter()
+            .all(|c| c.corpses == 0 || c.terrain == Terrain::Open));
+        let lay = |w: &World| w.cells().iter().map(|c| c.corpses).collect::<Vec<_>>();
+        assert_eq!(lay(&w1), lay(&w2));
     }
 
     #[test]

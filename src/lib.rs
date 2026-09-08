@@ -147,6 +147,7 @@ pub mod prelude {
         RewardSpec, Selection, SimConfig, Simulation, Snapshot, Stats, SurfaceRow, Trace,
     };
     pub use crate::entropy::{EntropyControl, Tempering};
+    pub use crate::experiments::{cemetery_arena, run_cemetery, CemeteryOutcome};
     pub use crate::experiments::{
         crowded_bridge, double_bridge, dripping_source, experiment_config, pure_pheromone_feedback,
         run_crowded_bridge, run_division_of_labor, run_double_bridge, run_double_bridge_configured,

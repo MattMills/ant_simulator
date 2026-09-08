@@ -163,6 +163,21 @@ fn main() {
         );
     }
 
+    println!("\n== cemetery formation: 300 corpses in an 80 cm arena (Theraulaz et al. 2002) ==");
+    for &seed in seeds.iter().take(3) {
+        let o = run_cemetery(
+            Species::lasius_niger(),
+            60,
+            300,
+            seconds.max(40.0 * 60.0),
+            seed,
+        );
+        println!(
+            "   seed {seed}: piles {} → {}, largest pile {} → {} corpses, {} pick-ups",
+            o.clusters_start, o.clusters_end, o.largest_start, o.largest_end, o.corpses_moved
+        );
+    }
+
     println!("\n== division of labour with and without threshold reinforcement (Theraulaz et al. 1998) ==");
     let o = run_division_of_labor(&Species::lasius_niger(), 60, seconds, 1);
     println!(

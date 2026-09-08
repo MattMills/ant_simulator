@@ -201,6 +201,23 @@ pub struct Species {
     pub protein_acceptance_base: f64,
     /// Foraging stimulus per unit of the colony's protein demand.
     pub protein_demand_gain: f64,
+
+    // ---- necrophoresis ----
+    /// Corpses near a carrier at which dropping is one quarter likely per
+    /// cell entered: `p = (n / (k + n))²` (Deneubourg et al. 1991; Theraulaz
+    /// et al. 2002, *PNAS* 99:9645: dropping grows with the pile, picking
+    /// up shrinks with it, and cemeteries emerge).
+    pub corpse_drop_k: f64,
+    /// Corpses near a corpse at which picking it up is one quarter likely
+    /// per encounter: `p = (k / (k + n))²`.
+    pub corpse_pickup_k: f64,
+    /// Chance per cell entered of dropping a corpse away from any pile.
+    pub corpse_base_drop: f64,
+    /// Distance from the nest beyond which an undertaker will drop its
+    /// load, cm (refuse piles lie away from the nest).
+    pub refuse_distance_cm: f64,
+    /// Stimulus per corpse inside the nest for a worker to carry one out.
+    pub undertaking_gain: f64,
     /// Extra unloading time per unit of colony satiation, as a factor.
     pub unloading_satiation_factor: f64,
 
@@ -390,6 +407,11 @@ impl Species {
             crop_capacity_ul: 0.5,
             intake_max_ul_s: 0.015,
             intake_half_molarity: 0.7,
+            corpse_drop_k: 4.0,
+            corpse_pickup_k: 2.0,
+            corpse_base_drop: 0.002,
+            refuse_distance_cm: 10.0,
+            undertaking_gain: 0.5,
             prey_load_mg: 1.0,
             prey_handling_s: 60.0,
             protein_acceptance_base: 0.1,

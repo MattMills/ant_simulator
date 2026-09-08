@@ -10,7 +10,8 @@ use std::fmt::Write as _;
 
 /// Render the world as ASCII art, one character per cell.
 ///
-/// * `#` wall, `N` nest, `F` sugar solution, `P` prey, `x` an alarm cloud,
+/// * `#` wall, `N` nest, `F` sugar solution, `P` prey, `+` a corpse or
+///   two, `%` a pile of them, `x` an alarm cloud,
 /// * `o` an outbound ant, `<` an inbound ant carrying food, `-` an inbound
 ///   ant returning empty, `?` a searching ant, `f` an ant feeding,
 /// * `@`, `:` and `.` strong, medium and faint recruitment trail,
