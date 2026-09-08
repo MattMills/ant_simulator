@@ -35,12 +35,13 @@ pub fn render(sim: &Simulation) -> String {
                 Terrain::Nest if cell.corpses > 0 => '+',
                 Terrain::Nest => 'N',
                 Terrain::Open => {
-                    let trail = cell.level(Pheromone::Trail);
+                    let p = Position::new(x as i32, y as i32);
+                    let trail = world.level(p, Pheromone::Trail);
                     if cell.has_solution() {
                         'F'
                     } else if cell.has_prey() {
                         'P'
-                    } else if cell.level(Pheromone::Alarm) > 1.0 {
+                    } else if world.level(p, Pheromone::Alarm) > 1.0 {
                         'x'
                     } else if trail > 4.0 * k {
                         '@'
@@ -48,9 +49,9 @@ pub fn render(sim: &Simulation) -> String {
                         ':'
                     } else if trail > 0.1 * k {
                         '.'
-                    } else if cell.level(Pheromone::NoEntry) > 0.5 {
+                    } else if world.level(p, Pheromone::NoEntry) > 0.5 {
                         '!'
-                    } else if cell.level(Pheromone::Territory) > 0.5 {
+                    } else if world.level(p, Pheromone::Territory) > 0.5 {
                         ','
                     } else {
                         ' '

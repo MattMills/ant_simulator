@@ -74,7 +74,21 @@
 //!   ground and learned against. Transits through plain, invariant nodes
 //!   are memoized in kernels keyed by how an ant entered, and mature
 //!   kernels stand in for the simulation, as memoized neighbourhoods do
-//!   in a cellular automaton, so that colonies of thousands run.
+//!   in a cellular automaton, so that colonies of thousands run. The
+//!   kernels are kept at several levels at once, and a coarser node
+//!   stands in for a finer one's worth of transits where its transition
+//!   is coherent.
+//!
+//! * **Multiscale kinetics, the lens and the decision pipeline**
+//!   ([`world`], [`lens`], [`pipeline`]): the chemical field is kept at
+//!   cell resolution where it has structure and as one mean per node of
+//!   the quadtree where it is faint, with conservative fluxes between
+//!   the two grains; the lens tessellates the tree between two points
+//!   so that the resolution follows the distance to the nearer of them,
+//!   the same from either end, and carries the geodesic round the walls;
+//!   and the pipeline holds an ant's decision for a horizon on invariant,
+//!   straight ground and schedules the rest against a frame budget,
+//!   earliest deadline first in the hierarchy's order.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
@@ -162,8 +176,10 @@ pub mod hierarchy;
 pub mod hive;
 pub mod landscape;
 pub mod learner;
+pub mod lens;
 pub mod memo;
 pub mod pheromone;
+pub mod pipeline;
 pub mod quad;
 pub mod render;
 pub mod rng;
@@ -223,11 +239,13 @@ pub mod prelude {
         Arm, CrossEntropy, DialBandit, EntropyBandit, HillClimber, Learner, LeverView, Mutation,
         Outcome, PeriodDetector, PhaseAware, PolicyGradient, RandomLearner, StaticLearner,
     };
+    pub use crate::lens::{geodesic, Geodesic, Ground, Leaf, Lens};
     pub use crate::memo::{
         Classification, Kernel, Layer, Leg, Memo, MemoConfig, Signature, Stop, TransitConfig,
         TransitKey, TransitOutcome, Transits,
     };
     pub use crate::pheromone::{perceived, Pheromone, PheromoneParams, PheromoneSet};
+    pub use crate::pipeline::{horizon, FrameStats, PipelineConfig};
     pub use crate::quad::{QuadKey, QuadTree};
     pub use crate::render::{render, render_surface};
     pub use crate::rng::Rng;

@@ -8,9 +8,23 @@
 //! (scaled by temperature through [`World::set_evaporation_factor`]) and
 //! diffuse conservatively to orthogonal neighbours each tick. Food is a
 //! volume of sugar solution of a given molarity.
+//!
+//! The field is kept at two grains. The grid is tiled by the nodes of
+//! its quadtree at one level (`kinetics_grain` cells across), and for
+//! every channel a node is either *active*, its cells carrying the
+//! field, or *coarse*, one mean concentration standing for all of them.
+//! Mass moves between cells, between a cell and a coarse node, and
+//! between coarse nodes by the same conservative shares, so the field is
+//! exact where it has structure (on and around the trails, where marks
+//! land) and cheap where it is faint and flat. A deposit or an inflow
+//! that lifts a coarse node above a threshold refines it into cells
+//! (coarse to fine); a node whose cells have all faded below half of it
+//! is composed into its mean (fine to coarse). [`World::field_tree`]
+//! reads the mass at every level above the grain.
 
 use crate::geometry::{Direction, Point, Position};
 use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
+use crate::quad::{QuadKey, QuadTree};
 use crate::rng::Rng;
 use crate::species::Species;
 
@@ -274,6 +288,20 @@ pub struct WorldConfig {
     /// indistinguishable for half-lives of minutes and cheaper by as
     /// much on large grids.
     pub kinetics_stride: u32,
+    /// Side, in cells, of the nodes at which the chemical field is kept
+    /// coarse where it is faint: the grid is tiled by square nodes of
+    /// this many cells (rounded up to a power of two, the nodes of the
+    /// world's quadtree at one level), and for every channel a node is
+    /// either active, its cells carrying the field, or coarse, one mean
+    /// concentration standing for all of them. Zero keeps every cell
+    /// active.
+    pub kinetics_grain: usize,
+    /// Concentration, as a fraction of a channel's sensitivity constant
+    /// `k`, below which a node of that channel may be coarse: a node
+    /// whose cells are all below half of it is composed into its mean,
+    /// and a coarse node whose mean reaches it is refined into cells
+    /// again.
+    pub coarse_below: f64,
     /// Corpses scattered at random over open cells when the world is built
     /// (the arenas of the cemetery-formation experiments).
     pub scattered_corpses: usize,
@@ -315,6 +343,8 @@ impl Default for WorldConfig {
             counters: Vec::new(),
             cell_capacity: 8,
             kinetics_stride: 1,
+            kinetics_grain: 8,
+            coarse_below: 0.01,
             capacity_zones: Vec::new(),
             scattered_corpses: 0,
             landmarks: Vec::new(),
@@ -334,12 +364,180 @@ pub struct CounterState {
     pub crossings: u64,
 }
 
+/// How often, in sweeps of the kinetics, active nodes are checked for
+/// coarsening.
+const COARSEN_EVERY: u32 = 16;
+
+/// The chemical field's two grains: the grid tiled by square nodes, and
+/// for every channel each node either active (its cells carry the
+/// field) or coarse (one mean stands for all of them).
+#[derive(Clone, Debug)]
+struct Grain {
+    /// Log2 of the node side.
+    shift: u32,
+    cols: usize,
+    rows: usize,
+    width: usize,
+    height: usize,
+    /// Open cells per node.
+    open: Vec<u32>,
+    /// Nodes with a wall in them, which are always active.
+    walled: Vec<bool>,
+    /// Per node and channel, whether the node is active.
+    active: Vec<[bool; Pheromone::COUNT]>,
+    /// Per node and channel, the mean concentration of a coarse node.
+    mean: Vec<[f64; Pheromone::COUNT]>,
+    /// Sweep scratch: the mass flowing into a coarse node, its own mass
+    /// after evaporation and outflow, and whether the front of the field
+    /// has reached it (an active cell at its door above the threshold).
+    inflow: Vec<f64>,
+    pool: Vec<f64>,
+    touched: Vec<bool>,
+    /// Per channel, the concentration below which a node may be coarse.
+    threshold: [f64; Pheromone::COUNT],
+    since_coarsen: u32,
+    /// Corpses per node, for counts over regions.
+    corpses: Vec<u32>,
+}
+
+impl Grain {
+    fn build(config: &WorldConfig, cells: &[Cell], params: &PheromoneSet) -> Option<Grain> {
+        if config.kinetics_grain == 0 {
+            return None;
+        }
+        let root = config.width.max(config.height).max(1);
+        let mut shift = 0u32;
+        while (1usize << shift) < config.kinetics_grain && (1usize << shift) < root {
+            shift += 1;
+        }
+        let side = 1usize << shift;
+        let cols = config.width.div_ceil(side);
+        let rows = config.height.div_ceil(side);
+        let n = cols * rows;
+        let mut g = Grain {
+            shift,
+            cols,
+            rows,
+            width: config.width,
+            height: config.height,
+            open: vec![0; n],
+            walled: vec![false; n],
+            active: vec![[false; Pheromone::COUNT]; n],
+            mean: vec![[0.0; Pheromone::COUNT]; n],
+            inflow: vec![0.0; n],
+            pool: vec![0.0; n],
+            touched: vec![false; n],
+            threshold: [0.0; Pheromone::COUNT],
+            since_coarsen: 0,
+            corpses: vec![0; n],
+        };
+        for (k, p) in params.iter().enumerate() {
+            g.threshold[k] = config.coarse_below.max(0.0) * p.k.max(1e-9);
+        }
+        for node in 0..n {
+            let (x0, y0, x1, y1) = g.rect(node);
+            let mut open = 0;
+            let mut walled = false;
+            let mut corpses = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let c = &cells[y * config.width + x];
+                    if c.terrain == Terrain::Wall {
+                        walled = true;
+                    } else {
+                        open += 1;
+                    }
+                    corpses += c.corpses as u32;
+                }
+            }
+            g.open[node] = open;
+            g.walled[node] = walled;
+            g.corpses[node] = corpses;
+            if walled {
+                g.active[node] = [true; Pheromone::COUNT];
+            }
+        }
+        Some(g)
+    }
+
+    #[inline]
+    fn node_of(&self, x: usize, y: usize) -> usize {
+        (y >> self.shift) * self.cols + (x >> self.shift)
+    }
+
+    /// The cells of a node, `(x0, y0, x1, y1)` with exclusive far
+    /// corners, clipped to the grid.
+    fn rect(&self, node: usize) -> (usize, usize, usize, usize) {
+        let side = 1usize << self.shift;
+        let x0 = (node % self.cols) * side;
+        let y0 = (node / self.cols) * side;
+        (
+            x0,
+            y0,
+            (x0 + side).min(self.width),
+            (y0 + side).min(self.height),
+        )
+    }
+
+    /// The node across a side (0 north, 1 east, 2 south, 3 west).
+    fn neighbour(&self, node: usize, side: u8) -> Option<usize> {
+        let col = node % self.cols;
+        let row = node / self.cols;
+        match side {
+            0 => (row > 0).then(|| node - self.cols),
+            1 => (col + 1 < self.cols).then_some(node + 1),
+            2 => (row + 1 < self.rows).then(|| node + self.cols),
+            _ => (col > 0).then(|| node - 1),
+        }
+    }
+
+    /// Coarse to fine: the node's cells take its mean and carry the
+    /// field from now on.
+    fn refine(&mut self, k: usize, node: usize, cells: &mut [Cell], width: usize) {
+        if self.active[node][k] {
+            return;
+        }
+        let m = self.mean[node][k];
+        let (x0, y0, x1, y1) = self.rect(node);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = &mut cells[y * width + x];
+                if c.terrain != Terrain::Wall {
+                    c.pheromone[k] = m;
+                }
+            }
+        }
+        self.active[node][k] = true;
+        self.mean[node][k] = 0.0;
+    }
+
+    /// Fine to coarse: the node's cells are composed into one mean.
+    fn coarsen(&mut self, k: usize, node: usize, cells: &mut [Cell], width: usize) {
+        let (x0, y0, x1, y1) = self.rect(node);
+        let mut sum = 0.0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = &mut cells[y * width + x];
+                sum += c.pheromone[k];
+                c.pheromone[k] = 0.0;
+            }
+        }
+        let open = self.open[node] as f64;
+        self.mean[node][k] = if open > 0.0 { sum / open } else { 0.0 };
+        self.active[node][k] = false;
+    }
+}
+
 /// The simulated environment.
 #[derive(Clone, Debug)]
 pub struct World {
     config: WorldConfig,
     cells: Vec<Cell>,
     scratch: Vec<[f64; Pheromone::COUNT]>,
+    /// The field's two grains, when the kinetics grain is set.
+    grain: Option<Grain>,
+    /// Wall cells per node of the world's quadtree, when there are any.
+    wall_tree: Option<QuadTree<u32>>,
     /// Whether any cell carries the channel (empty channels are skipped
     /// by the kinetics and by perception).
     present: [bool; Pheromone::COUNT],
@@ -394,6 +592,8 @@ impl World {
         let mut world = World {
             cells: vec![Cell::default(); n],
             scratch: vec![[0.0; Pheromone::COUNT]; n],
+            grain: None,
+            wall_tree: None,
             present: [false; Pheromone::COUNT],
             has_walls: false,
             kinetics_calls: 0,
@@ -409,6 +609,20 @@ impl World {
         };
         world.lay_terrain();
         world.has_walls = world.cells.iter().any(|c| c.terrain == Terrain::Wall);
+        if world.has_walls {
+            let mut tree = QuadTree::<u32>::new(world.config.width, world.config.height);
+            let w = world.config.width;
+            for (idx, c) in world.cells.iter().enumerate() {
+                if c.terrain == Terrain::Wall {
+                    let p = Position::new((idx % w) as i32, (idx / w) as i32);
+                    if let Some(key) = tree.leaf(p) {
+                        *tree.get_mut(key) = 1;
+                    }
+                }
+            }
+            tree.compose(|a, b| *a += *b);
+            world.wall_tree = Some(tree);
+        }
         let sources = world.config.food_sources.clone();
         for src in &sources {
             world.place_food(src);
@@ -462,6 +676,7 @@ impl World {
                 }
             }
         }
+        world.grain = Grain::build(&world.config, &world.cells, &world.params);
         world
     }
 
@@ -598,7 +813,9 @@ impl World {
         let cap = self.params[Pheromone::Odour.index()].cap;
         let active = self.retention[Pheromone::Odour.index()] > 0.0;
         let mut emitted = false;
-        for &i in &self.food_cells {
+        let width = self.config.width;
+        let food_cells = std::mem::take(&mut self.food_cells);
+        for &i in &food_cells {
             let c = &mut self.cells[i];
             if c.renewal_ul_per_s > 0.0 && c.food_ul < c.food_capacity_ul {
                 c.food_ul = (c.food_ul + c.renewal_ul_per_s * tick_s).min(c.food_capacity_ul);
@@ -607,12 +824,15 @@ impl World {
                 let emission =
                     odour_per_ul_s * c.food_ul.min(5.0) + odour_per_mg_s * c.prey_mg.min(30.0);
                 if emission > 0.0 {
-                    let slot = &mut c.pheromone[Pheromone::Odour.index()];
+                    let p = Position::new((i % width) as i32, (i / width) as i32);
+                    self.refine_at(Pheromone::Odour.index(), p);
+                    let slot = &mut self.cells[i].pheromone[Pheromone::Odour.index()];
                     *slot = (*slot + emission * tick_s).min(cap);
                     emitted = true;
                 }
             }
         }
+        self.food_cells = food_cells;
         if emitted {
             self.present[Pheromone::Odour.index()] = true;
         }
@@ -850,9 +1070,36 @@ impl World {
         out
     }
 
+    /// The field of a channel at a cell: the cell's own value in an
+    /// active node, the node's mean in a coarse one.
+    #[inline]
+    fn read(&self, idx: usize, p: Position, k: usize) -> f64 {
+        if let Some(g) = &self.grain {
+            let node = g.node_of(p.x as usize, p.y as usize);
+            if !g.active[node][k] {
+                return g.mean[node][k];
+            }
+        }
+        self.cells[idx].pheromone[k]
+    }
+
+    /// Refine the node holding a cell for a channel, if it is coarse.
+    fn refine_at(&mut self, k: usize, p: Position) {
+        let width = self.config.width;
+        if let Some(g) = self.grain.as_mut() {
+            let node = g.node_of(p.x as usize, p.y as usize);
+            if !g.active[node][k] {
+                g.refine(k, node, &mut self.cells, width);
+            }
+        }
+    }
+
     /// Concentration of a channel at a cell (0 outside the grid).
     pub fn level(&self, p: Position, kind: Pheromone) -> f64 {
-        self.cell(p).map(|c| c.level(kind)).unwrap_or(0.0)
+        match self.index(p) {
+            Some(idx) => self.read(idx, p, kind.index()),
+            None => 0.0,
+        }
     }
 
     /// Concentration of a channel on the substrate patch (cell) under a
@@ -862,10 +1109,13 @@ impl World {
     /// trails distinct instead of blending them with the heavily marked
     /// junction (see [`World::sample`] for the smooth field).
     pub fn level_at(&self, p: Point, kind: Pheromone) -> f64 {
-        self.cell(p.cell())
-            .filter(|c| c.terrain != Terrain::Wall)
-            .map(|c| c.level(kind))
-            .unwrap_or(0.0)
+        let cell = p.cell();
+        match self.index(cell) {
+            Some(idx) if self.cells[idx].terrain != Terrain::Wall => {
+                self.read(idx, cell, kind.index())
+            }
+            _ => 0.0,
+        }
     }
 
     /// Concentration of a channel at a continuous point, bilinearly
@@ -889,9 +1139,9 @@ impl World {
                 continue;
             }
             let cell = Position::new(x0 as i32 + dx, y0 as i32 + dy);
-            if let Some(c) = self.cell(cell) {
-                if c.terrain != Terrain::Wall {
-                    total += w * c.level(kind);
+            if let Some(idx) = self.index(cell) {
+                if self.cells[idx].terrain != Terrain::Wall {
+                    total += w * self.read(idx, cell, kind.index());
                 }
             }
         }
@@ -901,15 +1151,18 @@ impl World {
     /// Add pheromone of one channel to a cell (clamped to the channel's cap;
     /// inert channels take nothing).
     pub fn deposit(&mut self, p: Position, kind: Pheromone, amount: f64) {
-        let cap = self.params[kind.index()].cap;
+        let k = kind.index();
+        let cap = self.params[k].cap;
         if amount <= 0.0 || cap <= 0.0 {
             return;
         }
-        if let Some(c) = self.cell_mut(p) {
-            let v = &mut c.pheromone[kind.index()];
-            *v = (*v + amount).min(cap);
-            self.present[kind.index()] = true;
-        }
+        let Some(idx) = self.index(p) else {
+            return;
+        };
+        self.refine_at(k, p);
+        let v = &mut self.cells[idx].pheromone[k];
+        *v = (*v + amount).min(cap);
+        self.present[k] = true;
     }
 
     /// Take up to `volume_ul` of solution from a cell; returns the volume
@@ -1009,6 +1262,10 @@ impl World {
         if active.is_empty() {
             return;
         }
+        if self.grain.is_some() {
+            self.step_multiscale(&active, &retention, &diffusion);
+            return;
+        }
         for s in self.scratch.iter_mut() {
             for &k in &active {
                 s[k] = 0.0;
@@ -1072,6 +1329,338 @@ impl World {
         }
     }
 
+    /// The sweep at two grains: active nodes cell by cell, coarse nodes
+    /// as one pool each, with every share of mass leaving one place and
+    /// arriving in another.
+    fn step_multiscale(&mut self, channels: &[usize], retention: &[f64], diffusion: &[f64]) {
+        let Some(mut g) = self.grain.take() else {
+            return;
+        };
+        let w = self.config.width;
+        let h = self.config.height;
+        let nodes = g.cols * g.rows;
+        let mut present = [false; Pheromone::COUNT];
+        for &k in channels {
+            let r = retention[k];
+            let d = diffusion[k];
+            let cap = self.params[k].cap;
+            let threshold = g.threshold[k];
+            for node in 0..nodes {
+                g.inflow[node] = 0.0;
+                g.pool[node] = 0.0;
+                g.touched[node] = false;
+                if g.active[node][k] {
+                    let (x0, y0, x1, y1) = g.rect(node);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            self.scratch[y * w + x][k] = 0.0;
+                        }
+                    }
+                }
+            }
+            for node in 0..nodes {
+                let (x0, y0, x1, y1) = g.rect(node);
+                if g.active[node][k] {
+                    let walled = g.walled[node];
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let idx = y * w + x;
+                            if walled && self.cells[idx].terrain == Terrain::Wall {
+                                continue;
+                            }
+                            let value = self.cells[idx].pheromone[k];
+                            let amount = value * r;
+                            if amount <= 0.0 {
+                                continue;
+                            }
+                            if d > 0.0 {
+                                let share = amount * d / 4.0;
+                                // A cell inside an open node has its four
+                                // neighbours in the node, all open.
+                                if !walled && x > x0 && x + 1 < x1 && y > y0 && y + 1 < y1 {
+                                    self.scratch[idx - w][k] += share;
+                                    self.scratch[idx + 1][k] += share;
+                                    self.scratch[idx + w][k] += share;
+                                    self.scratch[idx - 1][k] += share;
+                                    self.scratch[idx][k] += amount - 4.0 * share;
+                                    continue;
+                                }
+                                // Conservative diffusion: shares that
+                                // would cross into a wall or off the grid
+                                // stay in the cell; a share crossing into
+                                // a coarse node joins its pool, and a cell
+                                // above the threshold at a coarse node's
+                                // door brings the front to it.
+                                let mut moved = 0.0;
+                                for (dx, dy) in [(0i64, -1i64), (1, 0), (0, 1), (-1, 0)] {
+                                    let nx = x as i64 + dx;
+                                    let ny = y as i64 + dy;
+                                    if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                                        continue;
+                                    }
+                                    let (nx, ny) = (nx as usize, ny as usize);
+                                    let nidx = ny * w + nx;
+                                    let nnode = g.node_of(nx, ny);
+                                    if g.active[nnode][k] {
+                                        if g.walled[nnode]
+                                            && self.cells[nidx].terrain == Terrain::Wall
+                                        {
+                                            continue;
+                                        }
+                                        self.scratch[nidx][k] += share;
+                                    } else {
+                                        g.inflow[nnode] += share;
+                                        if value >= threshold {
+                                            g.touched[nnode] = true;
+                                        }
+                                    }
+                                    moved += share;
+                                }
+                                self.scratch[idx][k] += amount - moved;
+                            } else {
+                                self.scratch[idx][k] += amount;
+                            }
+                        }
+                    }
+                } else {
+                    let mean = g.mean[node][k];
+                    if mean <= 0.0 {
+                        continue;
+                    }
+                    let mut pool = mean * g.open[node] as f64 * r;
+                    if d > 0.0 {
+                        // Each cell along a side sends its share across:
+                        // to the neighbouring cells of an active node,
+                        // to the pool of a coarse one.
+                        let per = mean * r * d / 4.0;
+                        for side in 0..4u8 {
+                            let Some(nb) = g.neighbour(node, side) else {
+                                continue;
+                            };
+                            if g.active[nb][k] {
+                                let (bx0, by0, bx1, by1) = g.rect(nb);
+                                let (ax0, ay0, ax1, ay1) = match side {
+                                    0 => (x0.max(bx0), by1 - 1, x1.min(bx1), by1),
+                                    1 => (bx0, y0.max(by0), bx0 + 1, y1.min(by1)),
+                                    2 => (x0.max(bx0), by0, x1.min(bx1), by0 + 1),
+                                    _ => (bx1 - 1, y0.max(by0), bx1, y1.min(by1)),
+                                };
+                                for y in ay0..ay1 {
+                                    for x in ax0..ax1 {
+                                        let nidx = y * w + x;
+                                        if self.cells[nidx].terrain == Terrain::Wall {
+                                            continue;
+                                        }
+                                        self.scratch[nidx][k] += per;
+                                        pool -= per;
+                                    }
+                                }
+                            } else {
+                                let pairs = match side {
+                                    0 | 2 => x1 - x0,
+                                    _ => y1 - y0,
+                                } as f64;
+                                g.inflow[nb] += per * pairs;
+                                pool -= per * pairs;
+                            }
+                        }
+                    }
+                    g.pool[node] = pool;
+                }
+            }
+            for node in 0..nodes {
+                if g.active[node][k] {
+                    let (x0, y0, x1, y1) = g.rect(node);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let idx = y * w + x;
+                            // No cut below a millionth here: a faint
+                            // node is composed into its mean instead.
+                            let value = self.scratch[idx][k].min(cap);
+                            self.cells[idx].pheromone[k] = value;
+                            if value > 0.0 {
+                                present[k] = true;
+                            }
+                        }
+                    }
+                } else {
+                    let open = g.open[node] as f64;
+                    let m = if open > 0.0 {
+                        (g.pool[node] + g.inflow[node]) / open
+                    } else {
+                        0.0
+                    };
+                    let m = m.min(cap);
+                    g.mean[node][k] = m;
+                    if m > 0.0 {
+                        present[k] = true;
+                    }
+                    if g.touched[node] || m >= threshold {
+                        g.refine(k, node, &mut self.cells, w);
+                    }
+                }
+            }
+        }
+        g.since_coarsen += 1;
+        if g.since_coarsen >= COARSEN_EVERY {
+            g.since_coarsen = 0;
+            for &k in channels {
+                let limit = 0.5 * g.threshold[k];
+                for node in 0..nodes {
+                    if !g.active[node][k] || g.walled[node] {
+                        continue;
+                    }
+                    let (x0, y0, x1, y1) = g.rect(node);
+                    let mut flat = true;
+                    'scan: for y in y0..y1 {
+                        for x in x0..x1 {
+                            if self.cells[y * w + x].pheromone[k] >= limit {
+                                flat = false;
+                                break 'scan;
+                            }
+                        }
+                    }
+                    if flat {
+                        g.coarsen(k, node, &mut self.cells, w);
+                    }
+                }
+            }
+        }
+        for &k in channels {
+            self.present[k] = present[k];
+        }
+        self.grain = Some(g);
+    }
+
+    /// What a node of the world's quadtree is made of, for the lens:
+    /// open ground crossed at unit cost, walled through, or both.
+    pub fn ground(&self, key: QuadKey, rect: (usize, usize, usize, usize)) -> crate::lens::Ground {
+        let Some(tree) = &self.wall_tree else {
+            return crate::lens::Ground::Open(1.0);
+        };
+        let (x0, y0, x1, y1) = rect;
+        let area = (x1.saturating_sub(x0)) * (y1.saturating_sub(y0));
+        let walls = *tree.get(key) as usize;
+        if walls == 0 {
+            crate::lens::Ground::Open(1.0)
+        } else if walls >= area {
+            crate::lens::Ground::Blocked
+        } else {
+            crate::lens::Ground::Mixed
+        }
+    }
+
+    /// Side of the kinetics grain's nodes, cells (0 when every cell is
+    /// always active).
+    pub fn kinetics_grain(&self) -> usize {
+        self.grain.as_ref().map(|g| 1usize << g.shift).unwrap_or(0)
+    }
+
+    /// The level of the world's quadtree whose nodes are the kinetics
+    /// grain's, if there is one.
+    pub fn grain_level(&self) -> Option<u8> {
+        let g = self.grain.as_ref()?;
+        let mut levels = 0u8;
+        while (1usize << levels) < self.config.width.max(self.config.height).max(1) {
+            levels += 1;
+        }
+        Some(levels - g.shift as u8)
+    }
+
+    /// Share of the grain's nodes at which a channel is at cell
+    /// resolution (1 when every cell is always active).
+    pub fn active_share(&self, kind: Pheromone) -> f64 {
+        match &self.grain {
+            None => 1.0,
+            Some(g) => {
+                let n = g.cols * g.rows;
+                g.active.iter().filter(|a| a[kind.index()]).count() as f64 / n.max(1) as f64
+            }
+        }
+    }
+
+    /// The mass of a channel on the world's quadtree, from the kinetics
+    /// grain (the cells, when every cell is active) up to the root: the
+    /// field read at every coarser grain.
+    pub fn field_tree(&self, kind: Pheromone) -> QuadTree<f64> {
+        let k = kind.index();
+        let w = self.config.width;
+        let mut tree = QuadTree::<f64>::new(w, self.config.height);
+        match &self.grain {
+            None => {
+                let levels = tree.levels();
+                for (idx, c) in self.cells.iter().enumerate() {
+                    if c.pheromone[k] > 0.0 {
+                        let p = Position::new((idx % w) as i32, (idx / w) as i32);
+                        if let Some(key) = tree.key_of(p, levels) {
+                            *tree.get_mut(key) = c.pheromone[k];
+                        }
+                    }
+                }
+                tree.compose(|a, b| *a += *b);
+            }
+            Some(g) => {
+                let level = tree.levels() - g.shift as u8;
+                for node in 0..g.cols * g.rows {
+                    let mass = if g.active[node][k] {
+                        let (x0, y0, x1, y1) = g.rect(node);
+                        let mut sum = 0.0;
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                sum += self.cells[y * w + x].pheromone[k];
+                            }
+                        }
+                        sum
+                    } else {
+                        g.mean[node][k] * g.open[node] as f64
+                    };
+                    let key = QuadKey::new(level, (node % g.cols) as u32, (node / g.cols) as u32);
+                    *tree.get_mut(key) = mass;
+                }
+                tree.compose_from(level, |a, b| *a += *b);
+            }
+        }
+        tree
+    }
+
+    /// Corpses lying in a rectangle of cells, `(x0, y0, x1, y1)` with
+    /// exclusive far corners (counted node by node where the rectangle
+    /// covers whole nodes of the grain).
+    pub fn corpses_in(&self, rect: (usize, usize, usize, usize)) -> u32 {
+        let (x0, y0, x1, y1) = rect;
+        let x1 = x1.min(self.config.width);
+        let y1 = y1.min(self.config.height);
+        if x0 >= x1 || y0 >= y1 {
+            return 0;
+        }
+        let w = self.config.width;
+        let scan = |ax0: usize, ay0: usize, ax1: usize, ay1: usize| -> u32 {
+            let mut n = 0;
+            for y in ay0..ay1 {
+                for x in ax0..ax1 {
+                    n += self.cells[y * w + x].corpses as u32;
+                }
+            }
+            n
+        };
+        let Some(g) = &self.grain else {
+            return scan(x0, y0, x1, y1);
+        };
+        let mut n = 0;
+        for row in (y0 >> g.shift)..=((y1 - 1) >> g.shift) {
+            for col in (x0 >> g.shift)..=((x1 - 1) >> g.shift) {
+                let node = row * g.cols + col;
+                let (nx0, ny0, nx1, ny1) = g.rect(node);
+                if nx0 >= x0 && ny0 >= y0 && nx1 <= x1 && ny1 <= y1 {
+                    n += g.corpses[node];
+                } else {
+                    n += scan(nx0.max(x0), ny0.max(y0), nx1.min(x1), ny1.min(y1));
+                }
+            }
+        }
+        n
+    }
+
     /// Total volume of food remaining on the ground, microlitres.
     pub fn total_food(&self) -> f64 {
         self.cells.iter().map(|c| c.food_ul).sum()
@@ -1093,16 +1682,24 @@ impl World {
 
     /// Lay a corpse down on cell `p`.
     pub fn add_corpse(&mut self, p: Position) {
-        if let Some(c) = self.cell_mut(p) {
-            c.corpses = c.corpses.saturating_add(1);
+        if let Some(idx) = self.index(p) {
+            self.cells[idx].corpses = self.cells[idx].corpses.saturating_add(1);
+            if let Some(g) = self.grain.as_mut() {
+                let node = g.node_of(p.x as usize, p.y as usize);
+                g.corpses[node] += 1;
+            }
         }
     }
 
     /// Pick a corpse up from cell `p`; false if there was none.
     pub fn take_corpse(&mut self, p: Position) -> bool {
-        match self.cell_mut(p) {
-            Some(c) if c.corpses > 0 => {
-                c.corpses -= 1;
+        match self.index(p) {
+            Some(idx) if self.cells[idx].corpses > 0 => {
+                self.cells[idx].corpses -= 1;
+                if let Some(g) = self.grain.as_mut() {
+                    let node = g.node_of(p.x as usize, p.y as usize);
+                    g.corpses[node] = g.corpses[node].saturating_sub(1);
+                }
                 true
             }
             _ => false,
@@ -1184,7 +1781,27 @@ impl World {
 
     /// Total amount of one channel over the grid.
     pub fn total_pheromone(&self, kind: Pheromone) -> f64 {
-        self.cells.iter().map(|c| c.level(kind)).sum()
+        let k = kind.index();
+        match &self.grain {
+            None => self.cells.iter().map(|c| c.pheromone[k]).sum(),
+            Some(g) => {
+                let w = self.config.width;
+                let mut total = 0.0;
+                for node in 0..g.cols * g.rows {
+                    if g.active[node][k] {
+                        let (x0, y0, x1, y1) = g.rect(node);
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                total += self.cells[y * w + x].pheromone[k];
+                            }
+                        }
+                    } else {
+                        total += g.mean[node][k] * g.open[node] as f64;
+                    }
+                }
+                total
+            }
+        }
     }
 
     /// Total of one channel inside a region.
@@ -1421,6 +2038,112 @@ mod tests {
         world.step_pheromones();
         assert_eq!(world.level(Position::new(9, 4), Pheromone::Trail), 0.0);
         assert!(world.level(Position::new(7, 4), Pheromone::Trail) > 0.0);
+    }
+
+    #[test]
+    fn the_grain_conserves_mass_and_coarsens_the_far_field() {
+        // An open field, no evaporation: whatever diffuses out of the
+        // active nodes is carried by the coarse ones, and nothing leaks.
+        let cfg = WorldConfig {
+            width: 64,
+            height: 64,
+            nest: Position::new(32, 32),
+            random_food: None,
+            kinetics_grain: 8,
+            pheromones: Some({
+                let mut set = Species::lasius_niger().pheromones();
+                set[Pheromone::Trail.index()].half_life_s = f64::INFINITY;
+                set[Pheromone::Trail.index()].diffusion_per_s = 0.2;
+                set
+            }),
+            ..WorldConfig::default()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        assert_eq!(world.kinetics_grain(), 8);
+        world.deposit(Position::new(20, 20), Pheromone::Trail, 40.0);
+        assert!(
+            world.active_share(Pheromone::Trail) < 0.1,
+            "one node refined"
+        );
+        for _ in 0..300 {
+            world.step_pheromones();
+        }
+        let total = world.total_pheromone(Pheromone::Trail);
+        assert!((total - 40.0).abs() < 1e-6, "mass conserved: {total}");
+        // The far field is carried as means, and reads as such.
+        let share = world.active_share(Pheromone::Trail);
+        assert!(share < 1.0, "the far field stays coarse: {share}");
+        assert!(world.level(Position::new(60, 60), Pheromone::Trail) > 0.0);
+        let tree = world.field_tree(Pheromone::Trail);
+        assert!((tree.get(QuadKey::ROOT) - 40.0).abs() < 1e-6);
+        let level = world.grain_level().unwrap();
+        let sum: f64 = tree.nodes(level).map(|(_, v)| *v).sum();
+        assert!((sum - 40.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_grain_matches_the_dense_sweep_where_the_field_has_structure() {
+        // A trail laid every tick across an evaporating field: the two
+        // grains agree on and around the trail, and on the total, and the
+        // coarse one keeps most nodes coarse.
+        let set = {
+            let mut set = Species::lasius_niger().pheromones();
+            set[Pheromone::Trail.index()].diffusion_per_s = 0.05;
+            set
+        };
+        let make = |grain: usize| {
+            World::new(
+                WorldConfig {
+                    width: 96,
+                    height: 64,
+                    nest: Position::new(48, 32),
+                    random_food: None,
+                    kinetics_grain: grain,
+                    pheromones: Some(set.clone()),
+                    ..WorldConfig::default()
+                },
+                &mut Rng::seed_from_u64(1),
+            )
+        };
+        let mut dense = make(0);
+        let mut coarse = make(8);
+        for tick in 0..1200 {
+            for x in 20..76 {
+                let y = 32 + ((x as f64 - 20.0) * 0.15).sin().round() as i32;
+                let amount = 0.5 + 0.5 * ((tick % 7) as f64 / 7.0);
+                dense.deposit(Position::new(x, y), Pheromone::Trail, amount);
+                coarse.deposit(Position::new(x, y), Pheromone::Trail, amount);
+            }
+            dense.step_pheromones();
+            coarse.step_pheromones();
+        }
+        let k = dense.channel(Pheromone::Trail).k;
+        let (td, tc) = (
+            dense.total_pheromone(Pheromone::Trail),
+            coarse.total_pheromone(Pheromone::Trail),
+        );
+        assert!((td - tc).abs() < 0.01 * td, "totals agree: {td} vs {tc}");
+        // On the trail and its halo the two agree; at the halo's edge
+        // (a twentieth of the perception constant, where the coarse
+        // nodes begin) the coarse mean stands in for the last of the
+        // dense front, within a few percent.
+        let (mut core, mut halo) = (0.0f64, 0.0f64);
+        for y in 0..64 {
+            for x in 0..96 {
+                let p = Position::new(x, y);
+                let a = dense.level(p, Pheromone::Trail);
+                let b = coarse.level(p, Pheromone::Trail);
+                if a >= k {
+                    core = core.max((a - b).abs() / a);
+                } else if a >= 0.05 * k {
+                    halo = halo.max((a - b).abs() / a);
+                }
+            }
+        }
+        assert!(core < 1e-3, "the trail agrees: {core}");
+        assert!(halo < 0.05, "the halo agrees within a few percent: {halo}");
+        let share = coarse.active_share(Pheromone::Trail);
+        assert!(share < 0.6, "most of the grid is coarse: {share}");
     }
 
     #[test]

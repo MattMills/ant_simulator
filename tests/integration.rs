@@ -230,7 +230,12 @@ fn smoothing_keeps_paths_coherent() {
     let c = smooth.path.ledger.contributions();
     assert!(c.smoothing > 0.05, "{c:?}");
     assert_eq!(c.field, 0.0);
-    assert!((smooth.path.turn_entropy() - flat.path.turn_entropy()).abs() < 0.25);
+    assert!(
+        (smooth.path.turn_entropy() - flat.path.turn_entropy()).abs() < 0.25,
+        "smooth {} vs flat {}",
+        smooth.path.turn_entropy(),
+        flat.path.turn_entropy()
+    );
     assert!(smooth.path.trip_efficiency() > 0.8);
 }
 
@@ -464,4 +469,55 @@ fn memoized_transits_stand_in_for_the_simulation() {
     assert!(within(tf, tm, 0.3), "trail {tf} full, {tm} memoized");
     // Replayed ants are accounted for like the rest.
     assert_eq!(memoized.alive(), 200);
+}
+
+#[test]
+fn the_pipeline_holds_decisions_on_invariant_ground_and_defers_them_to_the_budget() {
+    // Horizons alone: on the trails the ants hold their headings for
+    // several steps, and the colony forages as before.
+    let mut plain = memo_colony(false);
+    plain.memo = None;
+    let mut sim = Simulation::new(plain.clone(), 5);
+    sim.run_seconds(30.0 * 60.0);
+    let full = sim.stats().clone();
+    assert_eq!(full.frames.frames, 0, "no pipeline, no frames");
+
+    let mut held = plain.clone();
+    held.pipeline = Some(PipelineConfig::default());
+    let mut sim = Simulation::new(held, 5);
+    sim.run_seconds(30.0 * 60.0);
+    let s = sim.stats().clone();
+    assert!(s.frames.frames > 0);
+    assert!(
+        s.frames.held_share() > 0.15,
+        "steps held: {:.2}",
+        s.frames.held_share()
+    );
+    assert_eq!(s.frames.deferred, 0, "no budget, nothing deferred");
+    assert!(s.frames.mean_horizon() > 1.2, "{}", s.frames.mean_horizon());
+    assert!(
+        s.decisions < full.decisions,
+        "fewer decisions: {} against {}",
+        s.decisions,
+        full.decisions
+    );
+    assert!(
+        s.food_delivered as f64 > 0.8 * full.food_delivered as f64,
+        "delivered {} against {}",
+        s.food_delivered,
+        full.food_delivered
+    );
+
+    // A budget below the demand: pending decisions wait within their
+    // slack, frames overrun when the due ones alone exceed it.
+    let mut budgeted = plain;
+    budgeted.pipeline = Some(PipelineConfig {
+        budget: 20,
+        ..PipelineConfig::default()
+    });
+    let mut sim = Simulation::new(budgeted, 5);
+    sim.run_seconds(30.0 * 60.0);
+    let b = sim.stats().clone();
+    assert!(b.frames.deferred > 0, "the budget binds");
+    assert!(b.frames.held_share() > s.frames.held_share());
 }

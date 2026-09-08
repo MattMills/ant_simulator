@@ -19,6 +19,7 @@ use crate::colony::{SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::hive::{HistoryConfig, QueenConfig};
 use crate::memo::{MemoConfig, TransitConfig};
+use crate::pipeline::PipelineConfig;
 use crate::species::Species;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -172,6 +173,12 @@ pub struct Workload {
     pub memoize: bool,
     /// Ticks between steps of the chemical kinetics (one is exact).
     pub kinetics_stride: u32,
+    /// Whether the decision pipeline holds decisions for a horizon on
+    /// invariant ground (keeps the history too).
+    pub pipeline: bool,
+    /// The pipeline's frame budget of decisions beyond those due (zero
+    /// for no limit).
+    pub frame_budget: usize,
     /// The species.
     pub species: Species,
     /// Seed of the map and the run.
@@ -189,6 +196,8 @@ impl Default for Workload {
             mind: false,
             memoize: false,
             kinetics_stride: 1,
+            pipeline: false,
+            frame_budget: 0,
             species: Species::lasius_niger(),
             seed: 7,
         }
@@ -226,8 +235,16 @@ impl Workload {
         cfg.nest.mortality = false;
         cfg.nest.max_ants = cfg.nest.max_ants.max(self.ants);
         cfg.nest.log_every_s = 0.0;
-        cfg.history = if self.history || self.mind || self.memoize {
+        cfg.history = if self.history || self.mind || self.memoize || self.pipeline {
             Some(HistoryConfig::default())
+        } else {
+            None
+        };
+        cfg.pipeline = if self.pipeline {
+            Some(PipelineConfig {
+                budget: self.frame_budget,
+                ..PipelineConfig::default()
+            })
         } else {
             None
         };
@@ -266,12 +283,17 @@ pub struct Measurement {
     pub outside_fraction: f64,
     /// Share of the movement decisions stood in for by memoized transits.
     pub replayed_fraction: f64,
+    /// Share of the steps taken without a decision, held by the pipeline.
+    pub held_fraction: f64,
     /// Loads delivered into the nest: what the colony achieved, to set a
     /// memoized or strided run against the full one.
     pub delivered: u64,
     /// Mean entropy of the movement decisions, nats: how the colony
     /// behaved, for the same comparison.
     pub entropy: f64,
+    /// Share of the kinetics grain's nodes at which the trail channel
+    /// is kept at cell resolution at the end.
+    pub active: f64,
     /// The phase breakdown of the median run.
     pub profile: Profile,
 }
@@ -333,8 +355,10 @@ pub fn measure(workload: &Workload, repeats: usize) -> Measurement {
                 s.decisions_replayed as f64 / s.decisions as f64
             }
         },
+        held_fraction: sim.stats().frames.held_share(),
         delivered: sim.stats().food_delivered,
         entropy: sim.stats().mean_entropy(),
+        active: sim.world().active_share(crate::pheromone::Pheromone::Trail),
         profile: sim.profile().clone(),
     }
 }
@@ -402,7 +426,7 @@ impl Scan {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "{:>8} {:>8} {:>9} {:>11} {:>8} {:>8} {:>8} {:>9} {:>7} | {}",
+            "{:>8} {:>8} {:>9} {:>11} {:>8} {:>8} {:>8} {:>5} {:>9} {:>7} {:>6} | {}",
             self.dimension,
             "cells",
             "ticks/s",
@@ -410,8 +434,10 @@ impl Scan {
             "ns/ant",
             "outside",
             "replayed",
+            "held",
             "delivered",
             "entropy",
+            "active",
             Phase::ALL
                 .iter()
                 .map(|p| format!("{:>7}", p.name()))
@@ -421,7 +447,7 @@ impl Scan {
         for (x, m) in self.x.iter().zip(&self.measurements) {
             let _ = writeln!(
                 out,
-                "{:>8} {:>8} {:>9.0} {:>11.0} {:>8.0} {:>7.0}% {:>7.0}% {:>9} {:>7.3} | {}",
+                "{:>8} {:>8} {:>9.0} {:>11.0} {:>8.0} {:>7.0}% {:>7.0}% {:>4.0}% {:>9} {:>7.3} {:>5.0}% | {}",
                 x,
                 m.workload.cells(),
                 m.ticks_per_s,
@@ -429,8 +455,10 @@ impl Scan {
                 m.nanos_per_ant_tick(),
                 100.0 * m.outside_fraction,
                 100.0 * m.replayed_fraction,
+                100.0 * m.held_fraction,
                 m.delivered,
                 m.entropy,
+                100.0 * m.active,
                 Phase::ALL
                     .iter()
                     .map(|&p| format!("{:>6.0}%", 100.0 * m.profile.fraction(p)))

@@ -3,12 +3,14 @@
 //!     cargo bench            # the full scan (the better part of an hour)
 //!     cargo bench -- quick   # a shorter one
 //!     cargo bench -- phases  # one colony's phase breakdown only
-//!     cargo bench -- colony  # the colony-scale rows only, memoized against full
+//!     cargo bench -- colony  # the colony-scale rows only, approximated against full
 //!
 //! Each row times a hungry colony kept foraging for ten simulated minutes
 //! (the median of several runs) and divides the tick among its phases;
-//! the colony-scale rows run an hour and set the memoized colony's
-//! deliveries and decision entropy against the full one's.
+//! the colony-scale rows run an hour and set the deliveries and decision
+//! entropy of the colony with memoized transits and the decision
+//! pipeline against the full simulation's, with the field stepped every
+//! tick and every fourth.
 
 use ant_simulator::prelude::*;
 
@@ -78,38 +80,42 @@ fn main() {
     colony_scale(&base, quick);
 }
 
-/// The colony-scale rows: an hour on a 128×128 world, memoized transits
-/// and a strided field against the full simulation.
+/// The colony-scale rows: an hour on a 128×128 world, the full
+/// simulation against memoized transits and the decision pipeline, with
+/// the field stepped every tick and every fourth.
 fn colony_scale(base: &Workload, quick: bool) {
-    println!("== colony scale with memoized transits and the field stepped every 4 s: a 128×128 world, an hour, kernels learning as they go ==");
-    let large = Workload {
-        width: 128,
-        height: 128,
-        seconds: 3600.0,
-        memoize: true,
-        kinetics_stride: 4,
-        ..base.clone()
-    };
     let big: &[usize] = if quick {
         &[400, 1600]
     } else {
         &[400, 1600, 6400]
     };
-    println!(
-        "{}",
-        ant_scan(big, &large, if quick { 1 } else { 2 }).table()
-    );
-    println!("== the same in full ==");
+    let repeats = if quick { 1 } else { 2 };
+    let large = Workload {
+        width: 128,
+        height: 128,
+        seconds: 3600.0,
+        history: true,
+        ..base.clone()
+    };
+    println!("== colony scale: a 128×128 world, an hour, in full ==");
+    println!("{}", ant_scan(big, &large, repeats).table());
+    println!("== the same with memoized transits (kernels learning as they go) and the decision pipeline ==");
+    let approximated = Workload {
+        memoize: true,
+        pipeline: true,
+        ..large.clone()
+    };
+    println!("{}", ant_scan(big, &approximated, repeats).table());
+    println!("== the same with the field stepped every 4 ticks as well ==");
     println!(
         "{}",
         ant_scan(
             big,
             &Workload {
-                memoize: false,
-                kinetics_stride: 1,
-                ..large
+                kinetics_stride: 4,
+                ..approximated
             },
-            if quick { 1 } else { 2 }
+            repeats
         )
         .table()
     );

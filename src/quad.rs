@@ -315,6 +315,23 @@ impl<T: Clone + Default> QuadTree<T> {
         self.nodes.iter_mut().flat_map(|level| level.iter_mut())
     }
 
+    /// Rebuild every node above `level` as the composition of its
+    /// children, taking the nodes of `level` as given (for values kept
+    /// at one grain and read at every coarser one).
+    pub fn compose_from(&mut self, level: u8, mut add: impl FnMut(&mut T, &T)) {
+        let level = level.min(self.levels) as usize;
+        for l in (0..level).rev() {
+            for code in 0..self.nodes[l].len() {
+                let mut acc = T::default();
+                for q in 0..4u64 {
+                    let child = &self.nodes[l + 1][(code as u64 * 4 + q) as usize];
+                    add(&mut acc, child);
+                }
+                self.nodes[l][code] = acc;
+            }
+        }
+    }
+
     /// Rebuild every node above the leaves as the composition of its
     /// children (for values that are sums of their parts).
     pub fn compose(&mut self, mut add: impl FnMut(&mut T, &T)) {

@@ -24,8 +24,11 @@ use crate::hive::{HistoryConfig, MovementHistory, Queen, QueenConfig};
 use crate::landscape::{
     ring_heading, turn_magnitude, EntropyLedger, Landscape, Sucker, RING, RING_STEP,
 };
-use crate::memo::{Leg, Memo, MemoConfig, Stop, Transit, TransitKey, TransitRecord, INSIDE};
+use crate::memo::{
+    Leg, Memo, MemoConfig, Stop, Transit, TransitKey, TransitRecord, INSIDE, MAX_TRANSIT_LEVELS,
+};
 use crate::pheromone::Pheromone;
+use crate::pipeline::{FrameStats, PipelineConfig};
 use crate::rng::Rng;
 use crate::scaling::{Phase, Profile};
 use crate::species::Species;
@@ -219,6 +222,10 @@ pub struct SimConfig {
     /// Keep the behavioural memo (what is done where, over the quadtree;
     /// see [`crate::memo`]).
     pub memo: Option<MemoConfig>,
+    /// The decision pipeline: decisions held for a horizon on invariant
+    /// ground and scheduled against a frame budget (none: every step
+    /// decided).
+    pub pipeline: Option<PipelineConfig>,
 }
 
 impl Default for SimConfig {
@@ -254,6 +261,7 @@ impl SimConfig {
             history: None,
             mind: None,
             memo: None,
+            pipeline: None,
         }
     }
 }
@@ -714,6 +722,9 @@ pub struct Stats {
     pub corpses_fetched: u64,
     /// Of the decisions, those stood in for by replayed transits.
     pub decisions_replayed: u64,
+    /// The decision pipeline's frames: decisions made, steps held and
+    /// deferred, frames overrun.
+    pub frames: FrameStats,
     /// Position fixes taken from familiar landmarks.
     pub landmark_fixes: u64,
     /// Periodic snapshots.
@@ -899,6 +910,13 @@ pub struct Simulation {
     /// For each leaf, which distinct policy it acts through (transit
     /// kernels are keyed by it).
     policy_classes: Vec<u8>,
+    /// Direct distances from the nest to pickup cells along the geodesic
+    /// round the walls, remembered per cell.
+    geodesics: std::collections::HashMap<Position, f64>,
+    /// The decision pipeline, if decisions are coarse-grained in time.
+    pipeline: Option<PipelineConfig>,
+    /// Probability the last decision gave to holding the heading.
+    straight_prob: f64,
     leaf_paths: Vec<Vec<NodeId>>,
     dirty: bool,
     stats: Stats,
@@ -965,6 +983,7 @@ impl Simulation {
         let tick_s = world.tick_s();
         let cell_cm = world.cell_cm();
         let (world_width, world_height) = (world.width(), world.height());
+        let pipeline = config.pipeline.clone();
         let memo = config
             .memo
             .clone()
@@ -999,6 +1018,9 @@ impl Simulation {
         let temperature_c = config.environment.temperature(0.0);
         let mut sim = Simulation {
             policy_classes: Self::policy_classes(&hierarchy.compile()),
+            geodesics: std::collections::HashMap::new(),
+            pipeline,
+            straight_prob: 0.0,
             policies: hierarchy.compile(),
             leaf_paths,
             hierarchy,
@@ -1704,16 +1726,16 @@ impl Simulation {
         if let Some(m) = &mut self.memo {
             m.record_stop(cell, stop);
         }
-        self.close_record(i, INSIDE, 0.0);
+        self.close_records(i, INSIDE, 0.0);
         self.ants[i].transit = None;
     }
 
     /// Lay pheromone on a cell and note it in the memo and in the
-    /// transit being recorded.
+    /// transits being recorded.
     fn lay(
         world: &mut World,
         memo: Option<&mut Memo>,
-        record: Option<&mut TransitRecord>,
+        records: &mut [Option<TransitRecord>],
         cell: Position,
         kind: Pheromone,
         amount: f64,
@@ -1722,7 +1744,7 @@ impl Simulation {
         if let Some(m) = memo {
             m.record_deposit(cell, kind, amount);
         }
-        if let Some(r) = record {
+        for r in records.iter_mut().flatten() {
             r.deposits[kind.index()] += amount as f32;
         }
     }
@@ -1786,9 +1808,140 @@ impl Simulation {
         }
     }
 
-    /// Close the transit being recorded, if any, as an outcome.
-    fn close_record(&mut self, i: usize, exit_side: u8, exit_along: f32) {
-        let Some(record) = self.ants[i].record.take() else {
+    // ---------------------------------------------------------------
+    // The decision pipeline
+
+    /// Plan the frame: with a budget, count the decisions due and grant
+    /// what is left of the budget to the pending ones, earliest deadline
+    /// first and in the hierarchy's order among equals.
+    fn plan_frame(&mut self) {
+        let Some(cfg) = &self.pipeline else {
+            return;
+        };
+        let budget = cfg.budget;
+        self.stats.frames.frames += 1;
+        if budget == 0 {
+            return;
+        }
+        let tick = self.tick;
+        let mut due = 0usize;
+        let mut pending: Vec<(u64, usize, usize)> = Vec::new();
+        for (i, a) in self.ants.iter_mut().enumerate() {
+            a.granted = false;
+            if !a.alive
+                || a.is_inside()
+                || !a.activity.is_moving()
+                || a.transit.is_some()
+                || tick < a.hold_until
+            {
+                continue;
+            }
+            if tick >= a.deadline || a.activity != a.hold_activity {
+                due += 1;
+            } else {
+                pending.push((a.deadline, a.leaf, i));
+            }
+        }
+        if due > budget {
+            self.stats.frames.overrun += 1;
+        }
+        let left = budget.saturating_sub(due);
+        if left == 0 {
+            return;
+        }
+        if pending.len() > left {
+            pending.select_nth_unstable(left - 1);
+            pending.truncate(left);
+        }
+        for (_, _, i) in pending {
+            self.ants[i].granted = true;
+        }
+    }
+
+    /// What the pipeline says about an ant's next step: hold its heading,
+    /// wait for the budget, or decide.
+    fn pipeline_gate(&self, i: usize, step: f64) -> Gate {
+        let Some(cfg) = &self.pipeline else {
+            return Gate::Decide;
+        };
+        let a = &self.ants[i];
+        if self.tick >= a.deadline || a.activity != a.hold_activity {
+            return Gate::Decide;
+        }
+        // A step taken without looking must be clear.
+        let ahead = a.position.advanced(a.heading, step);
+        if !self.world.segment_passable(a.position, ahead) {
+            return Gate::Decide;
+        }
+        if self.tick < a.hold_until {
+            Gate::Hold
+        } else if cfg.budget == 0 || a.granted {
+            Gate::Decide
+        } else {
+            Gate::Defer
+        }
+    }
+
+    /// After a decision: how long the ant may hold its heading, from
+    /// the invariance of the flow through its node and the probability
+    /// the decision itself gave to holding it, and the deadline of its
+    /// next decision.
+    fn set_horizon(&mut self, i: usize) {
+        let Some(cfg) = &self.pipeline else {
+            return;
+        };
+        let (cell, searching, activity) = {
+            let a = &self.ants[i];
+            (a.cell(), a.activity == Activity::Searching, a.activity)
+        };
+        let invariance = match &self.history {
+            Some(h) => {
+                let level = self.transit_level().unwrap_or(h.sector_level());
+                match h.key_of(cell, level) {
+                    Some(key) => {
+                        let departure = h.node_variance(key);
+                        if departure.is_finite() {
+                            (1.0 - departure.min(1.0)).max(0.0)
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                }
+            }
+            None => 0.0,
+        };
+        let h = crate::pipeline::horizon(cfg, invariance, self.straight_prob, searching);
+        let slack = (h as f64 * cfg.slack.max(0.0)).floor() as u64;
+        let a = &mut self.ants[i];
+        a.hold_until = self.tick + h as u64;
+        a.deadline = a.hold_until + slack;
+        a.hold_activity = activity;
+        self.stats.frames.served += 1;
+        self.stats.frames.horizon_sum += h as u64;
+        self.stats.frames.horizons += 1;
+    }
+
+    /// The decision pipeline's configuration, if any.
+    pub fn pipeline(&self) -> Option<&PipelineConfig> {
+        self.pipeline.as_ref()
+    }
+
+    // ---------------------------------------------------------------
+    // Memoized transits, level by level
+
+    /// The levels at which transits are memoized, finest first.
+    fn transit_levels(&self) -> Vec<u8> {
+        self.memo
+            .as_ref()
+            .and_then(|m| m.transits.as_ref())
+            .map(|t| t.levels().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Close the record of one slot, if any, as an outcome.
+    fn close_slot(&mut self, i: usize, slot: usize, exit_side: u8, exit_along: f32) {
+        let Some(record) = self.ants[i].records[slot].take() else {
             return;
         };
         let heading = self.ants[i].heading;
@@ -1798,10 +1951,18 @@ impl Simulation {
         }
     }
 
-    /// An ant leaves the node it was in for `to_cell`: close its record
-    /// by the side it left through.
-    fn leave_node(&mut self, i: usize, to_cell: Position, to: Point) {
-        let Some(record) = self.ants[i].record else {
+    /// Close every record being kept, with one exit for all (a stop
+    /// inside).
+    fn close_records(&mut self, i: usize, exit_side: u8, exit_along: f32) {
+        for slot in 0..MAX_TRANSIT_LEVELS {
+            self.close_slot(i, slot, exit_side, exit_along);
+        }
+    }
+
+    /// An ant leaves the node of one slot for `to_cell`: close that
+    /// record by the side it left through.
+    fn leave_slot(&mut self, i: usize, slot: usize, to_cell: Position, to: Point) {
+        let Some(record) = self.ants[i].records[slot] else {
             return;
         };
         let rect = self
@@ -1811,35 +1972,57 @@ impl Simulation {
             .unwrap_or((0, 0, 0, 0));
         let side = Self::side_towards(rect, to_cell);
         let along = Self::along_side(rect, side, to);
-        self.close_record(i, side, along);
+        self.close_slot(i, slot, side, along);
     }
 
-    /// An ant enters the node holding `to_cell` from `from_cell`: replay
-    /// a mature kernel's outcome if the node is plain and invariant and
-    /// the ant qualifies, or open a record. Returns whether a replay
-    /// began.
-    fn enter_node(&mut self, i: usize, from_cell: Position, to_cell: Position, to: Point) -> bool {
-        let Some(level) = self.transit_level() else {
-            return false;
+    /// How many slots, finest first, a move from one cell to another
+    /// crosses out of the nodes of: a prefix of the slots, since a
+    /// coarser node's boundary is part of every finer one's.
+    fn crossed_slots(&self, from_cell: Position, to_cell: Position) -> usize {
+        let Some(m) = &self.memo else {
+            return 0;
         };
-        let Some(node) = self.memo.as_ref().and_then(|m| m.key_of(to_cell, level)) else {
-            return false;
-        };
-        let plain = self
-            .memo
-            .as_ref()
-            .and_then(|m| m.transits.as_ref())
-            .map(|t| t.is_plain(node))
-            .unwrap_or(false);
-        if !plain || self.ants[i].corpse || !self.ants[i].activity.is_moving() {
+        let mut crossed = 0;
+        for (slot, &level) in self.transit_levels().iter().enumerate() {
+            if m.key_of(from_cell, level) != m.key_of(to_cell, level) {
+                crossed = slot + 1;
+            }
+        }
+        crossed
+    }
+
+    /// A move from one cell into another that crosses out of the nodes
+    /// of some slots: close their records by the sides left through,
+    /// then enter the new nodes. Returns whether a replay began.
+    fn cross(&mut self, i: usize, from_cell: Position, to_cell: Position, to: Point) -> bool {
+        let crossed = self.crossed_slots(from_cell, to_cell);
+        if crossed == 0 {
             return false;
         }
-        let rect = self
-            .memo
-            .as_ref()
-            .map(|m| m.rect(node))
-            .unwrap_or((0, 0, 0, 0));
-        let side = Self::side_towards(rect, from_cell);
+        for slot in 0..crossed.min(MAX_TRANSIT_LEVELS) {
+            self.leave_slot(i, slot, to_cell, to);
+        }
+        self.enter_node(i, crossed, from_cell, to_cell, to)
+    }
+
+    /// An ant enters the nodes of the first `crossed` slots at `to_cell`
+    /// from `from_cell`: replay a mature kernel's outcome at the coarsest
+    /// of them that is plain and invariant, if the ant qualifies, or
+    /// open records for those that are plain. Returns whether a replay
+    /// began.
+    fn enter_node(
+        &mut self,
+        i: usize,
+        crossed: usize,
+        from_cell: Position,
+        to_cell: Position,
+        to: Point,
+    ) -> bool {
+        let levels = self.transit_levels();
+        let crossed = crossed.min(levels.len()).min(MAX_TRANSIT_LEVELS);
+        if crossed == 0 || self.ants[i].corpse || !self.ants[i].activity.is_moving() {
+            return false;
+        }
         let (heading, leaf, laden, searching) = {
             let a = &self.ants[i];
             (
@@ -1863,59 +2046,129 @@ impl Simulation {
             .cell(to_cell)
             .map(|c| c.crowding(false) > 0.5)
             .unwrap_or(false);
-        let key = TransitKey {
-            node,
-            side,
-            heading: TransitKey::heading_class(heading),
-            leg: self.leg_code(i),
-            laden,
-            policy: self.policy_classes.get(leaf).copied().unwrap_or(0),
-            dial: TransitKey::dial_class(tempering),
-            context: TransitKey::context_class(trail, crowded),
-        };
-        // Corpses on the ground change what happens; so does a field that
-        // is not what it always was.
-        let (x0, y0, x1, y1) = rect;
-        let corpses = (y0..y1)
-            .flat_map(|y| (x0..x1).map(move |x| Position::new(x as i32, y as i32)))
-            .any(|p| self.world.cell(p).map(|c| c.corpses > 0).unwrap_or(false));
-        let invariant = match (
-            &self.history,
-            self.memo.as_ref().and_then(|m| m.transits.as_ref()),
-        ) {
-            (Some(h), Some(t)) => h
-                .key_of(to_cell, level)
-                .map(|hk| h.node_variance(hk) <= t.config().invariance)
-                .unwrap_or(false),
-            _ => true,
-        };
-        if !corpses && invariant {
-            let outcome = self
+        let leg = self.leg_code(i);
+        let policy = self.policy_classes.get(leaf).copied().unwrap_or(0);
+        let dial = TransitKey::dial_class(tempering);
+        let context = TransitKey::context_class(trail, crowded);
+        let heading_class = TransitKey::heading_class(heading);
+        let (explore, invariance, coarse_coherence) = self
+            .memo
+            .as_ref()
+            .and_then(|m| m.transits.as_ref())
+            .map(|t| {
+                let c = t.config();
+                (c.explore, c.invariance, c.coarse_coherence)
+            })
+            .unwrap_or((0.0, 0.0, 0.0));
+        // The keys of the plain nodes entered, one per slot.
+        let mut keys: Vec<Option<Entry>> = vec![None; crossed];
+        for (slot, key) in keys.iter_mut().enumerate() {
+            let level = levels[slot];
+            let Some(node) = self.memo.as_ref().and_then(|m| m.key_of(to_cell, level)) else {
+                continue;
+            };
+            let plain = self
                 .memo
-                .as_mut()
-                .and_then(|m| m.transits.as_mut())
-                .and_then(|t| t.replay(&key, &mut self.rng));
-            if let Some(outcome) = outcome {
-                let exit = Self::across_side(rect, outcome.exit_side, outcome.exit_along);
-                if self.world.has_clearance(exit) {
-                    let until = self.tick + outcome.ticks.max(1) as u64;
-                    self.ants[i].transit = Some(Transit {
-                        until,
-                        entry: to,
-                        exit,
-                        outcome,
-                        key,
-                    });
-                    return true;
+                .as_ref()
+                .and_then(|m| m.transits.as_ref())
+                .map(|t| t.is_plain(node))
+                .unwrap_or(false);
+            if !plain {
+                continue;
+            }
+            let rect = self
+                .memo
+                .as_ref()
+                .map(|m| m.rect(node))
+                .unwrap_or((0, 0, 0, 0));
+            let side = Self::side_towards(rect, from_cell);
+            *key = Some((
+                TransitKey {
+                    node,
+                    side,
+                    heading: heading_class,
+                    leg,
+                    laden,
+                    policy,
+                    dial,
+                    context,
+                },
+                rect,
+            ));
+        }
+        // A share of entries is always simulated in full, so that the
+        // kernels keep learning and a change in the ground shows.
+        let exploring = explore > 0.0 && self.rng.chance(explore);
+        if !exploring {
+            // The coarsest plain node first: corpses on the ground change
+            // what happens, and so does a field that is not what it
+            // always was.
+            for slot in (0..crossed).rev() {
+                let Some((key, rect)) = keys[slot] else {
+                    continue;
+                };
+                if self.world.corpses_in(rect) > 0 {
+                    continue;
                 }
+                let invariant = match &self.history {
+                    Some(h) => h
+                        .key_of(to_cell, key.node.level)
+                        .map(|hk| h.node_variance(hk) <= invariance)
+                        .unwrap_or(false),
+                    None => true,
+                };
+                if !invariant {
+                    continue;
+                }
+                let coherence = if slot > 0 { coarse_coherence } else { 0.0 };
+                let outcome = self
+                    .memo
+                    .as_ref()
+                    .and_then(|m| m.transits.as_ref())
+                    .and_then(|t| t.sample(&key, coherence, &mut self.rng));
+                let Some(outcome) = outcome else {
+                    continue;
+                };
+                let exit = Self::across_side(rect, outcome.exit_side, outcome.exit_along);
+                if !self.world.has_clearance(exit) {
+                    continue;
+                }
+                if let Some(t) = self.memo.as_mut().and_then(|m| m.transits.as_mut()) {
+                    t.note_replay(&outcome, key.node.level);
+                }
+                // Finer nodes are not recorded while a coarser one is
+                // replayed.
+                for record in self.ants[i].records.iter_mut().take(slot) {
+                    *record = None;
+                }
+                let until = self.tick + outcome.ticks.max(1) as u64;
+                self.ants[i].transit = Some(Transit {
+                    until,
+                    entry: to,
+                    exit,
+                    outcome,
+                    key,
+                });
+                return true;
             }
         }
-        self.ants[i].record = Some(TransitRecord::open(key, self.tick, to));
+        for (slot, key) in keys.iter().enumerate() {
+            if let Some((key, rect)) = key {
+                let side = (rect.2 - rect.0).max(rect.3 - rect.1) as f32;
+                self.ants[i].records[slot] = Some(TransitRecord::open(
+                    *key,
+                    self.tick,
+                    to,
+                    (side / 4.0).max(1.0),
+                ));
+            }
+        }
         false
     }
 
-    /// A replayed transit ends: apply what the outcome carried and put
-    /// the ant at the exit, entering the next node.
+    /// A replayed transit ends: apply what the outcome carried along
+    /// the path it recorded, put the ant at the exit, and enter the
+    /// next node.
     fn complete_transit(&mut self, i: usize) {
         let Some(t) = self.ants[i].transit.take() else {
             return;
@@ -1938,17 +2191,19 @@ impl Simulation {
         };
         let laden = t.key.laden;
         let leaf = self.ants[i].leaf;
-        let species_trail = self.species.uses_home_pheromone;
-        let _ = species_trail;
-        // What was laid and walked, spread along the straight line from
-        // entry to exit.
-        let (dx, dy) = t.entry.to(t.exit);
+        // What was laid and walked, spread along the path from entry
+        // through the waypoints to the exit.
+        let mut path: Vec<Point> = Vec::with_capacity(o.via_len as usize + 2);
+        path.push(t.entry);
+        path.extend(o.waypoints());
+        path.push(t.exit);
+        let segments: Vec<f64> = path.windows(2).map(|w| w[0].distance(w[1])).collect();
+        let total: f64 = segments.iter().sum();
         let samples = (o.length.ceil().max(1.0) as usize).clamp(1, 64);
         let per = 1.0 / samples as f64;
         let mut prev = t.entry;
         for s in 1..=samples {
-            let f = s as f64 / samples as f64;
-            let p = Point::new(t.entry.x + dx * f, t.entry.y + dy * f);
+            let p = point_along(&path, &segments, total * s as f64 / samples as f64);
             let cell = p.cell();
             for (k, &amount) in o.deposits.iter().enumerate() {
                 if amount > 0.0 {
@@ -1986,8 +2241,19 @@ impl Simulation {
             self.stats.path_by_node[node].moves += o.decisions as u64;
             self.stats.path_by_node[node].length += o.length as f64;
         }
+        // Coarser nodes still being recorded take the outcome in.
+        let level = t.key.node.level;
+        let levels = self.transit_levels();
+        for (slot, &l) in levels.iter().enumerate().take(MAX_TRANSIT_LEVELS) {
+            if l < level {
+                if let Some(r) = &mut self.ants[i].records[slot] {
+                    r.absorb(&o, t.exit);
+                }
+            }
+        }
         // The ant itself: where it is, where it faces, what it has walked
         // and integrated.
+        let (dx, dy) = t.entry.to(t.exit);
         let species = &self.species;
         let a = &mut self.ants[i];
         a.position = t.exit;
@@ -1995,8 +2261,8 @@ impl Simulation {
         a.trip_length += o.length as f64;
         a.integrate(dx, dy, species, &mut self.rng);
         a.remember(from_cell);
-        // Into the next node.
-        self.enter_node(i, from_cell, to_cell, t.exit);
+        // Out of the nodes crossed, into the next.
+        self.cross(i, from_cell, to_cell, t.exit);
     }
 
     /// The queen's mind, if she has one.
@@ -2124,6 +2390,7 @@ impl Simulation {
         }
         self.update_environment();
         self.index_inside();
+        self.plan_frame();
         for i in 0..self.ants.len() {
             if self.ants[i].alive {
                 self.step_ant(i);
@@ -2490,7 +2757,7 @@ impl Simulation {
         a.accepts_prey = accepts_prey;
         a.item_mg = 0.0;
         a.goal = None;
-        a.record = None;
+        a.records = [None; MAX_TRANSIT_LEVELS];
         a.transit = None;
         if nest_view.is_some() {
             a.nest_view = nest_view;
@@ -2948,12 +3215,16 @@ impl Simulation {
                 return;
             }
         }
-        // A change of leg inside a node ends the transit being recorded
-        // as one that stopped inside.
-        if let Some(record) = &self.ants[i].record {
-            if record.key.leg != self.leg_code(i) {
-                self.close_record(i, INSIDE, 0.0);
-            }
+        // A change of leg inside a node ends the transits being recorded
+        // as ones that stopped inside.
+        let leg = self.leg_code(i);
+        if self.ants[i]
+            .records
+            .iter()
+            .flatten()
+            .any(|r| r.key.leg != leg)
+        {
+            self.close_records(i, INSIDE, 0.0);
         }
         // Speed: cells per tick at the current temperature, faster on a
         // strong trail, slower when loaded and in a crowd.
@@ -2991,7 +3262,25 @@ impl Simulation {
                     _ => Mode::Outbound,
                 };
                 let decided = std::time::Instant::now();
-                let ring = self.decide(i, mode, step);
+                // The pipeline: hold the heading under a horizon, wait
+                // for the budget within the slack, or decide.
+                let ring = match self.pipeline_gate(i, step) {
+                    Gate::Hold => {
+                        self.stats.frames.held += 1;
+                        Some(0)
+                    }
+                    Gate::Defer => {
+                        self.stats.frames.deferred += 1;
+                        Some(0)
+                    }
+                    Gate::Decide => {
+                        let ring = self.decide(i, mode, step);
+                        if ring.is_some() {
+                            self.set_horizon(i);
+                        }
+                        ring
+                    }
+                };
                 self.decisions_time += decided.elapsed();
                 if let Some(ring) = ring {
                     if self.move_ant(i, ring, step) {
@@ -3076,14 +3365,14 @@ impl Simulation {
         if let Some(m) = &mut self.memo {
             m.record_move(to_cell, step);
         }
-        if let Some(r) = &mut self.ants[i].record {
-            r.length += step as f32;
+        for r in self.ants[i].records.iter_mut().flatten() {
+            r.walked(step, to);
         }
         match laying {
             Some(Pheromone::Trail) => Self::lay(
                 &mut self.world,
                 self.memo.as_mut(),
-                self.ants[i].record.as_mut(),
+                &mut self.ants[i].records,
                 to_cell,
                 Pheromone::Trail,
                 species.trail_deposit * strength * step * crowd_factor,
@@ -3091,7 +3380,7 @@ impl Simulation {
             Some(Pheromone::NoEntry) => Self::lay(
                 &mut self.world,
                 self.memo.as_mut(),
-                self.ants[i].record.as_mut(),
+                &mut self.ants[i].records,
                 to_cell,
                 Pheromone::NoEntry,
                 species.no_entry_deposit * strength * step,
@@ -3099,7 +3388,7 @@ impl Simulation {
             Some(kind) => Self::lay(
                 &mut self.world,
                 self.memo.as_mut(),
-                self.ants[i].record.as_mut(),
+                &mut self.ants[i].records,
                 to_cell,
                 kind,
                 strength * step,
@@ -3110,7 +3399,7 @@ impl Simulation {
             Self::lay(
                 &mut self.world,
                 self.memo.as_mut(),
-                self.ants[i].record.as_mut(),
+                &mut self.ants[i].records,
                 to_cell,
                 Pheromone::Home,
                 species.trail_deposit * step,
@@ -3120,7 +3409,7 @@ impl Simulation {
             Self::lay(
                 &mut self.world,
                 self.memo.as_mut(),
-                self.ants[i].record.as_mut(),
+                &mut self.ants[i].records,
                 to_cell,
                 Pheromone::Territory,
                 species.territory_deposit * step,
@@ -3165,15 +3454,14 @@ impl Simulation {
             self.fix_position_by_landmarks(i);
             self.handle_corpses(i, to_cell);
         }
-        // Crossing into another memo node closes the transit being
+        // Crossing into other memo nodes closes the transits being
         // recorded and opens the next, or replays one.
         let mut in_transit = false;
         if let Some(level) = self.transit_level() {
             let node_from = self.memo.as_ref().and_then(|m| m.key_of(from_cell, level));
             let node_to = self.memo.as_ref().and_then(|m| m.key_of(to_cell, level));
             if node_from != node_to {
-                self.leave_node(i, to_cell, to);
-                in_transit = self.enter_node(i, from_cell, to_cell, to);
+                in_transit = self.cross(i, from_cell, to_cell, to);
             }
         }
         in_transit
@@ -3357,12 +3645,32 @@ impl Simulation {
     /// the direct distance from the nest.
     fn record_outbound(&mut self, i: usize, (length, pickup): (f64, Point)) {
         let leaf = self.ants[i].leaf;
-        let nest = Point::center_of(self.world.nest());
-        let direct = (pickup.distance(nest) - self.world.nest_radius().max(0) as f64).max(0.0);
+        let direct = self.direct_distance(pickup);
         self.stats.path.record_outbound(length, direct);
         for &node in &self.leaf_paths[leaf] {
             self.stats.path_by_node[node].record_outbound(length, direct);
         }
+    }
+
+    /// The direct distance from the nest's edge to a point: the geodesic
+    /// round the walls (the lens's route) where there are walls, the
+    /// straight line in the open; remembered per cell.
+    fn direct_distance(&mut self, p: Point) -> f64 {
+        let nest = Point::center_of(self.world.nest());
+        let radius = self.world.nest_radius().max(0) as f64;
+        if !self.world.has_walls() {
+            return (p.distance(nest) - radius).max(0.0);
+        }
+        let cell = p.cell();
+        if let Some(&d) = self.geodesics.get(&cell) {
+            return d;
+        }
+        let along = crate::lens::geodesic(&self.world, nest, Point::center_of(cell), 3.0)
+            .map(|g| g.length())
+            .unwrap_or_else(|| p.distance(nest));
+        let d = (along - radius).max(0.0);
+        self.geodesics.insert(cell, d);
+        d
     }
 
     /// Start cutting a piece of prey: its value to the colony is its
@@ -3673,7 +3981,21 @@ impl Simulation {
             }
         };
 
-        // Accounting.
+        // Accounting: the probability of holding the heading, for the
+        // pipeline.
+        self.straight_prob = {
+            let cone = self
+                .pipeline
+                .as_ref()
+                .map(|p| p.cone)
+                .unwrap_or(0)
+                .min(RING / 4);
+            let mut p = selected[0];
+            for r in 1..=cone {
+                p += selected[r] + selected[RING - r];
+            }
+            p
+        };
         self.stats.decisions += 1;
         self.stats.entropy_sum += tempered.entropy;
         if let Some(m) = &mut self.memo {
@@ -3686,7 +4008,7 @@ impl Simulation {
             };
             m.record_decision(position.cell(), chosen, tempered.entropy, leg, carrying);
         }
-        if let Some(r) = &mut self.ants[i].record {
+        for r in self.ants[i].records.iter_mut().flatten() {
             r.decisions = r.decisions.saturating_add(1);
             r.entropy += tempered.entropy as f32;
             r.straight += (turn_magnitude(chosen) as f64 * RING_STEP).cos() as f32;
@@ -3788,6 +4110,39 @@ impl Simulation {
 /// Heading angle of a vector, for callers that want to face something.
 pub fn heading_towards(dx: f64, dy: f64) -> f64 {
     angle_of(dx, dy)
+}
+
+/// A node entered, as a transit key and the node's cells.
+type Entry = (TransitKey, (usize, usize, usize, usize));
+
+/// What the pipeline says about an ant's next step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Keep the heading: the hold has not ended.
+    Hold,
+    /// Keep the heading a little longer: the budget is spent.
+    Defer,
+    /// Decide.
+    Decide,
+}
+
+/// The point at a distance along a polyline (its last point beyond the
+/// end).
+fn point_along(path: &[Point], segments: &[f64], distance: f64) -> Point {
+    let mut acc = 0.0;
+    for (i, &len) in segments.iter().enumerate() {
+        if acc + len >= distance || i + 1 == segments.len() {
+            let f = if len > 1e-12 {
+                ((distance - acc) / len).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let (p, q) = (path[i], path[i + 1]);
+            return Point::new(p.x + (q.x - p.x) * f, p.y + (q.y - p.y) * f);
+        }
+        acc += len;
+    }
+    *path.last().unwrap_or(&Point::new(0.0, 0.0))
 }
 
 #[cfg(test)]

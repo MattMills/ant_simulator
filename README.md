@@ -395,6 +395,7 @@ cargo run --release --example hive        [epochs] [epoch_seconds]
 cargo run --release --example nest        [minutes]
 cargo run --release --example scale       [minutes]
 cargo run --release --example memo        [minutes] [categories]
+cargo run --release --example lens
 cargo bench                               [-- quick | phases | colony]
 ```
 
@@ -408,9 +409,10 @@ on fresh episodes. `surface` explores the geometric entropy channels.
 undertakers at work. `scale` runs the scale analysis: foraging
 organisation against colony size and the hive's memory against colony
 size and grain. `memo` extracts the behavioural memo and classifies the
-ground. `cargo bench` runs the throughput scan (see below); `colony`
-selects its colony-scale rows, memoized transits against the full
-simulation.
+ground. `lens` draws the two-position tessellation of the quadtree and
+the geodesic over it. `cargo bench` runs the throughput scan (see
+below); `colony` selects its colony-scale rows, the memoized and
+pipelined colony against the full simulation.
 
 ## The arena, turn by turn
 
@@ -466,10 +468,14 @@ thought is a vector on a fixed clock, expressed through the entropy dials
 and read back by linear readouts, and the colony it thinks through is
 kept foraging by a reserve drain standing for nestmates that are not
 simulated. Memoized transits replay recorded outcomes: a replayed ant
-crosses its node in a straight line for laying and for the history,
-learns no route there, and takes the outcome of another ant of its kind;
-the field's kinetics can be stepped every few ticks with the evaporation
-and diffusion of the ticks skipped applied at once.
+crosses its node along the waypoints of another ant of its kind, laying
+and moving for the history along them, learns no route there, and takes
+that ant's outcome; the chemical field is kept at cell resolution only
+where it has structure, and as one mean per node where it is faint; the
+kinetics can be stepped every few ticks with the evaporation and
+diffusion of the ticks skipped applied at once; and under the decision
+pipeline an ant on invariant, straight ground holds its heading for a
+few steps between decisions.
 
 ## Scale analysis
 
@@ -595,19 +601,40 @@ side entered by, the entry heading's class, the leg, whether laden, which
 distinct policy the ant acts through, the entropy dial's class, and the
 local field's class (the trail's strength, the crowding). What came of it
 is the outcome: the side and point left by, the heading, the ticks, the
-cells walked, the decisions and their entropy, what was laid. A key's
-kernel keeps a forgetting reservoir of outcomes. Once a kernel is mature
-(a dozen outcomes, next to none of which ended inside the node) and the
+cells walked, the decisions and their entropy, what was laid, and the
+waypoints passed (one every quarter of the node's side). A key's kernel
+keeps a forgetting reservoir of outcomes. Once a kernel is mature (a
+dozen outcomes, next to none of which ended inside the node) and the
 node's current flow is within half of its invariant one, an ant entering
 under that key is advanced in one step: it sits inside the node for the
 outcome's ticks and appears at its exit with its path integrated, its
-deposits laid along the line it crossed, and its decisions counted, at a
-tick's cost of a comparison instead of one decision per cell. A tenth of
-eligible entries are still simulated in full, so that the kernels keep
-learning and a change in the ground shows; a change of leg, a corpse on
-the ground or a node whose flow has departed from its invariant turns
-memoization off there. Transits chain: an ant leaving one memoized node
-into another is advanced again.
+deposits laid along the waypoints it followed, and its decisions
+counted, at a tick's cost of a comparison instead of one decision per
+cell. A tenth of eligible entries are still simulated in full, so that
+the kernels keep learning and a change in the ground shows; a change of
+leg, a corpse on the ground or a node whose flow has departed from its
+invariant turns memoization off there. Transits chain: an ant leaving
+one memoized node into another is advanced again.
+
+The kernels are kept at several levels of the tree at once, the memo's
+grain and the levels above it (`TransitConfig::depth`, two by default:
+4-, 8- and 16-cell nodes), and a transit is recorded at every level the
+ant is crossing a node of. An entry is replayed at the coarsest level
+whose node is plain and invariant and whose kernel is mature and
+*coherent*: above the grain a kernel must leave by one side at one place
+(`Kernel::coherence`, the share of outcomes leaving by the commonest
+side discounted by the spread of where along it, 0.85 by default), so
+that the bigger the step, the more definite the transition it stands in
+for, as a macro-cell of a cellular automaton is memoized only where its
+transition is a function. A coarser node still being recorded takes a
+finer replay into its record, so the coarse kernels keep learning while
+the fine ones are replayed. Over eight seeds of a 400-worker hour on a
+128 × 128 world the hierarchy replayed a sixth more decisions through a
+fifth fewer replays than the grain alone (92 thousand through 12.5
+thousand, against 79 thousand through 15.5 thousand), delivering 4043
+loads against 4064 in full and 4027 with the grain alone, at a decision
+entropy of 1.64 against 1.54 and 1.61: the coarser the kernel, the more
+its outcomes lag the trail as it strengthens.
 
 `cargo bench -- colony` sets the memoized colony against the full one at
 colony scale: 400, 1600 and 6400 workers for a simulated hour on a
@@ -636,6 +663,54 @@ field evaporates in steps, which together leave the memoized colony a
 little hotter and a little more productive than the full one. What
 remains is the three fifths of the decisions still simulated, which is
 where the time goes at every size.
+
+## The lens: a two-position structure on the quadtree
+
+Between two points the tree can be tessellated so that its resolution
+follows the distance to the nearer of them: cells within a radius of
+either end, and beyond it nodes that double in size with their distance
+from the nearer end (`Lens`). The tessellation is the same whichever end
+is named first, so anything computed on it is invariant under exchanging
+the ends, and it has a number of leaves that grows with the logarithm of
+the span rather than with the span, so that the two ends are joined
+through a graph of a few hundred nodes on any grid. A node that holds
+both walls and open ground is refined wherever it lies, so the geodesic
+over the lens (`Lens::geodesic`, the least-cost path between the leaves'
+centres, pulled straight where the line of sight is clear) respects the
+walls exactly. `cargo run --release --example lens` draws it on a walled
+field: the nest and a pool at cell resolution, the wall refined to cells
+along its length with the open ground beside it in 2- and 4-cell leaves,
+the corners of the field in 8- and 16-cell leaves, and the geodesic
+through the wall's gap; on an open 512 × 512 world the lens between two
+points 8 cells apart has 313 leaves and between points 256 cells apart
+469, over 262144 cells. The simulation measures the directness of
+outbound legs against this geodesic, so that in a walled arena an ant
+that walked round the wall is not counted as having wandered.
+
+## The decision pipeline: horizons, deadlines and a frame budget
+
+Decisions can be coarse-grained in time as transits are in space. Under
+the pipeline (`PipelineConfig`) an ant's decision sets its next: a hold
+on the heading for a horizon of steps, and a deadline, up to a horizon's
+slack later, by which the next decision must be made. The horizon is
+one step where the flow through the node has departed from its
+invariant or where the ant is searching; on invariant ground it is the
+expected run of straight choices the decision itself would make,
+`p / (1 − p)` for the probability `p` it gave to keeping the heading
+(within one ring position, 22.5°, which the heading's persistence
+smooths into the direction of travel), up to `max_horizon` steps
+(four), so that a decision is skipped only where it would have come out
+the same. A dial the queen runs hot flattens the distribution and
+shortens the hold of itself: she orders the colony's decisions by where
+she spends its entropy. A hold ends early when the ant's leg changes or
+the step ahead is not clear. Every tick is a frame
+with a budget of decisions: those at their deadline are made whatever
+the budget, the rest of the budget goes to the pending ones, earliest
+deadline first and, among equal deadlines, in the hierarchy's order (the
+castes the queen put first are served first), and an ant not served
+holds its heading a little longer, within its slack. The frames' ledger
+(`Stats::frames`) counts the decisions made, the steps held and
+deferred, the frames overrun and the mean horizon.
 
 ## Performance and scaling
 

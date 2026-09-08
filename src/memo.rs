@@ -963,6 +963,13 @@ pub const INSIDE: u8 = 4;
 /// Classes the entry heading is quantised into.
 pub const HEADING_CLASSES: u8 = 8;
 
+/// Waypoints an outcome keeps of the path through the node.
+pub const VIA: usize = 6;
+
+/// Levels at which transits can be memoized at once: the memo's grain
+/// and the levels above it.
+pub const MAX_TRANSIT_LEVELS: usize = 4;
+
 /// Where and how a transit through a node began: the key of a transit
 /// kernel. Two ants entering the same node from the same side with the
 /// same heading, on the same leg, laden alike, under the same dial and
@@ -1025,7 +1032,7 @@ impl TransitKey {
 }
 
 /// What came of a transit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TransitOutcome {
     /// The side left by, or [`INSIDE`] when the transit ended in the
     /// node (food found, nest reached, search begun or given up, death).
@@ -1047,6 +1054,21 @@ pub struct TransitOutcome {
     pub straight: f32,
     /// Pheromone laid in the node, per channel.
     pub deposits: [f32; Pheromone::COUNT],
+    /// Points passed on the way through the node, one every quarter of
+    /// the node's side, so that what a replay lays follows the path
+    /// rather than the chord.
+    pub via: [(f32, f32); VIA],
+    /// How many of them are set.
+    pub via_len: u8,
+}
+
+impl TransitOutcome {
+    /// The waypoints, as points.
+    pub fn waypoints(&self) -> impl Iterator<Item = crate::geometry::Point> + '_ {
+        self.via[..self.via_len as usize]
+            .iter()
+            .map(|&(x, y)| crate::geometry::Point::new(x as f64, y as f64))
+    }
 }
 
 /// A transit being recorded: where it began and what has happened in it.
@@ -1068,11 +1090,24 @@ pub struct TransitRecord {
     pub straight: f32,
     /// Pheromone laid so far.
     pub deposits: [f32; Pheromone::COUNT],
+    /// Waypoints so far.
+    pub via: [(f32, f32); VIA],
+    /// How many of them are set.
+    pub via_len: u8,
+    /// Cells walked between waypoints.
+    pub spacing: f32,
+    /// Cells walked since the last waypoint.
+    pub since_via: f32,
 }
 
 impl TransitRecord {
-    /// A record just opened.
-    pub fn open(key: TransitKey, tick: u64, entry: crate::geometry::Point) -> TransitRecord {
+    /// A record just opened, keeping a waypoint every `spacing` cells.
+    pub fn open(
+        key: TransitKey,
+        tick: u64,
+        entry: crate::geometry::Point,
+        spacing: f32,
+    ) -> TransitRecord {
         TransitRecord {
             key,
             start_tick: tick,
@@ -1082,7 +1117,34 @@ impl TransitRecord {
             entropy: 0.0,
             straight: 0.0,
             deposits: [0.0; Pheromone::COUNT],
+            via: [(0.0, 0.0); VIA],
+            via_len: 0,
+            spacing: spacing.max(0.5),
+            since_via: 0.0,
         }
+    }
+
+    /// A step of `step` cells ending at `at`.
+    pub fn walked(&mut self, step: f64, at: crate::geometry::Point) {
+        self.length += step as f32;
+        self.since_via += step as f32;
+        if self.since_via >= self.spacing && (self.via_len as usize) < VIA {
+            self.via[self.via_len as usize] = (at.x as f32, at.y as f32);
+            self.via_len += 1;
+            self.since_via = 0.0;
+        }
+    }
+
+    /// Take in a replayed outcome inside this record's node (a finer
+    /// node crossed by kernel), ending at `at`.
+    pub fn absorb(&mut self, o: &TransitOutcome, at: crate::geometry::Point) {
+        self.decisions = self.decisions.saturating_add(o.decisions);
+        self.entropy += o.entropy;
+        self.straight += o.straight;
+        for (d, a) in self.deposits.iter_mut().zip(&o.deposits) {
+            *d += a;
+        }
+        self.walked(o.length as f64, at);
     }
 
     /// Close the record as an outcome.
@@ -1097,6 +1159,8 @@ impl TransitRecord {
             entropy: self.entropy,
             straight: self.straight,
             deposits: self.deposits,
+            via: self.via,
+            via_len: self.via_len,
         }
     }
 }
@@ -1154,6 +1218,37 @@ impl Kernel {
             && (self.stopped as f64) <= max_stop_share * self.seen as f64
     }
 
+    /// How definite the kernel's transition is: the share of its
+    /// retained outcomes that left by the commonest side, discounted by
+    /// the spread of where along that side they left (1 when every
+    /// outcome leaves at the same point, 0 when the sides are split or
+    /// the exits are spread over the whole side).
+    pub fn coherence(&self) -> f64 {
+        let leaving: Vec<&TransitOutcome> = self
+            .outcomes
+            .iter()
+            .filter(|o| o.exit_side != INSIDE)
+            .collect();
+        if leaving.is_empty() {
+            return 0.0;
+        }
+        let mut counts = [0usize; 4];
+        for o in &leaving {
+            counts[(o.exit_side as usize).min(3)] += 1;
+        }
+        let side = (0..4).max_by_key(|&s| counts[s]).unwrap_or(0);
+        let share = counts[side] as f64 / leaving.len() as f64;
+        let along: Vec<f64> = leaving
+            .iter()
+            .filter(|o| o.exit_side as usize == side)
+            .map(|o| o.exit_along as f64)
+            .collect();
+        let n = along.len() as f64;
+        let mean = along.iter().sum::<f64>() / n;
+        let var = along.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / n;
+        (share * (1.0 - 2.0 * var.sqrt())).clamp(0.0, 1.0)
+    }
+
     /// One retained outcome that left the node, at random.
     pub fn sample(&self, rng: &mut Rng) -> Option<TransitOutcome> {
         let leaving: Vec<&TransitOutcome> = self
@@ -1186,29 +1281,40 @@ pub struct TransitConfig {
     /// Largest share of a key's transits that may have ended inside the
     /// node.
     pub max_stop_share: f64,
+    /// Levels above the memo's grain at which transits are memoized
+    /// too: an ant entering a coarser node whose kernel is mature and
+    /// whose flow is invariant is advanced across the whole of it.
+    pub depth: usize,
+    /// Coherence ([`Kernel::coherence`]) a kernel at a level above the
+    /// grain must have before it stands in for the simulation: the
+    /// coarser the node, the more definite its transition has to be.
+    pub coarse_coherence: f64,
 }
 
 impl Default for TransitConfig {
     fn default() -> Self {
         TransitConfig {
             min_samples: 12,
-            capacity: 32,
+            capacity: 16,
             explore: 0.1,
             invariance: 0.5,
             max_stop_share: 0.02,
+            depth: 2,
+            coarse_coherence: 0.7,
         }
     }
 }
 
-/// The transit kernels of the memo's nodes, and the ledger of what they
-/// stood in for.
+/// The transit kernels of the memo's nodes at every level memoized, and
+/// the ledger of what they stood in for.
 #[derive(Clone, Debug)]
 pub struct Transits {
-    level: u8,
+    /// The levels, finest first.
+    levels: Vec<u8>,
     kernels: std::collections::HashMap<TransitKey, Kernel>,
-    /// Per node at the level, whether it is plain ground: no food, nest,
-    /// prey or landmark, nothing that changes an ant's state.
-    plain: Vec<bool>,
+    /// Per level and node, whether it is plain ground: no food, nest,
+    /// prey, wall or landmark, nothing that changes an ant's state.
+    plain: Vec<Vec<bool>>,
     cfg: TransitConfig,
     /// Transits recorded in full.
     pub recorded: u64,
@@ -1218,19 +1324,32 @@ pub struct Transits {
     pub ticks_replayed: u64,
     /// Decisions the replayed transits stood in for.
     pub decisions_replayed: u64,
+    /// Transits replayed per level, finest first.
+    pub replayed_by_level: Vec<u64>,
+    /// Decisions stood in for per level, finest first.
+    pub decisions_by_level: Vec<u64>,
 }
 
 impl Transits {
-    /// Kernels over the nodes of a level, with the plain nodes taken from
-    /// the world.
+    /// Kernels over the nodes of a level and the `depth` levels above
+    /// it, with the plain nodes taken from the world.
     pub fn new(
         tree: &QuadTree<Signature>,
         level: u8,
         world: &crate::world::World,
         cfg: TransitConfig,
     ) -> Transits {
-        let count = 1usize << (2 * level as usize);
-        let mut plain = vec![false; count];
+        let levels: Vec<u8> = (0..=cfg.depth)
+            .filter_map(|d| {
+                let l = level as i32 - d as i32;
+                (l >= 1).then_some(l as u8)
+            })
+            .take(MAX_TRANSIT_LEVELS)
+            .collect();
+        let mut plain: Vec<Vec<bool>> = levels
+            .iter()
+            .map(|&l| vec![false; 1usize << (2 * l as usize)])
+            .collect();
         for key in tree.keys(level) {
             let (x0, y0, x1, y1) = tree.rect(key);
             let mut ok = true;
@@ -1261,10 +1380,23 @@ impl Transits {
             {
                 ok = false;
             }
-            plain[key.code as usize] = ok;
+            plain[0][key.code as usize] = ok;
         }
+        // A coarser node is plain when every child on the grid is.
+        for slot in 1..levels.len() {
+            let l = levels[slot];
+            for key in tree.keys(l) {
+                let all = key
+                    .children()
+                    .iter()
+                    .filter(|c| tree.on_grid(**c))
+                    .all(|c| plain[slot - 1][c.code as usize]);
+                plain[slot][key.code as usize] = all;
+            }
+        }
+        let n = levels.len();
         Transits {
-            level,
+            levels,
             kernels: std::collections::HashMap::new(),
             plain,
             cfg,
@@ -1272,12 +1404,24 @@ impl Transits {
             replayed: 0,
             ticks_replayed: 0,
             decisions_replayed: 0,
+            replayed_by_level: vec![0; n],
+            decisions_by_level: vec![0; n],
         }
     }
 
-    /// The level of the nodes.
+    /// The finest level memoized (the memo's grain).
     pub fn level(&self) -> u8 {
-        self.level
+        self.levels[0]
+    }
+
+    /// The levels memoized, finest first.
+    pub fn levels(&self) -> &[u8] {
+        &self.levels
+    }
+
+    /// The slot of a level among those memoized.
+    pub fn slot_of(&self, level: u8) -> Option<usize> {
+        self.levels.iter().position(|&l| l == level)
     }
 
     /// The configuration.
@@ -1285,9 +1429,11 @@ impl Transits {
         &self.cfg
     }
 
-    /// Whether a node is plain ground.
+    /// Whether a node (at any level memoized) is plain ground.
     pub fn is_plain(&self, node: QuadKey) -> bool {
-        node.level == self.level && self.plain.get(node.code as usize).copied().unwrap_or(false)
+        self.slot_of(node.level)
+            .and_then(|s| self.plain[s].get(node.code as usize).copied())
+            .unwrap_or(false)
     }
 
     /// Record a transit's outcome under its key.
@@ -1313,20 +1459,48 @@ impl Transits {
             .unwrap_or(false)
     }
 
-    /// An outcome to replay for a key, if its kernel is mature (and the
-    /// exploration draw does not ask for the full simulation).
-    pub fn replay(&mut self, key: &TransitKey, rng: &mut Rng) -> Option<TransitOutcome> {
-        if self.cfg.explore > 0.0 && rng.chance(self.cfg.explore) {
-            return None;
-        }
+    /// An outcome of a mature kernel of at least `coherence`, at random
+    /// (not yet counted as replayed: see [`Transits::note_replay`]).
+    pub fn sample(
+        &self,
+        key: &TransitKey,
+        coherence: f64,
+        rng: &mut Rng,
+    ) -> Option<TransitOutcome> {
         let kernel = self.kernels.get(key)?;
         if !kernel.mature(self.cfg.min_samples, self.cfg.max_stop_share) {
             return None;
         }
-        let outcome = kernel.sample(rng)?;
+        if coherence > 0.0 && kernel.coherence() < coherence {
+            return None;
+        }
+        kernel.sample(rng)
+    }
+
+    /// Count an outcome replayed at a level.
+    pub fn note_replay(&mut self, outcome: &TransitOutcome, level: u8) {
         self.replayed += 1;
         self.ticks_replayed += outcome.ticks as u64;
         self.decisions_replayed += outcome.decisions as u64;
+        if let Some(slot) = self.slot_of(level) {
+            self.replayed_by_level[slot] += 1;
+            self.decisions_by_level[slot] += outcome.decisions as u64;
+        }
+    }
+
+    /// An outcome to replay for a key, if its kernel is mature (and the
+    /// exploration draw does not ask for the full simulation), counted.
+    pub fn replay(&mut self, key: &TransitKey, rng: &mut Rng) -> Option<TransitOutcome> {
+        if self.cfg.explore > 0.0 && rng.chance(self.cfg.explore) {
+            return None;
+        }
+        let coherence = if key.node.level < self.level() {
+            self.cfg.coarse_coherence
+        } else {
+            0.0
+        };
+        let outcome = self.sample(key, coherence, rng)?;
+        self.note_replay(&outcome, key.node.level);
         Some(outcome)
     }
 
@@ -1340,7 +1514,7 @@ impl Transits {
         (self.kernels.len(), mature)
     }
 
-    /// Nodes with at least one mature kernel.
+    /// Nodes (at any level) with at least one mature kernel.
     pub fn memoized_nodes(&self) -> usize {
         let mut nodes: Vec<QuadKey> = self
             .kernels
@@ -1353,10 +1527,10 @@ impl Transits {
         nodes.len()
     }
 
-    /// A short account of the kernels.
+    /// A short account of the kernels, level by level.
     pub fn report(&self) -> String {
         let (keys, mature) = self.maturity();
-        format!(
+        let mut out = format!(
             "{} keys, {} mature over {} nodes; {} transits recorded, {} replayed standing in for {} ticks and {} decisions",
             keys,
             mature,
@@ -1365,7 +1539,23 @@ impl Transits {
             self.replayed,
             self.ticks_replayed,
             self.decisions_replayed
-        )
+        );
+        if self.levels.len() > 1 {
+            let by_level: Vec<String> = self
+                .levels
+                .iter()
+                .enumerate()
+                .map(|(s, &l)| {
+                    format!(
+                        "level {}: {} replayed for {} decisions",
+                        l, self.replayed_by_level[s], self.decisions_by_level[s]
+                    )
+                })
+                .collect();
+            out.push_str("; ");
+            out.push_str(&by_level.join(", "));
+        }
+        out
     }
 }
 
@@ -1407,6 +1597,8 @@ mod transit_tests {
             entropy: 2.0,
             straight: 4.0,
             deposits: [0.0; Pheromone::COUNT],
+            via: [(0.0, 0.0); VIA],
+            via_len: 0,
         };
         for _ in 0..40 {
             k.push(leaving, 8, &mut rng);

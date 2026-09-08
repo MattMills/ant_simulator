@@ -13,7 +13,7 @@
 
 use crate::geometry::{Point, Position};
 use crate::landscape::{ring_heading, turn_magnitude, RING, RING_STEP};
-use crate::memo::{Transit, TransitRecord};
+use crate::memo::{Transit, TransitRecord, MAX_TRANSIT_LEVELS};
 use crate::pheromone::{perceived, Pheromone};
 use crate::rng::Rng;
 use crate::species::Species;
@@ -300,11 +300,20 @@ pub struct Ant {
     pub goal: Option<Position>,
     /// Recruitment excitation from contacts with successful foragers.
     pub excitement: f64,
-    /// The transit through a memo node being recorded, if any.
-    pub record: Option<TransitRecord>,
+    /// The transits being recorded through the memo's nodes, one slot
+    /// per level memoized, finest first.
+    pub records: [Option<TransitRecord>; MAX_TRANSIT_LEVELS],
     /// The transit being replayed, if any: the ant is inside a node and
     /// appears at its exit when the transit ends.
     pub transit: Option<Transit>,
+    /// The pipeline's hold on the heading: no decision before this tick.
+    pub hold_until: u64,
+    /// The pipeline's deadline: a decision by this tick at the latest.
+    pub deadline: u64,
+    /// Whether the frame's budget has been granted to this ant.
+    pub granted: bool,
+    /// The activity the hold was set under; a change of leg ends it.
+    pub hold_activity: Activity,
     /// Fractional movement credit (unused sub-cell movement).
     pub move_credit: f64,
     routes: HashMap<Position, Route>,
@@ -365,7 +374,11 @@ impl Ant {
             time_nursing: 0,
             goal: None,
             excitement: 0.0,
-            record: None,
+            records: [None; MAX_TRANSIT_LEVELS],
+            hold_until: 0,
+            deadline: 0,
+            granted: false,
+            hold_activity: Activity::Resting,
             transit: None,
             move_credit: 0.0,
             routes: HashMap::new(),
