@@ -477,7 +477,6 @@ pub fn run_two_sources_once(
             .expect("counter exists")
             .counter
             .rect
-            .clone()
     };
     let (ra, rb) = (rect_of("a"), rect_of("b"));
     let (fa0, fb0) = (sim.world().food_in(&ra), sim.world().food_in(&rb));

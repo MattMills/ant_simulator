@@ -92,6 +92,14 @@
 //!   would have been the same and schedules the rest against a frame
 //!   budget. `cargo bench -- shapes` measures larger and shaped arenas.
 //!
+//! * **The frame** ([`frame`]): surfaces joined along their edges on one
+//!   grid, as the net of a box unfolds: an outworld box with its corners
+//!   joined by portals and its walls sloping, a slab nest, tubes round
+//!   whose backs the two sides meet; each region standing somewhere in
+//!   space. An ant walking over a fold turns its frame and the vectors it
+//!   carries, the field flows through, and a trail is followed round a
+//!   corner, so a colony forages over a formicarium's surfaces.
+//!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
 //!   sweeps colony size and world area and fits the cost's exponents; and
@@ -173,6 +181,7 @@ pub mod arena;
 pub mod colony;
 pub mod entropy;
 pub mod experiments;
+pub mod frame;
 pub mod geometry;
 pub mod hierarchy;
 pub mod hive;
@@ -225,6 +234,7 @@ pub mod prelude {
     };
     pub use crate::experiments::{run_communal_nutrition, sugar_and_prey, NutritionOutcome};
     pub use crate::experiments::{run_thermal_tradeoff, ThermalOutcome};
+    pub use crate::frame::{Frame, Outworld, Region};
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,
@@ -261,7 +271,7 @@ pub mod prelude {
         SMOOTH_PARAM,
     };
     pub use crate::world::{
-        CapacityZone, Cell, Counter, CounterState, FoodSource, Nutrient, RandomFood, Rect, Terrain,
-        World, WorldConfig,
+        CapacityZone, Cell, Counter, CounterState, Edge, FoodSource, Nutrient, Portal, RandomFood,
+        Rect, Side, Slope, Terrain, Warp, World, WorldConfig,
     };
 }

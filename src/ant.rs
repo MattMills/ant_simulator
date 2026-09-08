@@ -479,6 +479,21 @@ impl Ant {
         self.home_vector.1 += (s * dx + c * dy) * scale;
     }
 
+    /// Turn the body's frame, as crossing a fold of the ground does (a
+    /// floor onto a wall, one face of a box onto the next): the vectors
+    /// the ant carries turn with it.
+    pub fn rotate_frame(&mut self, turn: f64) {
+        if turn == 0.0 {
+            return;
+        }
+        let (s, c) = turn.sin_cos();
+        let rotate = |v: (f64, f64)| (c * v.0 - s * v.1, s * v.0 + c * v.1);
+        self.home_vector = rotate(self.home_vector);
+        if let Some(site) = self.site.as_mut() {
+            site.vector = rotate(site.vector);
+        }
+    }
+
     /// Reset path integration at the nest.
     pub fn reset_home_vector(&mut self) {
         self.home_vector = (0.0, 0.0);

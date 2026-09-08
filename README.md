@@ -396,6 +396,7 @@ cargo run --release --example nest        [minutes]
 cargo run --release --example scale       [minutes]
 cargo run --release --example memo        [minutes] [categories]
 cargo run --release --example lens
+cargo run --release --example frame       [minutes]
 cargo bench                               [-- quick | phases | colony | shapes]
 ```
 
@@ -410,8 +411,10 @@ undertakers at work. `scale` runs the scale analysis: foraging
 organisation against colony size and the hive's memory against colony
 size and grain. `memo` extracts the behavioural memo and classifies the
 ground. `lens` draws the two-position tessellation of the quadtree and
-the geodesic over it. `cargo bench` runs the throughput scan (see
-below); `colony` selects its colony-scale rows, the memoized and
+the geodesic over it. `frame` builds a formicarium (a slab nest, a tube,
+an open box whose walls the ants climb to a shelf of food) and lets a
+colony forage over its surfaces. `cargo bench` runs the throughput scan
+(see below); `colony` selects its colony-scale rows, the memoized and
 pipelined colony against the full simulation, and `shapes` its larger
 and shaped arenas, the field's grain against the dense sweep.
 
@@ -722,6 +725,54 @@ of the transits' replays, and over eight seeds of a 400-worker hour it
 costs 2% of the deliveries; a budget of fifty decisions a frame for
 four hundred workers defers a further fifth of the steps within their
 slack for the same cost.
+
+## The frame: surfaces joined along their edges
+
+An ant walks on surfaces. Its degrees of freedom are a position and a
+heading on the surface it is on, and it walks over a fold onto the next
+surface (a floor onto a wall, a wall onto the next round a corner) and
+along a tube; an ant colony in a plastic frame lives on a set of such
+surfaces. The `Frame` lays them out flat on one grid, as the net of a
+box unfolds, so that everything above (the field on its two structures,
+the memo, the transits, the pipeline) runs on them unchanged. Where two
+surfaces meet in space but not on the net, a `Portal` joins their
+edges: what lies beyond one edge is the other's cells, a body crossing
+turns by the angle between the sides and turns the vectors it carries
+with it (its path integration and its remembered site, as an ant
+integrates in its body's frame over a fold), the field flows through in
+both sweeps, and perception's probes read through it, so a trail is
+followed round a corner. A `Slope` makes walking up a wall slower than
+along it. Every region carries its place in space, so a point of the
+net has a position and a height in three dimensions.
+
+`Frame::outworld` folds out an open box: a floor with four walls
+attached along its sides on the net and joined at the corners by
+portals, each wall a slope; `Frame::slab` lays a flat nest module;
+`Frame::tube` runs a strip whose two long sides are joined round the
+back and whose ends are portals to the edges it connects; `Frame::wall`
+cuts a hole. `cargo run --release --example frame` builds a slab nest
+joined by a 32-cm tube through a hole at the foot of the west wall of a
+56 × 40 cm box with 16-cm walls, with a pool on the floor and one on a
+shelf 9 cm up the east wall, and lets 150 workers forage for forty
+minutes with the memo, memoized transits and the pipeline on:
+
+```
+after 10 min: delivered 7, taken 20 µl from the floor pool and 16 µl from the shelf, 109 outside, mean height 6.5 cm
+after 20 min: delivered 26, taken 38 µl from the floor pool and 28 µl from the shelf, 121 outside, mean height 12.1 cm
+after 40 min: delivered 43, taken 45 µl from the floor pool and 30 µl from the shelf, 125 outside, mean height 13.2 cm
+ants per region: floor 3, north wall 32, east wall 17, south wall 34, west wall 26, slab 11, tube 2
+```
+
+The ants find the tube, come out on the floor, climb every wall and
+reach the shelf; the trail runs through the tube, across the floor and
+up the east wall, and the heaviest marking lies along the rims of the
+walls, where searching ants turned back by the edge of the net walk
+along it, as they do along the barrier of a real box. What is
+simplified: a surface is flat within a region and folds only at the
+edges the builder joins; there is no gravity beyond a slope's slowing,
+no falling and no lid; the lens does not see through portals (a route
+through one falls back to the straight line), and transits are not
+memoized in the nodes that hold one.
 
 ## Performance and scaling
 

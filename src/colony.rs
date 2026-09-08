@@ -3246,6 +3246,7 @@ impl Simulation {
                 speed *= self.species.trail_speed_factor;
             }
             speed *= (1.0 - self.species.crowding_slowdown * crowding).max(0.2);
+            speed *= self.world.climb_factor(here, a.heading);
             speed
         };
         self.ants[i].move_credit += speed;
@@ -3303,11 +3304,21 @@ impl Simulation {
             let a = &self.ants[i];
             (a.position, ring_heading(ring, a.heading))
         };
-        let to = from.advanced(heading, step);
+        let to_raw = from.advanced(heading, step);
+        // Through a portal the step comes out on the joined edge, and the
+        // body's frame turns with the fold.
+        let (to, turn) = if !self.world.is_passable(to_raw.cell()) {
+            match self.world.warp(to_raw) {
+                Some(warp) => (warp.point, warp.turn),
+                None => (to_raw, 0.0),
+            }
+        } else {
+            (to_raw, 0.0)
+        };
         let from_cell = from.cell();
         let to_cell = to.cell();
         if let Some(h) = &mut self.history {
-            h.record(from, to, turn_magnitude(ring) as f64 * RING_STEP);
+            h.record(from, to_raw, turn_magnitude(ring) as f64 * RING_STEP);
         }
         self.stats.path.record_move(ring, step);
         for &node in &self.leaf_paths[leaf] {
@@ -3350,8 +3361,12 @@ impl Simulation {
                 a.remember(from_cell);
             }
             a.trip_length += step;
-            let (dx, dy) = from.to(to);
+            let (dx, dy) = from.to(to_raw);
             a.integrate(dx, dy, species, &mut self.rng);
+            if turn != 0.0 {
+                a.heading = crate::geometry::wrap_angle(a.heading + turn);
+                a.rotate_frame(turn);
+            }
             let home = species.uses_home_pheromone && a.activity == Activity::Outbound;
             (a.laying, a.lay_strength, home, a.activity)
         };

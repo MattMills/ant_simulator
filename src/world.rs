@@ -198,7 +198,7 @@ impl FoodSource {
 }
 
 /// An inclusive axis-aligned rectangle of cells.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
     /// Top-left corner.
     pub min: Position,
@@ -279,6 +279,12 @@ pub struct WorldConfig {
     pub nest_radius: i32,
     /// Explicit food clusters.
     pub food_sources: Vec<FoodSource>,
+    /// Edges joined in pairs: faces of a box meeting at a corner, the two
+    /// sides of a tube. See [`Portal`].
+    pub portals: Vec<Portal>,
+    /// Regions that stand at an angle in space, where walking one way is
+    /// climbing. See [`Slope`].
+    pub slopes: Vec<Slope>,
     /// Randomly generated food clusters, in addition to `food_sources`.
     pub random_food: Option<RandomFood>,
     /// Wall rectangles.
@@ -354,6 +360,8 @@ impl Default for WorldConfig {
             }),
             walls: Vec::new(),
             open: Vec::new(),
+            portals: Vec::new(),
+            slopes: Vec::new(),
             counters: Vec::new(),
             cell_capacity: 8,
             kinetics_stride: 1,
@@ -368,6 +376,198 @@ impl Default for WorldConfig {
         }
     }
 }
+
+/// One of the four sides of a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    /// The top side (towards smaller `y`).
+    North,
+    /// The right side.
+    East,
+    /// The bottom side.
+    South,
+    /// The left side.
+    West,
+}
+
+impl Side {
+    /// Heading of the outward normal (`x` east, `y` south, clockwise
+    /// positive).
+    pub fn outward(self) -> f64 {
+        match self {
+            Side::North => -std::f64::consts::FRAC_PI_2,
+            Side::East => 0.0,
+            Side::South => std::f64::consts::FRAC_PI_2,
+            Side::West => std::f64::consts::PI,
+        }
+    }
+
+    /// The cell across this side, as an offset.
+    pub fn offset(self) -> (i32, i32) {
+        match self {
+            Side::North => (0, -1),
+            Side::East => (1, 0),
+            Side::South => (0, 1),
+            Side::West => (-1, 0),
+        }
+    }
+}
+
+/// A straight run of cells with one side open: the boundary a portal
+/// joins. The run goes from `start` to `end` (inclusive) along the side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Edge {
+    /// The first cell of the run.
+    pub start: Position,
+    /// The last cell of the run.
+    pub end: Position,
+    /// The side of the cells that opens.
+    pub side: Side,
+}
+
+impl Edge {
+    /// The run's cells, from `start` to `end`.
+    pub fn cells(&self) -> Vec<Position> {
+        let n = self.len() as i32;
+        let (dx, dy) = match self.side {
+            Side::North | Side::South => ((self.end.x - self.start.x).signum(), 0),
+            Side::East | Side::West => (0, (self.end.y - self.start.y).signum()),
+        };
+        (0..n)
+            .map(|i| Position::new(self.start.x + dx * i, self.start.y + dy * i))
+            .collect()
+    }
+
+    /// Cells in the run.
+    pub fn len(&self) -> usize {
+        match self.side {
+            Side::North | Side::South => (self.end.x - self.start.x).unsigned_abs() as usize + 1,
+            Side::East | Side::West => (self.end.y - self.start.y).unsigned_abs() as usize + 1,
+        }
+    }
+
+    /// Whether the run is empty (it never is).
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Where a point lies relative to the edge: `along` the run from the
+    /// start cell's near corner, and `depth` beyond the open side
+    /// (negative inside the cells).
+    fn coords(&self, p: Point) -> (f64, f64) {
+        let (sx, sy) = (self.start.x as f64, self.start.y as f64);
+        match self.side {
+            Side::North | Side::South => {
+                let along = if self.end.x >= self.start.x {
+                    p.x - sx
+                } else {
+                    sx + 1.0 - p.x
+                };
+                let depth = if self.side == Side::North {
+                    sy - p.y
+                } else {
+                    p.y - (sy + 1.0)
+                };
+                (along, depth)
+            }
+            Side::East | Side::West => {
+                let along = if self.end.y >= self.start.y {
+                    p.y - sy
+                } else {
+                    sy + 1.0 - p.y
+                };
+                let depth = if self.side == Side::East {
+                    p.x - (sx + 1.0)
+                } else {
+                    sx - p.x
+                };
+                (along, depth)
+            }
+        }
+    }
+
+    /// The point `along` the run and `depth` into the cells from the
+    /// open side.
+    fn point_inside(&self, along: f64, depth: f64) -> Point {
+        let (sx, sy) = (self.start.x as f64, self.start.y as f64);
+        match self.side {
+            Side::North | Side::South => {
+                let x = if self.end.x >= self.start.x {
+                    sx + along
+                } else {
+                    sx + 1.0 - along
+                };
+                let y = if self.side == Side::North {
+                    sy + depth
+                } else {
+                    sy + 1.0 - depth
+                };
+                Point::new(x, y)
+            }
+            Side::East | Side::West => {
+                let y = if self.end.y >= self.start.y {
+                    sy + along
+                } else {
+                    sy + 1.0 - along
+                };
+                let x = if self.side == Side::East {
+                    sx + 1.0 - depth
+                } else {
+                    sx + depth
+                };
+                Point::new(x, y)
+            }
+        }
+    }
+}
+
+/// Two edges of the same length joined: what lies beyond the open side
+/// of one is the cells of the other, as two faces of a box meet at a
+/// corner or a tube's two sides meet round its back. A body crossing
+/// turns by the angle between the sides, the field flows through, and
+/// the cells beyond either edge must be wall or off the grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Portal {
+    /// One edge.
+    pub a: Edge,
+    /// The other, its cells matched to `a`'s in order.
+    pub b: Edge,
+}
+
+impl Portal {
+    /// The turn a body makes crossing from `a` into `b`.
+    pub fn turn(&self) -> f64 {
+        crate::geometry::wrap_angle(
+            self.b.side.outward() + std::f64::consts::PI - self.a.side.outward(),
+        )
+    }
+}
+
+/// A region of the net that stands at an angle in space: walking
+/// towards `up` is climbing, and is slower by `factor` (1 for no
+/// slope, 0.5 for half speed straight up).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Slope {
+    /// The region.
+    pub rect: Rect,
+    /// The direction of the net that points up in space.
+    pub up: Side,
+    /// Speed factor straight up.
+    pub factor: f64,
+}
+
+/// Where a point beyond a portal's edge comes out, and the turn made.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Warp {
+    /// The point on the other side.
+    pub point: Point,
+    /// The turn a heading makes, radians.
+    pub turn: f64,
+}
+
+/// How far beyond an edge a point may lie and still come through its
+/// portal, cells.
+const PORTAL_DEPTH: i32 = 4;
 
 /// A counter's running total.
 #[derive(Clone, Debug, PartialEq)]
@@ -814,6 +1014,16 @@ pub struct World {
     grain: Option<Grain>,
     /// Wall cells per node of the world's quadtree, when there are any.
     wall_tree: Option<QuadTree<u32>>,
+    /// The cell beyond each portal edge, at every depth, to the portals
+    /// and edges (0 for `a`, 1 for `b`) it lies beyond; at a corner two
+    /// edges' reaches overlap, and the nearer edge takes a point.
+    portal_index: std::collections::HashMap<Position, Vec<(u16, u8)>>,
+    /// The cells paired through portals, by index.
+    portal_pairs: Vec<(usize, usize)>,
+    /// The cells that have a portal on a side.
+    portal_cells: std::collections::HashSet<Position>,
+    /// Per cell, the slope it lies on (`u8::MAX` for none).
+    slope_of: Vec<u8>,
     /// Whether any cell carries the channel (empty channels are skipped
     /// by the kinetics and by perception).
     present: [bool; Pheromone::COUNT],
@@ -870,6 +1080,10 @@ impl World {
             scratch: vec![[0.0; Pheromone::COUNT]; n],
             grain: None,
             wall_tree: None,
+            portal_index: std::collections::HashMap::new(),
+            portal_pairs: Vec::new(),
+            portal_cells: std::collections::HashSet::new(),
+            slope_of: Vec::new(),
             present: [false; Pheromone::COUNT],
             has_walls: false,
             kinetics_calls: 0,
@@ -952,8 +1166,111 @@ impl World {
                 }
             }
         }
+        world.lay_portals_and_slopes();
         world.grain = Grain::build(&world.config, &world.cells, &world.params);
         world
+    }
+
+    /// Index the portals' edges and the slopes' cells.
+    fn lay_portals_and_slopes(&mut self) {
+        let portals = self.config.portals.clone();
+        for (i, portal) in portals.iter().enumerate() {
+            assert_eq!(
+                portal.a.len(),
+                portal.b.len(),
+                "a portal joins two edges of the same length"
+            );
+            let (ca, cb) = (portal.a.cells(), portal.b.cells());
+            for (edge, cells, which) in [(&portal.a, &ca, 0u8), (&portal.b, &cb, 1u8)] {
+                let (dx, dy) = edge.side.offset();
+                for &c in cells {
+                    self.portal_cells.insert(c);
+                    for depth in 1..=PORTAL_DEPTH {
+                        let beyond = Position::new(c.x + dx * depth, c.y + dy * depth);
+                        let entry = self.portal_index.entry(beyond).or_default();
+                        if !entry.contains(&(i as u16, which)) {
+                            entry.push((i as u16, which));
+                        }
+                    }
+                }
+            }
+            for (&pa, &pb) in ca.iter().zip(&cb) {
+                if let (Some(ia), Some(ib)) = (self.index(pa), self.index(pb)) {
+                    self.portal_pairs.push((ia, ib));
+                }
+            }
+        }
+        let n = self.cells.len();
+        self.slope_of = vec![u8::MAX; n];
+        let slopes = self.config.slopes.clone();
+        for (i, s) in slopes.iter().enumerate().take(u8::MAX as usize) {
+            let (w, h) = (self.config.width as i32, self.config.height as i32);
+            for y in s.rect.min.y.max(0)..=s.rect.max.y.min(h - 1) {
+                for x in s.rect.min.x.max(0)..=s.rect.max.x.min(w - 1) {
+                    self.slope_of[y as usize * self.config.width + x as usize] = i as u8;
+                }
+            }
+        }
+    }
+
+    /// Where a point beyond a portal's edge comes out on the other side,
+    /// and the turn made, if it lies within reach of one.
+    pub fn warp(&self, p: Point) -> Option<Warp> {
+        let candidates = self.portal_index.get(&p.cell())?;
+        let mut best: Option<(f64, Warp)> = None;
+        for &(i, which) in candidates {
+            let portal = &self.config.portals[i as usize];
+            let (from, to) = if which == 0 {
+                (&portal.a, &portal.b)
+            } else {
+                (&portal.b, &portal.a)
+            };
+            let (along, depth) = from.coords(p);
+            if along < 0.0
+                || along >= from.len() as f64
+                || depth <= 0.0
+                || depth > PORTAL_DEPTH as f64
+            {
+                continue;
+            }
+            if best.map(|(d, _)| depth < d).unwrap_or(true) {
+                let turn = crate::geometry::wrap_angle(
+                    to.side.outward() + std::f64::consts::PI - from.side.outward(),
+                );
+                best = Some((
+                    depth,
+                    Warp {
+                        point: to.point_inside(along, depth),
+                        turn,
+                    },
+                ));
+            }
+        }
+        best.map(|(_, w)| w)
+    }
+
+    /// Whether a cell has a portal on one of its sides.
+    pub fn has_portal(&self, p: Position) -> bool {
+        self.portal_cells.contains(&p)
+    }
+
+    /// Speed factor for walking from a cell on a heading: less than one
+    /// when climbing a slope, one on the flat or downhill.
+    pub fn climb_factor(&self, p: Position, heading: f64) -> f64 {
+        let Some(idx) = self.index(p) else {
+            return 1.0;
+        };
+        let s = self.slope_of[idx];
+        if s == u8::MAX {
+            return 1.0;
+        }
+        let slope = &self.config.slopes[s as usize];
+        let up = (heading - slope.up.outward()).cos();
+        if up > 0.0 {
+            1.0 - (1.0 - slope.factor.clamp(0.0, 1.0)) * up
+        } else {
+            1.0
+        }
     }
 
     /// The landmarks of this world.
@@ -1291,6 +1608,11 @@ impl World {
     /// Whether an ant may stand at a continuous point.
     pub fn is_passable_point(&self, p: Point) -> bool {
         self.is_passable(p.cell())
+            || (!self.portal_index.is_empty()
+                && self
+                    .warp(p)
+                    .map(|w| self.is_passable(w.point.cell()))
+                    .unwrap_or(false))
     }
 
     /// Probe along a ray from `from` in direction `heading` for up to
@@ -1432,6 +1754,18 @@ impl World {
             Some(idx) if self.cells[idx].terrain != Terrain::Wall => {
                 self.read(idx, cell, kind.index())
             }
+            _ if !self.portal_index.is_empty() => match self.warp(p) {
+                Some(w) => {
+                    let cell = w.point.cell();
+                    match self.index(cell) {
+                        Some(idx) if self.cells[idx].terrain != Terrain::Wall => {
+                            self.read(idx, cell, kind.index())
+                        }
+                        _ => 0.0,
+                    }
+                }
+                None => 0.0,
+            },
             _ => 0.0,
         }
     }
@@ -1644,6 +1978,20 @@ impl World {
                 }
             }
         }
+        // Through the portals: the share that stayed at a blocked side
+        // crosses to the cell joined to it.
+        for &(a, b) in &self.portal_pairs {
+            for &k in &active {
+                let d = diffusion[k];
+                if d <= 0.0 {
+                    continue;
+                }
+                let sa = self.cells[a].pheromone[k] * retention[k] * d / 4.0;
+                let sb = self.cells[b].pheromone[k] * retention[k] * d / 4.0;
+                self.scratch[a][k] += sb - sa;
+                self.scratch[b][k] += sa - sb;
+            }
+        }
         let mut present = [false; Pheromone::COUNT];
         for (cell, s) in self.cells.iter_mut().zip(self.scratch.iter()) {
             for &k in &active {
@@ -1834,6 +2182,40 @@ impl World {
                         }
                     }
                     g.pool[node] = pool;
+                }
+            }
+            // Through the portals: the share that stayed at a blocked
+            // side crosses to the cell joined to it, cell to cell, cell
+            // to pool or pool to cell as the nodes are.
+            if d > 0.0 {
+                for &(a, b) in &self.portal_pairs {
+                    let (na, nb) = (g.node_of(a % w, a / w), g.node_of(b % w, b / w));
+                    for (from, to, nf, nt) in [(a, b, na, nb), (b, a, nb, na)] {
+                        let value = if g.active[nf][k] {
+                            self.cells[from].pheromone[k]
+                        } else {
+                            g.mean[nf][k]
+                        };
+                        let share = value * r * d / 4.0;
+                        if share <= 0.0 {
+                            continue;
+                        }
+                        if g.active[nf][k] {
+                            self.scratch[from][k] -= share;
+                        } else {
+                            let anchor = g.anchor[nf][k] as usize;
+                            g.pool[anchor] -= share;
+                        }
+                        if g.active[nt][k] {
+                            self.scratch[to][k] += share;
+                        } else {
+                            let anchor = g.anchor[nt][k] as usize;
+                            g.inflow[anchor] += share;
+                            if value >= threshold {
+                                g.touched[nt] = true;
+                            }
+                        }
+                    }
                 }
             }
             for node in 0..nodes {
@@ -2654,6 +3036,151 @@ mod tests {
         assert!(world.level(Position::new(52, 32), Pheromone::Trail) > 0.0);
         assert!(world.level(Position::new(12, 32), Pheromone::Trail) > 0.0);
         assert!(world.active_share(Pheromone::Trail) < 1.0);
+    }
+
+    #[test]
+    fn portals_join_edges_turn_bodies_and_carry_the_field() {
+        use std::f64::consts::FRAC_PI_2;
+        let make = |open: Vec<Rect>, portal: Portal, grain: usize| {
+            World::new(
+                WorldConfig {
+                    width: 40,
+                    height: 40,
+                    nest: Position::new(4, 8),
+                    nest_radius: 1,
+                    random_food: None,
+                    open,
+                    portals: vec![portal],
+                    kinetics_grain: grain,
+                    pheromones: Some({
+                        let mut set = Species::lasius_niger().pheromones();
+                        set[Pheromone::Trail.index()].half_life_s = f64::INFINITY;
+                        set[Pheromone::Trail.index()].diffusion_per_s = 0.2;
+                        set
+                    }),
+                    ..WorldConfig::default()
+                },
+                &mut Rng::seed_from_u64(1),
+            )
+        };
+        // Two regions with twelve cells of wall between, joined straight
+        // across.
+        let straight = Portal {
+            a: Edge {
+                start: Position::new(15, 0),
+                end: Position::new(15, 39),
+                side: Side::East,
+            },
+            b: Edge {
+                start: Position::new(28, 0),
+                end: Position::new(28, 39),
+                side: Side::West,
+            },
+        };
+        let two = vec![
+            Rect::new(Position::new(0, 0), Position::new(15, 39)),
+            Rect::new(Position::new(28, 0), Position::new(39, 39)),
+        ];
+        let world = make(two.clone(), straight, 0);
+        let w = world.warp(Point::new(16.3, 5.5)).expect("through");
+        assert!((w.point.x - 28.3).abs() < 1e-9 && (w.point.y - 5.5).abs() < 1e-9);
+        assert!(w.turn.abs() < 1e-9, "no turn straight across");
+        let back = world.warp(Point::new(27.7, 5.5)).expect("and back");
+        assert!((back.point.x - 15.7).abs() < 1e-9 && back.turn.abs() < 1e-9);
+        assert!(
+            world.is_passable_point(Point::new(16.3, 5.5)),
+            "the way through"
+        );
+        assert!(
+            !world.is_passable_point(Point::new(22.0, 5.5)),
+            "not the wall beyond the portal's reach"
+        );
+        assert!(world.warp(Point::new(16.3, 45.0)).is_none(), "off the run");
+        assert!(world.has_portal(Position::new(15, 7)) && !world.has_portal(Position::new(14, 7)));
+        // The field flows through, on either sweep, and never into the wall.
+        for grain in [0, 8] {
+            let mut world = make(two.clone(), straight, grain);
+            world.deposit(Position::new(12, 20), Pheromone::Trail, 40.0);
+            for _ in 0..300 {
+                world.step_pheromones();
+            }
+            let total = world.total_pheromone(Pheromone::Trail);
+            // Within a hundredth: the dense sweep drops a trace below a
+            // millionth of a unit, and the front spreads over many cells.
+            assert!(
+                (total - 40.0).abs() < 1e-2,
+                "conserved through the portal: {total}"
+            );
+            let far = world.pheromone_in(
+                &Rect::new(Position::new(28, 0), Position::new(39, 39)),
+                Pheromone::Trail,
+            );
+            assert!(far > 1.0, "the far region receives (grain {grain}): {far}");
+            assert_eq!(world.level(Position::new(22, 20), Pheromone::Trail), 0.0);
+        }
+        // Round a corner: the first region's east edge meets the second's
+        // north edge, a quarter turn clockwise on the way through.
+        let corner = Portal {
+            a: Edge {
+                start: Position::new(15, 0),
+                end: Position::new(15, 15),
+                side: Side::East,
+            },
+            b: Edge {
+                start: Position::new(24, 30),
+                end: Position::new(39, 30),
+                side: Side::North,
+            },
+        };
+        assert!((corner.turn() - FRAC_PI_2).abs() < 1e-9);
+        let world = make(
+            vec![
+                Rect::new(Position::new(0, 0), Position::new(15, 15)),
+                Rect::new(Position::new(24, 30), Position::new(39, 39)),
+            ],
+            corner,
+            0,
+        );
+        let w = world.warp(Point::new(16.5, 3.0)).expect("round the corner");
+        assert!((w.point.x - 27.0).abs() < 1e-9 && (w.point.y - 30.5).abs() < 1e-9);
+        assert!(
+            (w.turn - FRAC_PI_2).abs() < 1e-9,
+            "a quarter turn: {}",
+            w.turn
+        );
+        let back = world.warp(Point::new(27.0, 29.5)).expect("and back");
+        assert!((back.point.x - 15.5).abs() < 1e-9 && (back.point.y - 3.0).abs() < 1e-9);
+        assert!((back.turn + FRAC_PI_2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slopes_slow_climbing() {
+        use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+        let cfg = WorldConfig {
+            slopes: vec![Slope {
+                rect: Rect::new(Position::new(0, 0), Position::new(11, 4)),
+                up: Side::North,
+                factor: 0.5,
+            }],
+            ..small_config()
+        };
+        let world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        let p = Position::new(3, 2);
+        assert!(
+            (world.climb_factor(p, -FRAC_PI_2) - 0.5).abs() < 1e-9,
+            "straight up"
+        );
+        assert!(
+            (world.climb_factor(p, FRAC_PI_2) - 1.0).abs() < 1e-9,
+            "down is free"
+        );
+        assert!(
+            (world.climb_factor(p, 0.0) - 1.0).abs() < 1e-9,
+            "along the level"
+        );
+        let diagonal = 1.0 - 0.5 * FRAC_PI_4.cos();
+        assert!((world.climb_factor(p, -FRAC_PI_4) - diagonal).abs() < 1e-9);
+        assert!((world.climb_factor(Position::new(3, 8), -FRAC_PI_2) - 1.0).abs() < 1e-9);
     }
 
     #[test]

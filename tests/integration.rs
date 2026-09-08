@@ -521,3 +521,164 @@ fn the_pipeline_holds_decisions_on_invariant_ground_and_defers_them_to_the_budge
     assert!(b.frames.deferred > 0, "the budget binds");
     assert!(b.frames.held_share() > s.frames.held_share());
 }
+
+#[test]
+fn ants_forage_through_portals() {
+    // Two regions joined only by a portal, the food in the far one:
+    // straight across, then round a corner with a quarter turn.
+    let straight = Portal {
+        a: Edge {
+            start: Position::new(15, 0),
+            end: Position::new(15, 39),
+            side: Side::East,
+        },
+        b: Edge {
+            start: Position::new(24, 0),
+            end: Position::new(24, 39),
+            side: Side::West,
+        },
+    };
+    let corner = Portal {
+        a: Edge {
+            start: Position::new(15, 0),
+            end: Position::new(15, 15),
+            side: Side::East,
+        },
+        b: Edge {
+            start: Position::new(24, 30),
+            end: Position::new(39, 30),
+            side: Side::North,
+        },
+    };
+    let cases = [
+        (
+            "straight",
+            vec![
+                Rect::new(Position::new(0, 0), Position::new(15, 39)),
+                Rect::new(Position::new(24, 0), Position::new(39, 39)),
+            ],
+            straight,
+            Position::new(6, 20),
+            Position::new(35, 20),
+        ),
+        (
+            "corner",
+            vec![
+                Rect::new(Position::new(0, 0), Position::new(15, 15)),
+                Rect::new(Position::new(24, 30), Position::new(39, 39)),
+            ],
+            corner,
+            Position::new(6, 8),
+            Position::new(36, 35),
+        ),
+    ];
+    for (name, open, portal, nest, food) in cases {
+        let mut cfg = SimConfig::default();
+        cfg.nest.initial_satiation = 0.05;
+        cfg.ants = 60;
+        cfg.world = WorldConfig {
+            width: 40,
+            height: 40,
+            nest,
+            nest_radius: 2,
+            random_food: None,
+            food_sources: vec![FoodSource::pool(food, 1, 30.0, 1.0)],
+            open,
+            portals: vec![portal],
+            ..WorldConfig::default()
+        };
+        let mut sim = Simulation::new(cfg, 3);
+        sim.run_seconds(30.0 * 60.0);
+        let s = sim.stats();
+        assert!(s.food_delivered > 0, "{name}: nothing came through: {s:?}");
+        let far = Rect::new(Position::new(24, 0), Position::new(39, 39));
+        assert!(
+            sim.world().pheromone_in(&far, Pheromone::Trail) > 0.0,
+            "{name}: no trail beyond the portal"
+        );
+        let outside = sim.living().filter(|a| !a.is_inside()).count();
+        assert!(outside > 0);
+    }
+}
+
+#[test]
+fn ants_forage_up_a_wall_and_through_a_tube() {
+    // A slab nest joined by a tube through a hole in the wall of an open
+    // box; food on the floor of the box and on a shelf up its far wall.
+    let mut frame = Frame::new(96, 64, 2.0);
+    frame.outworld(48, 20, 28, 20, 8, [56.0, 0.0, 0.0], 0.6);
+    frame.slab("slab", 4, 22, 20, 12, [0.0, 4.0, 0.0]);
+    frame.nest(Position::new(10, 28), 2);
+    frame.wall(Rect::new(Position::new(44, 30), Position::new(47, 33)));
+    frame.tube(
+        "tube",
+        28,
+        46,
+        16,
+        4,
+        Edge {
+            start: Position::new(23, 30),
+            end: Position::new(23, 33),
+            side: Side::East,
+        },
+        Edge {
+            start: Position::new(48, 30),
+            end: Position::new(48, 33),
+            side: Side::West,
+        },
+        [40.0, 60.0, 0.0],
+        [1.0, 0.0, 0.0],
+    );
+    let on_wall = Position::new(80, 30);
+    let mut world = frame.config();
+    world.food_sources = vec![FoodSource::pool(on_wall, 1, 40.0, 1.0)];
+    let mut cfg = SimConfig {
+        world,
+        ants: 150,
+        ..SimConfig::default()
+    };
+    cfg.nest.initial_satiation = 0.05;
+    cfg.memo = Some(MemoConfig {
+        transits: Some(TransitConfig::default()),
+        ..MemoConfig::default()
+    });
+    cfg.history = Some(HistoryConfig::default());
+    cfg.pipeline = Some(PipelineConfig::default());
+    let mut sim = Simulation::new(cfg, 7);
+    sim.run_seconds(40.0 * 60.0);
+    let s = sim.stats();
+    let world = sim.world();
+    let left = world.food_in(&Rect::new(on_wall.offset(-1, -1), on_wall.offset(1, 1)));
+    assert!(left < 360.0, "the shelf was reached: {left} µl left of 360");
+    assert!(s.food_delivered > 0, "and brought home: {s:?}");
+    // The way runs over every surface between: trail in the tube, on the
+    // floor and up the east wall.
+    for (name, rect) in [
+        (
+            "tube",
+            Rect::new(Position::new(28, 46), Position::new(43, 49)),
+        ),
+        (
+            "floor",
+            Rect::new(Position::new(48, 20), Position::new(75, 39)),
+        ),
+        (
+            "east wall",
+            Rect::new(Position::new(76, 20), Position::new(83, 39)),
+        ),
+    ] {
+        assert!(
+            world.pheromone_in(&rect, Pheromone::Trail) > 0.0,
+            "no trail on the {name}"
+        );
+    }
+    // Ants stand at every height, none in the wall or off the net.
+    for a in sim.living().filter(|a| !a.is_inside()) {
+        assert!(
+            world.is_passable(a.cell()),
+            "an ant in a wall at {:?}",
+            a.position
+        );
+        assert!(frame.height(a.position).is_some());
+    }
+}
