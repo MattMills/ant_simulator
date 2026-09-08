@@ -111,6 +111,25 @@ fn main() {
         100.0 * s.majority
     );
 
+    println!("\n== foraging effort against the productivity of a dripping source (Mailleux et al. 2003) ==");
+    for o in run_productivity_response(
+        &Species::lasius_niger(),
+        60,
+        &[0.02, 0.1, 0.5, 2.0, 10.0],
+        seconds,
+        1,
+    ) {
+        println!(
+            "   flow {:>5.2} µl/min: {:>4.1} ants at the source, {:.0}% of ant-time outside, {:>3} loads, mean load {:.2} µl, {:.0}% of returns recruit",
+            o.flow_ul_per_min,
+            o.at_source,
+            100.0 * o.foraging_fraction,
+            o.delivered,
+            o.mean_load_ul,
+            100.0 * o.recruiting_fraction
+        );
+    }
+
     println!("\n== foraging activity against colony satiation (Mailleux et al. 2003) ==");
     for o in run_hunger_response(
         &Species::lasius_niger(),

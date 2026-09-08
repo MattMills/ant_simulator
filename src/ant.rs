@@ -193,6 +193,8 @@ pub struct Ant {
     pub load_molarity: f64,
     /// Quality (0..1) of the food carried or last collected.
     pub load_quality: f64,
+    /// How full the crop was on leaving the source (0..1).
+    pub load_fill: f64,
     /// Seconds of reserve before starvation.
     pub energy: f64,
     /// Ticks lived.
@@ -223,6 +225,8 @@ pub struct Ant {
     pub trip_length: f64,
     /// Ticks spent in the current search.
     pub search_steps: u32,
+    /// Ticks spent waiting at a source that offered nothing.
+    pub feed_wait: u32,
     /// Completed food deliveries.
     pub deliveries: u32,
     /// Outbound trips that ended without food.
@@ -261,6 +265,7 @@ impl Ant {
             crop_ul: 0.0,
             load_molarity: 0.0,
             load_quality: 0.0,
+            load_fill: 0.0,
             energy,
             age: 0,
             alive: true,
@@ -276,6 +281,7 @@ impl Ant {
             steps_since_food: u32::MAX / 2,
             trip_length: 0.0,
             search_steps: 0,
+            feed_wait: 0,
             deliveries: 0,
             failed_trips: 0,
             pickup: None,
@@ -731,12 +737,7 @@ mod tests {
             height: 10,
             nest: Position::new(5, 5),
             nest_radius: 0,
-            food_sources: vec![FoodSource {
-                center: Position::new(2, 2),
-                radius: 0,
-                volume_ul_per_cell: 3.0,
-                molarity: 1.0,
-            }],
+            food_sources: vec![FoodSource::pool(Position::new(2, 2), 0, 3.0, 1.0)],
             random_food: None,
             ..WorldConfig::default()
         };

@@ -39,6 +39,11 @@ pub struct Cell {
     pub food_ul: f64,
     /// Sucrose molarity of that solution.
     pub molarity: f64,
+    /// Standing volume a renewing source refills to, microlitres.
+    pub food_capacity_ul: f64,
+    /// Renewal rate of the solution here (a drop fed by a syringe, an
+    /// aphid colony), microlitres per second; zero for a fixed pool.
+    pub renewal_ul_per_s: f64,
     /// Concentration of every pheromone channel, indexed by
     /// [`Pheromone::index`].
     pub pheromone: [f64; Pheromone::COUNT],
@@ -90,6 +95,28 @@ pub struct FoodSource {
     pub volume_ul_per_cell: f64,
     /// Sucrose molarity of the solution.
     pub molarity: f64,
+    /// Rate at which each cell refills towards its placed volume,
+    /// microlitres per second (zero: a fixed pool).
+    pub renewal_ul_per_s: f64,
+}
+
+impl FoodSource {
+    /// A fixed pool of solution.
+    pub fn pool(center: Position, radius: i32, volume_ul_per_cell: f64, molarity: f64) -> Self {
+        FoodSource {
+            center,
+            radius,
+            volume_ul_per_cell,
+            molarity,
+            renewal_ul_per_s: 0.0,
+        }
+    }
+
+    /// The same source refilling at `renewal_ul_per_s` per cell.
+    pub fn renewing(mut self, renewal_ul_per_s: f64) -> Self {
+        self.renewal_ul_per_s = renewal_ul_per_s.max(0.0);
+        self
+    }
 }
 
 /// An inclusive axis-aligned rectangle of cells.
@@ -139,6 +166,8 @@ pub struct RandomFood {
     pub min_distance_from_nest: i32,
     /// Molarity range the clusters are drawn from.
     pub molarity: (f64, f64),
+    /// Renewal rate of every cluster cell, microlitres per second.
+    pub renewal_ul_per_s: f64,
 }
 
 /// A region whose crossings are counted (the "bridge counters" of the
@@ -207,6 +236,7 @@ impl Default for WorldConfig {
                 volume_ul_per_cell: 20.0,
                 min_distance_from_nest: 12,
                 molarity: (0.4, 1.0),
+                renewal_ul_per_s: 0.0,
             }),
             walls: Vec::new(),
             open: Vec::new(),
@@ -359,8 +389,20 @@ impl World {
                                 / total;
                         }
                         c.food_ul = total;
+                        c.food_capacity_ul = c.food_capacity_ul.max(total);
+                        c.renewal_ul_per_s = c.renewal_ul_per_s.max(src.renewal_ul_per_s);
                     }
                 }
+            }
+        }
+    }
+
+    /// Refill renewing sources by one tick.
+    pub fn step_food(&mut self) {
+        let tick_s = self.config.tick_s;
+        for c in self.cells.iter_mut() {
+            if c.renewal_ul_per_s > 0.0 && c.food_ul < c.food_capacity_ul {
+                c.food_ul = (c.food_ul + c.renewal_ul_per_s * tick_s).min(c.food_capacity_ul);
             }
         }
     }
@@ -390,6 +432,7 @@ impl World {
                     radius: r,
                     volume_ul_per_cell: random.volume_ul_per_cell,
                     molarity,
+                    renewal_ul_per_s: random.renewal_ul_per_s,
                 });
                 break;
             }
@@ -760,6 +803,20 @@ impl World {
         total
     }
 
+    /// Number of ants on the grid inside a rectangle.
+    pub fn occupancy_in(&self, rect: &Rect) -> u32 {
+        let mut total = 0u32;
+        for y in rect.min.y..=rect.max.y {
+            for x in rect.min.x..=rect.max.x {
+                total += self
+                    .cell(Position::new(x, y))
+                    .map(|c| c.occupancy as u32)
+                    .unwrap_or(0);
+            }
+        }
+        total
+    }
+
     /// Total amount of one channel over the grid.
     pub fn total_pheromone(&self, kind: Pheromone) -> f64 {
         self.cells.iter().map(|c| c.level(kind)).sum()
@@ -787,12 +844,7 @@ mod tests {
             height: 10,
             nest: Position::new(6, 5),
             nest_radius: 1,
-            food_sources: vec![FoodSource {
-                center: Position::new(1, 1),
-                radius: 1,
-                volume_ul_per_cell: 5.0,
-                molarity: 0.7,
-            }],
+            food_sources: vec![FoodSource::pool(Position::new(1, 1), 1, 5.0, 0.7)],
             random_food: None,
             walls: vec![Rect::new(Position::new(9, 0), Position::new(9, 9))],
             ..WorldConfig::default()
@@ -822,18 +874,8 @@ mod tests {
         assert!((rest - 3.0).abs() < 1e-12);
         assert_eq!(world.take_food(Position::new(1, 1), 1.0), (0.0, 0.0));
         assert!(!world.cell(Position::new(1, 1)).unwrap().has_food());
-        world.place_food(&FoodSource {
-            center: Position::new(1, 1),
-            radius: 0,
-            volume_ul_per_cell: 2.0,
-            molarity: 0.1,
-        });
-        world.place_food(&FoodSource {
-            center: Position::new(1, 1),
-            radius: 0,
-            volume_ul_per_cell: 2.0,
-            molarity: 0.5,
-        });
+        world.place_food(&FoodSource::pool(Position::new(1, 1), 0, 2.0, 0.1));
+        world.place_food(&FoodSource::pool(Position::new(1, 1), 0, 2.0, 0.5));
         let c = world.cell(Position::new(1, 1)).unwrap();
         assert!((c.food_ul - 4.0).abs() < 1e-12 && (c.molarity - 0.3).abs() < 1e-12);
     }
@@ -1005,6 +1047,36 @@ mod tests {
         world.step_pheromones();
         assert_eq!(world.level(Position::new(9, 4), Pheromone::Trail), 0.0);
         assert!(world.level(Position::new(7, 4), Pheromone::Trail) > 0.0);
+    }
+
+    #[test]
+    fn renewing_sources_refill_to_their_standing_volume() {
+        let cfg = WorldConfig {
+            food_sources: vec![
+                FoodSource::pool(Position::new(1, 1), 0, 0.5, 1.0).renewing(0.1),
+                FoodSource::pool(Position::new(0, 0), 0, 5.0, 1.0),
+            ],
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        let c = Position::new(1, 1);
+        assert_eq!(world.cell(c).unwrap().food_capacity_ul, 0.5);
+        let (taken, _) = world.take_food(c, 0.4);
+        assert!((taken - 0.4).abs() < 1e-12);
+        world.step_food();
+        assert!((world.cell(c).unwrap().food_ul - 0.2).abs() < 1e-12);
+        for _ in 0..10 {
+            world.step_food();
+        }
+        assert!(
+            (world.cell(c).unwrap().food_ul - 0.5).abs() < 1e-12,
+            "capped at the standing volume"
+        );
+        // A plain pool does not refill.
+        let (taken, _) = world.take_food(Position::new(0, 0), 5.0);
+        assert!((taken - 5.0).abs() < 1e-12);
+        world.step_food();
+        assert!(!world.cell(Position::new(0, 0)).unwrap().has_food());
     }
 
     #[test]

@@ -112,12 +112,12 @@ pub fn double_bridge(spec: &BridgeSpec) -> WorldConfig {
         height,
         nest,
         nest_radius: 1,
-        food_sources: vec![FoodSource {
-            center: Position::new(x_food + 1, y_mid),
-            radius: 1,
-            volume_ul_per_cell: 1.0e6,
-            molarity: 1.0,
-        }],
+        food_sources: vec![FoodSource::pool(
+            Position::new(x_food + 1, y_mid),
+            1,
+            1.0e6,
+            1.0,
+        )],
         random_food: None,
         walls: Vec::new(),
         open,
@@ -391,18 +391,18 @@ pub fn two_sources(distance: i32, molarity_a: f64, molarity_b: f64) -> WorldConf
         nest,
         nest_radius: 1,
         food_sources: vec![
-            FoodSource {
-                center: Position::new(nest.x + distance, nest.y),
-                radius: 1,
-                volume_ul_per_cell: 1.0e6,
-                molarity: molarity_a,
-            },
-            FoodSource {
-                center: Position::new(nest.x - distance, nest.y),
-                radius: 1,
-                volume_ul_per_cell: 1.0e6,
-                molarity: molarity_b,
-            },
+            FoodSource::pool(
+                Position::new(nest.x + distance, nest.y),
+                1,
+                1.0e6,
+                molarity_a,
+            ),
+            FoodSource::pool(
+                Position::new(nest.x - distance, nest.y),
+                1,
+                1.0e6,
+                molarity_b,
+            ),
         ],
         random_food: None,
         counters: vec![
@@ -510,6 +510,88 @@ pub fn run_hunger_response(
                 satiation,
                 foraging_fraction: sim.stats().foraging_fraction(),
                 delivered: sim.stats().food_delivered,
+            }
+        })
+        .collect()
+}
+
+/// A single drop of solution at `distance` cells east of the nest, fed at
+/// `flow_ul_per_min` (Mailleux, Deneubourg & Detrain 2003: a source whose
+/// productivity the colony's foraging effort comes to match).
+pub fn dripping_source(distance: i32, flow_ul_per_min: f64, molarity: f64) -> WorldConfig {
+    let margin = 4;
+    let width = (distance + 2 * margin + 1) as usize;
+    let height = (2 * margin + 9) as usize;
+    let nest = Position::new(margin, margin + 4);
+    WorldConfig {
+        width,
+        height,
+        nest,
+        nest_radius: 1,
+        food_sources: vec![FoodSource::pool(
+            Position::new(nest.x + distance, nest.y),
+            0,
+            1.0,
+            molarity,
+        )
+        .renewing(flow_ul_per_min / 60.0)],
+        random_food: None,
+        ..WorldConfig::default()
+    }
+}
+
+/// Outcome of one dripping-source replicate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProductivityOutcome {
+    /// Flow of the source, microlitres per minute.
+    pub flow_ul_per_min: f64,
+    /// Share of ant-time spent outside.
+    pub foraging_fraction: f64,
+    /// Loads delivered.
+    pub delivered: u64,
+    /// Solution drunk, microlitres.
+    pub collected_ul: f64,
+    /// Mean crop load per feeding visit, microlitres.
+    pub mean_load_ul: f64,
+    /// Share of returns on which the forager laid trail.
+    pub recruiting_fraction: f64,
+    /// Mean number of ants at the source (its cell and neighbours),
+    /// sampled every minute.
+    pub at_source: f64,
+}
+
+/// Foraging effort and recruitment against the productivity of a source:
+/// one replicate per flow, 1 M sucrose 12 cells from the nest.
+pub fn run_productivity_response(
+    species: &Species,
+    ants: usize,
+    flows_ul_per_min: &[f64],
+    seconds: f64,
+    seed: u64,
+) -> Vec<ProductivityOutcome> {
+    flows_ul_per_min
+        .iter()
+        .map(|&flow| {
+            let world = dripping_source(12, flow, 1.0);
+            let source = world.food_sources[0].center;
+            let around = Rect::new(source.offset(-1, -1), source.offset(1, 1));
+            let cfg = experiment_config(species.clone(), world, ants);
+            let mut sim = Simulation::new(cfg, seed);
+            let minutes = (seconds / 60.0).ceil().max(1.0) as usize;
+            let mut at_source = 0.0;
+            for _ in 0..minutes {
+                sim.run_seconds(60.0);
+                at_source += sim.world().occupancy_in(&around) as f64;
+            }
+            let s = sim.stats();
+            ProductivityOutcome {
+                flow_ul_per_min: flow,
+                foraging_fraction: s.foraging_fraction(),
+                delivered: s.food_delivered,
+                collected_ul: s.food_collected_ul,
+                mean_load_ul: s.food_collected_ul / s.food_picked.max(1) as f64,
+                recruiting_fraction: s.recruiting_trips as f64 / s.food_picked.max(1) as f64,
+                at_source: at_source / minutes as f64,
             }
         })
         .collect()

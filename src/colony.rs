@@ -490,6 +490,8 @@ pub struct Stats {
     pub sugar_delivered_mg: f64,
     /// Feeding visits at sources.
     pub food_picked: u64,
+    /// Returns from food on which the forager laid trail.
+    pub recruiting_trips: u64,
     /// Solution drunk at sources, microlitres.
     pub food_collected_ul: f64,
     /// Outbound trips abandoned without food.
@@ -1027,6 +1029,7 @@ impl Simulation {
             }
         }
         self.world.step_pheromones();
+        self.world.step_food();
         self.nest_step();
         self.tick += 1;
         self.stats.ticks += 1;
@@ -1266,11 +1269,13 @@ impl Simulation {
         let load_ul = a.crop_ul;
         let molarity = a.load_molarity;
         let quality = a.load_quality;
+        let fill = a.load_fill;
         a.crop_ul = 0.0;
         a.activity = Activity::Resting;
         // Poor sources are abandoned: the memory survives with a
-        // quality-dependent probability.
-        let keep = self.species.site_fidelity(quality);
+        // probability that depends on the quality of the food and on how
+        // much of it there was to drink.
+        let keep = self.species.site_fidelity(quality * fill);
         if !self.rng.chance(keep) {
             self.ants[i].site = None;
         }
@@ -1314,20 +1319,45 @@ impl Simulation {
         };
         self.ants[i].crop_ul += taken;
         self.stats.food_collected_ul += taken;
-        let exhausted = taken < want - 1e-12;
+        let short = taken < want - 1e-12;
         let full = self.ants[i].crop_ul >= want_total - 1e-9;
-        if full || exhausted {
+        // A drop that refills is worth waiting at, for a while; a dry
+        // patch is not.
+        let renewing = self
+            .world
+            .cell(cell)
+            .map(|c| c.renewal_ul_per_s > 0.0)
+            .unwrap_or(false);
+        let patience = self.seconds_to_ticks(self.species.feeding_patience_s);
+        let waited = {
+            let a = &mut self.ants[i];
+            if short {
+                a.feed_wait += 1;
+            }
+            a.feed_wait
+        };
+        let give_up_waiting = short && (!renewing || waited > patience);
+        if full || give_up_waiting {
+            let fill = (self.ants[i].crop_ul / want_total.max(1e-12)).clamp(0.0, 1.0);
+            self.ants[i].feed_wait = 0;
             if self.ants[i].carrying() {
-                self.finish_feeding(i, quality);
+                self.finish_feeding(i, quality, fill);
             } else {
                 self.give_up(i);
             }
         }
     }
 
-    fn finish_feeding(&mut self, i: usize, quality: f64) {
-        let lay = self.species.lay_probability(quality) * self.ants[i].traits.laying;
+    fn finish_feeding(&mut self, i: usize, quality: f64, fill: f64) {
+        // Recruitment rises with quality and with the volume ingested.
+        let lay = self.species.lay_probability(quality)
+            * self.ants[i].traits.laying
+            * fill.powf(self.species.lay_load_exponent);
         let lays = self.rng.chance(lay.clamp(0.0, 1.0));
+        if lays {
+            self.stats.recruiting_trips += 1;
+        }
+        self.ants[i].load_fill = fill;
         let a = &mut self.ants[i];
         a.steps_since_food = 0;
         a.trip_length = 0.0;

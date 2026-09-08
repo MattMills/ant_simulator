@@ -148,10 +148,11 @@ pub mod prelude {
     };
     pub use crate::entropy::{EntropyControl, Tempering};
     pub use crate::experiments::{
-        crowded_bridge, double_bridge, experiment_config, pure_pheromone_feedback,
+        crowded_bridge, double_bridge, dripping_source, experiment_config, pure_pheromone_feedback,
         run_crowded_bridge, run_division_of_labor, run_double_bridge, run_double_bridge_configured,
-        run_double_bridge_once, run_hunger_response, run_two_sources_once, summarize, two_sources,
-        BridgeOutcome, BridgeSpec, HungerOutcome, LaborOutcome, SourcesOutcome, Summary,
+        run_double_bridge_once, run_hunger_response, run_productivity_response,
+        run_two_sources_once, summarize, two_sources, BridgeOutcome, BridgeSpec, HungerOutcome,
+        LaborOutcome, ProductivityOutcome, SourcesOutcome, Summary,
     };
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
@@ -175,6 +176,7 @@ pub mod prelude {
         SMOOTH_PARAM,
     };
     pub use crate::world::{
-        Cell, Counter, CounterState, FoodSource, RandomFood, Rect, Terrain, World, WorldConfig,
+        CapacityZone, Cell, Counter, CounterState, FoodSource, RandomFood, Rect, Terrain, World,
+        WorldConfig,
     };
 }

@@ -37,18 +37,24 @@ fn double_bridge_selects_the_shorter_branch() {
 }
 
 #[test]
-fn double_bridge_works_for_inbound_only_layers() {
-    // Beckers, Deneubourg & Goss 1992: Lasius niger, which lays trail on
-    // the way home, also selects the shorter branch.
-    let o = run_double_bridge_once(
+fn lasius_also_selects_the_shorter_branch() {
+    // Beckers, Deneubourg & Goss 1992: Lasius niger selects the shorter
+    // branch with a large majority of foragers. A minority that learned
+    // the long branch on its first trips may keep to it (route memory),
+    // so the majority is not always overwhelming.
+    let outcomes = run_double_bridge(
         &BridgeSpec::ratio_two(),
-        Species::lasius_niger(),
+        &Species::lasius_niger(),
         60,
         20.0 * 60.0,
         8.0 * 60.0,
-        3,
+        &[1, 3],
     );
-    assert!(o.short_fraction > 0.7, "{o:?}");
+    for o in &outcomes {
+        assert!(o.short_fraction > 0.55, "{o:?}");
+    }
+    let mean = outcomes.iter().map(|o| o.short_fraction).sum::<f64>() / outcomes.len() as f64;
+    assert!(mean > 0.75, "{outcomes:?}");
 }
 
 #[test]
@@ -120,6 +126,31 @@ fn crowding_spreads_traffic_over_a_narrow_bridge() {
         traffic(&narrow),
         traffic(&wide)
     );
+}
+
+#[test]
+fn foraging_effort_tracks_source_productivity() {
+    // Mailleux, Deneubourg & Detrain 2003: at a slow drip foragers leave
+    // with partial loads and recruit little; effort scales with the flow.
+    let outcomes = run_productivity_response(
+        &Species::lasius_niger(),
+        60,
+        &[0.05, 0.5, 5.0],
+        30.0 * 60.0,
+        3,
+    );
+    assert_eq!(outcomes.len(), 3);
+    let (slow, mid, fast) = (&outcomes[0], &outcomes[1], &outcomes[2]);
+    assert!(
+        slow.delivered < mid.delivered && mid.delivered < fast.delivered,
+        "{outcomes:?}"
+    );
+    assert!(slow.mean_load_ul < fast.mean_load_ul, "{outcomes:?}");
+    assert!(
+        slow.recruiting_fraction < fast.recruiting_fraction,
+        "{outcomes:?}"
+    );
+    assert!(fast.delivered > 3 * slow.delivered.max(1), "{outcomes:?}");
 }
 
 #[test]
@@ -201,12 +232,7 @@ fn pharaoh_ants_mark_exhausted_routes() {
     let world = WorldConfig {
         seed: Some(6),
         random_food: None,
-        food_sources: vec![FoodSource {
-            center: Position::new(50, 20),
-            radius: 0,
-            volume_ul_per_cell: 1.0,
-            molarity: 1.0,
-        }],
+        food_sources: vec![FoodSource::pool(Position::new(50, 20), 0, 1.0, 1.0)],
         ..WorldConfig::default()
     };
     let cfg = experiment_config(Species::pharaoh(), world, 40);

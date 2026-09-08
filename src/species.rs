@@ -176,6 +176,15 @@ pub struct Species {
     /// Molarity at which the intake rate halves (viscosity: Josens et al.
     /// 1998).
     pub intake_half_molarity: f64,
+    /// Longest a forager waits at a source that offers solution slower than
+    /// it drinks before leaving with what it has, seconds (at a slow drip,
+    /// ants ingest less and recruit less: Mailleux, Deneubourg & Detrain
+    /// 2003, *Proc. R. Soc. B* 270:1609).
+    pub feeding_patience_s: f64,
+    /// Exponent on the crop's fill fraction in the probability of laying
+    /// trail on the way home: foragers that ingested little do not recruit
+    /// (Mailleux, Deneubourg & Detrain 2000, *Anim. Behav.* 59:1061).
+    pub lay_load_exponent: f64,
     /// Time to unload by trophallaxis in a hungry nest, seconds.
     pub unloading_time_s: f64,
     /// Extra unloading time per unit of colony satiation, as a factor.
@@ -233,7 +242,11 @@ pub struct Species {
     pub excitation_per_contact: f64,
     /// Half-life of a worker's excitation, seconds.
     pub excitation_half_life_s: f64,
-    /// Foraging stimulus per unit of colony hunger.
+    /// Foraging stimulus per unit of colony hunger. Kept low: hunger alone
+    /// sends out a trickle of scouts, and it is the excitation spread by
+    /// returning foragers that mobilises the colony, so the foraging force
+    /// builds up sigmoidally as recruitment feeds on itself (Mailleux,
+    /// Detrain & Deneubourg 2006, *J. Exp. Biol.* 209:4224).
     pub hunger_gain: f64,
     /// Sugar consumed per worker inside the nest per second at the
     /// reference temperature, milligrams.
@@ -357,6 +370,8 @@ impl Species {
             crop_capacity_ul: 0.5,
             intake_max_ul_s: 0.015,
             intake_half_molarity: 0.7,
+            feeding_patience_s: 300.0,
+            lay_load_exponent: 1.0,
             unloading_time_s: 30.0,
             unloading_satiation_factor: 3.0,
             forager_hazard_per_s: 1.0 / day,
@@ -379,7 +394,7 @@ impl Species {
             contacts_per_return: 5,
             excitation_per_contact: 0.3,
             excitation_half_life_s: 120.0,
-            hunger_gain: 1.0,
+            hunger_gain: 0.3,
             consumption_mg_per_ant_per_s: 0.05 / day,
             q10_metabolism: 2.0,
             egg_interval_s: 3600.0,
