@@ -16,7 +16,7 @@ use crate::landscape::{ring_heading, turn_magnitude, RING, RING_STEP};
 use crate::pheromone::{perceived, Pheromone};
 use crate::rng::Rng;
 use crate::species::Species;
-use crate::world::World;
+use crate::world::{Nutrient, World};
 use std::collections::HashMap;
 
 /// Identifier of an ant within a simulation.
@@ -149,6 +149,8 @@ pub struct Site {
     pub vector: (f64, f64),
     /// Quality of the food found there.
     pub quality: f64,
+    /// What was found there.
+    pub nutrient: Nutrient,
 }
 
 /// What an ant remembers at a familiar place: the local vectors of a
@@ -195,6 +197,13 @@ pub struct Ant {
     pub load_quality: f64,
     /// How full the crop was on leaving the source (0..1).
     pub load_fill: f64,
+    /// What the ant is collecting on this trip.
+    pub load_kind: Nutrient,
+    /// Prey carried in the mandibles, milligrams.
+    pub item_mg: f64,
+    /// Whether the ant will take prey this trip (decided on leaving the
+    /// nest from the colony's protein demand).
+    pub accepts_prey: bool,
     /// Seconds of reserve before starvation.
     pub energy: f64,
     /// Ticks lived.
@@ -266,6 +275,9 @@ impl Ant {
             load_molarity: 0.0,
             load_quality: 0.0,
             load_fill: 0.0,
+            load_kind: Nutrient::Sugar,
+            item_mg: 0.0,
+            accepts_prey: false,
             energy,
             age: 0,
             alive: true,
@@ -307,7 +319,7 @@ impl Ant {
 
     /// Whether the ant carries food.
     pub fn carrying(&self) -> bool {
-        self.crop_ul > 1e-9
+        self.crop_ul > 1e-9 || self.item_mg > 1e-9
     }
 
     /// Record a cell in the short-term memory ring.
@@ -695,7 +707,14 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f6
             let k_half = world.channel(kind).k * ant.traits.sensitivity;
             f[slot] = perceived(c, k_half);
         }
-        let food_at = |p: Point| world.cell(p.cell()).map(|c| c.has_food()).unwrap_or(false);
+        // Food this ant is after: solution always, prey only when the trip
+        // is a protein trip.
+        let food_at = |p: Point| {
+            world
+                .cell(p.cell())
+                .map(|c| c.has_solution() || (ant.accepts_prey && c.has_prey()))
+                .unwrap_or(false)
+        };
         f[F_FOOD] = if food_at(target) || food_at(one) {
             1.0
         } else if second && food_at(two) {
@@ -836,6 +855,7 @@ mod tests {
         ant.site = Some(Site {
             vector: (-3.0, -12.0),
             quality: 1.0,
+            nutrient: Nutrient::Sugar,
         });
         ant.learn_route_out(Position::new(2, 3), (0.0, -1.0), 0.3, 10);
         let obs = observe(&ant, &w, &species, Mode::Outbound, 0.75);

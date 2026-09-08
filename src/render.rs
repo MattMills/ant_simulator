@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 /// Render the world as ASCII art, one character per cell.
 ///
-/// * `#` wall, `N` nest, `F` food, `x` an alarm cloud,
+/// * `#` wall, `N` nest, `F` sugar solution, `P` prey, `x` an alarm cloud,
 /// * `o` an outbound ant, `<` an inbound ant carrying food, `-` an inbound
 ///   ant returning empty, `?` a searching ant, `f` an ant feeding,
 /// * `@`, `:` and `.` strong, medium and faint recruitment trail,
@@ -34,8 +34,10 @@ pub fn render(sim: &Simulation) -> String {
                 Terrain::Nest => 'N',
                 Terrain::Open => {
                     let trail = cell.level(Pheromone::Trail);
-                    if cell.has_food() {
+                    if cell.has_solution() {
                         'F'
+                    } else if cell.has_prey() {
+                        'P'
                     } else if cell.level(Pheromone::Alarm) > 1.0 {
                         'x'
                     } else if trail > 4.0 * k {

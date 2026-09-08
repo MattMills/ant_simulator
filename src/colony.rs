@@ -25,13 +25,15 @@ use crate::pheromone::Pheromone;
 use crate::rng::Rng;
 use crate::species::Species;
 use crate::surface::{BehavioralSurface, SurfaceError, PARAM_LEN};
-use crate::world::{World, WorldConfig};
+use crate::world::{Nutrient, World, WorldConfig};
 
 /// How events translate into the scalar reward learners optimise.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RewardSpec {
     /// Reward per milligram of sugar delivered into the nest.
     pub sugar_mg: f64,
+    /// Reward per milligram of protein delivered into the nest.
+    pub protein_mg: f64,
     /// Reward per feeding visit at a source.
     pub food_picked: f64,
     /// Reward (normally negative) per dead worker.
@@ -44,6 +46,7 @@ impl Default for RewardSpec {
     fn default() -> Self {
         RewardSpec {
             sugar_mg: 5.0,
+            protein_mg: 5.0,
             food_picked: 0.1,
             death: -0.5,
             birth: 0.0,
@@ -257,6 +260,8 @@ pub struct BroodItem {
     pub stage_age_s: f64,
     /// Sugar received as a larva, milligrams.
     pub fed_mg: f64,
+    /// Protein received as a larva, milligrams.
+    pub protein_mg: f64,
     /// Seconds since a nurse last fed it.
     pub unfed_s: f64,
 }
@@ -268,6 +273,8 @@ pub struct Nest {
     pub store_mg: f64,
     /// Store capacity, milligrams.
     pub capacity_mg: f64,
+    /// Protein (prey) in store, milligrams.
+    pub protein_mg: f64,
     /// Developing brood.
     pub brood: Vec<BroodItem>,
     /// Mean recruitment excitation of the workers inside.
@@ -283,6 +290,26 @@ pub struct Nest {
 }
 
 impl Nest {
+    /// Protein the current larvae still need to pupate, milligrams.
+    pub fn protein_need(&self, larva_protein_mg: f64) -> f64 {
+        self.brood
+            .iter()
+            .filter(|b| b.stage == BroodStage::Larva)
+            .map(|b| (larva_protein_mg - b.protein_mg).max(0.0))
+            .sum()
+    }
+
+    /// The colony's protein demand, 0..1: the share of what the larvae
+    /// still need that the store does not cover.
+    pub fn protein_demand(&self, larva_protein_mg: f64) -> f64 {
+        let need = self.protein_need(larva_protein_mg);
+        if need <= 0.0 {
+            0.0
+        } else {
+            ((need - self.protein_mg) / need).clamp(0.0, 1.0)
+        }
+    }
+
     /// Fill of the store, 0 (empty) to 1 (full).
     pub fn satiation(&self) -> f64 {
         if self.capacity_mg <= 0.0 {
@@ -494,6 +521,10 @@ pub struct Stats {
     pub recruiting_trips: u64,
     /// Solution drunk at sources, microlitres.
     pub food_collected_ul: f64,
+    /// Prey pieces cut at sources.
+    pub prey_picked: u64,
+    /// Protein delivered, milligrams.
+    pub protein_delivered_mg: f64,
     /// Outbound trips abandoned without food.
     pub failed_trips: u64,
     /// Workers that died.
@@ -715,6 +746,7 @@ impl Simulation {
         let nest = Nest {
             store_mg: capacity * config.nest.initial_satiation.clamp(0.0, 1.0),
             capacity_mg: capacity,
+            protein_mg: 0.0,
             brood: Vec::new(),
             excitation: 0.0,
             eggs_laid: 0,
@@ -789,6 +821,7 @@ impl Simulation {
                 stage: BroodStage::Egg,
                 stage_age_s: t,
                 fed_mg: 0.0,
+                protein_mg: 0.0,
                 unfed_s: 0.0,
             }
         } else if t < s.egg_s + s.larva_s {
@@ -797,6 +830,7 @@ impl Simulation {
                 stage: BroodStage::Larva,
                 stage_age_s: age,
                 fed_mg: s.larva_food_mg * age / s.larva_s.max(1e-9),
+                protein_mg: s.larva_protein_mg * age / s.larva_s.max(1e-9),
                 unfed_s: 0.0,
             }
         } else {
@@ -804,6 +838,7 @@ impl Simulation {
                 stage: BroodStage::Pupa,
                 stage_age_s: t - s.egg_s - s.larva_s,
                 fed_mg: s.larva_food_mg,
+                protein_mg: s.larva_protein_mg,
                 unfed_s: 0.0,
             }
         }
@@ -1179,7 +1214,11 @@ impl Simulation {
         // A known source is a reason to go again only while the colony
         // can take the food: satiated nestmates refuse to unload foragers,
         // which stops re-foraging (Mailleux, Detrain & Deneubourg 2006).
-        let stimulus = self.species.hunger_gain * hunger + excitement + site_bonus * hunger;
+        let protein_demand = self.nest.protein_demand(self.species.larva_protein_mg);
+        let stimulus = self.species.hunger_gain * hunger
+            + self.species.protein_demand_gain * protein_demand
+            + excitement
+            + site_bonus * hunger.max(protein_demand);
         let p_forage =
             self.species.response(stimulus, threshold) * self.decision_prob * self.activity_factor;
         let larvae = self.nest.larvae() as f64;
@@ -1207,8 +1246,14 @@ impl Simulation {
         let jitter = (self.rng.range(-0.4, 0.4), self.rng.range(-0.4, 0.4));
         let outbound_laying = self.species.outbound_laying;
         let exploratory_laying = self.species.exploratory_laying;
+        // A protein trip or a sugar trip, from the colony's demand.
+        let demand = self.nest.protein_demand(self.species.larva_protein_mg);
+        let base = self.species.protein_acceptance_base;
+        let accepts_prey = self.rng.chance(base + (1.0 - base) * demand);
         let a = &mut self.ants[i];
         a.activity = Activity::Outbound;
+        a.accepts_prey = accepts_prey;
+        a.item_mg = 0.0;
         let c = Point::center_of(exit);
         a.position = Point::new(c.x + jitter.0, c.y + jitter.1);
         a.heading = heading;
@@ -1251,6 +1296,27 @@ impl Simulation {
                 self.nest.store_mg -= amount;
             }
         }
+        // Protein goes to the larva that still needs the most of it.
+        let protein_available = rate.min(self.nest.protein_mg);
+        if protein_available > 0.0 {
+            let need = self.species.larva_protein_mg;
+            if let Some(neediest) = self
+                .nest
+                .brood
+                .iter_mut()
+                .filter(|b| b.stage == BroodStage::Larva && b.protein_mg < need)
+                .min_by(|a, b| {
+                    a.protein_mg
+                        .partial_cmp(&b.protein_mg)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                let amount = protein_available.min(need - neediest.protein_mg);
+                neediest.protein_mg += amount;
+                neediest.unfed_s = 0.0;
+                self.nest.protein_mg -= amount;
+            }
+        }
         let no_larvae = self.nest.larvae() == 0;
         let a = &mut self.ants[i];
         a.time_nursing += 1;
@@ -1270,7 +1336,9 @@ impl Simulation {
         let molarity = a.load_molarity;
         let quality = a.load_quality;
         let fill = a.load_fill;
+        let item = a.item_mg;
         a.crop_ul = 0.0;
+        a.item_mg = 0.0;
         a.activity = Activity::Resting;
         // Poor sources are abandoned: the memory survives with a
         // probability that depends on the quality of the food and on how
@@ -1279,12 +1347,14 @@ impl Simulation {
         if !self.rng.chance(keep) {
             self.ants[i].site = None;
         }
-        // The store gains the load's sugar content.
+        // The store gains the load's sugar content, or the prey.
         let sugar = self.species.sugar_mg(load_ul, molarity);
         self.nest.store_mg = (self.nest.store_mg + sugar).min(self.nest.capacity_mg);
         self.stats.sugar_delivered_mg += sugar;
+        self.nest.protein_mg += item;
+        self.stats.protein_delivered_mg += item;
         let leaf = self.ants[i].leaf;
-        let reward = self.config.reward.sugar_mg * sugar;
+        let reward = self.config.reward.sugar_mg * sugar + self.config.reward.protein_mg * item;
         self.credit(leaf, reward, false);
         // Recruitment by contact: the returning forager excites nestmates.
         let inside: Vec<usize> = (0..self.ants.len())
@@ -1303,6 +1373,10 @@ impl Simulation {
     }
 
     fn feed(&mut self, i: usize) {
+        if self.ants[i].load_kind == Nutrient::Protein {
+            self.cut_prey(i);
+            return;
+        }
         let cell = self.ants[i].cell();
         let (molarity, quality, crop, want_total) = {
             let a = &self.ants[i];
@@ -1348,6 +1422,27 @@ impl Simulation {
         }
     }
 
+    /// Cutting a piece of prey takes a handling time; then the piece is
+    /// carried home like a crop load.
+    fn cut_prey(&mut self, i: usize) {
+        let cell = self.ants[i].cell();
+        let a = &mut self.ants[i];
+        a.timer = a.timer.saturating_sub(1);
+        if a.timer > 0 {
+            return;
+        }
+        let want = self.species.prey_load_mg;
+        let taken = self.world.take_prey(cell, want);
+        if taken > 0.0 {
+            self.ants[i].item_mg = taken;
+            let quality = self.ants[i].load_quality;
+            let fill = (taken / want.max(1e-12)).clamp(0.0, 1.0);
+            self.finish_feeding(i, quality, fill);
+        } else {
+            self.give_up(i);
+        }
+    }
+
     fn finish_feeding(&mut self, i: usize, quality: f64, fill: f64) {
         // Recruitment rises with quality and with the volume ingested.
         let lay = self.species.lay_probability(quality)
@@ -1364,6 +1459,7 @@ impl Simulation {
         a.site = Some(Site {
             vector: a.home_vector,
             quality,
+            nutrient: a.load_kind,
         });
         a.heading = crate::geometry::wrap_angle(a.heading + std::f64::consts::PI);
         a.activity = Activity::Inbound;
@@ -1618,18 +1714,23 @@ impl Simulation {
     fn check_transitions(&mut self, i: usize) -> bool {
         let cell = self.ants[i].cell();
         let on_nest = self.world.is_nest(cell);
-        let food_here = self
+        let accepts_prey = self.ants[i].accepts_prey;
+        let (solution_here, molarity, prey_here) = self
             .world
             .cell(cell)
-            .map(|c| (c.has_food(), c.molarity))
-            .unwrap_or((false, 0.0));
+            .map(|c| (c.has_solution(), c.molarity, accepts_prey && c.has_prey()))
+            .unwrap_or((false, 0.0, false));
         let arrival = self.species.arrival_radius;
         let activity = self.ants[i].activity;
         let target = self.ants[i].search_target;
         match (activity, target) {
             (Activity::Outbound, _) | (Activity::Searching, SearchTarget::Food) => {
-                if food_here.0 && !self.ants[i].carrying() {
-                    self.start_feeding(i, food_here.1);
+                if solution_here && !self.ants[i].carrying() {
+                    self.start_feeding(i, molarity);
+                    return true;
+                }
+                if prey_here && !self.ants[i].carrying() {
+                    self.start_cutting(i);
                     return true;
                 }
                 let a = &mut self.ants[i];
@@ -1710,6 +1811,7 @@ impl Simulation {
         let leaf = self.ants[i].leaf;
         let a = &mut self.ants[i];
         a.activity = Activity::Feeding;
+        a.load_kind = Nutrient::Sugar;
         a.load_molarity = molarity;
         a.load_quality = quality;
         a.pickup = Some(a.position);
@@ -1717,6 +1819,28 @@ impl Simulation {
         a.steps_since_food = 0;
         a.trip_length = 0.0;
         self.stats.food_picked += 1;
+        let reward = self.config.reward.food_picked;
+        self.credit(leaf, reward, false);
+    }
+
+    /// Start cutting a piece of prey: its value to the colony is its
+    /// protein demand, which sets recruitment and site fidelity.
+    fn start_cutting(&mut self, i: usize) {
+        let demand = self.nest.protein_demand(self.species.larva_protein_mg);
+        let handling = self.seconds_to_ticks(self.species.prey_handling_s);
+        let leaf = self.ants[i].leaf;
+        let a = &mut self.ants[i];
+        a.activity = Activity::Feeding;
+        a.load_kind = Nutrient::Protein;
+        a.load_molarity = 0.0;
+        a.load_quality = 0.5 + 0.5 * demand;
+        a.timer = handling;
+        a.pickup = Some(a.position);
+        a.laying = None;
+        a.steps_since_food = 0;
+        a.trip_length = 0.0;
+        self.stats.food_picked += 1;
+        self.stats.prey_picked += 1;
         let reward = self.config.reward.food_picked;
         self.credit(leaf, reward, false);
     }
@@ -1809,11 +1933,12 @@ impl Simulation {
         // Development, larval starvation, and emergence.
         let dev = self.development_factor * self.tick_s;
         let s = &self.species;
-        let (egg_s, larva_s, pupa_s, larva_food, larva_starvation) = (
+        let (egg_s, larva_s, pupa_s, larva_food, larva_protein, larva_starvation) = (
             s.egg_s,
             s.larva_s,
             s.pupa_s,
             s.larva_food_mg,
+            s.larva_protein_mg,
             s.larva_starvation_s,
         );
         let tick_s = self.tick_s;
@@ -1835,7 +1960,10 @@ impl Simulation {
                         starved += 1;
                         return false;
                     }
-                    if b.stage_age_s >= larva_s && b.fed_mg >= larva_food {
+                    if b.stage_age_s >= larva_s
+                        && b.fed_mg >= larva_food
+                        && b.protein_mg >= larva_protein
+                    {
                         b.stage = BroodStage::Pupa;
                         b.stage_age_s = 0.0;
                     }
@@ -1878,6 +2006,7 @@ impl Simulation {
                     stage: BroodStage::Egg,
                     stage_age_s: 0.0,
                     fed_mg: 0.0,
+                    protein_mg: 0.0,
                     unfed_s: 0.0,
                 });
                 self.nest.eggs_laid += 1;
@@ -2072,6 +2201,7 @@ mod tests {
     use super::*;
     use crate::entropy::EntropyControl;
     use crate::surface::Deformation;
+    use crate::world::FoodSource;
 
     fn quick_config() -> SimConfig {
         SimConfig {
@@ -2251,6 +2381,51 @@ mod tests {
         let occupancy: u32 = sim.world().cells().iter().map(|c| c.occupancy as u32).sum();
         assert_eq!(occupancy as usize, sim.outside());
         assert!(s.deaths_predation + s.deaths_starvation == s.deaths);
+    }
+
+    #[test]
+    fn larvae_need_protein_to_pupate() {
+        // Larvae only, sugar and prey within reach: foragers bring prey
+        // because the larvae demand it, nurses feed it, larvae pupate.
+        let mut cfg = life_history();
+        cfg.nest.initial_brood_per_ant = 0.0;
+        cfg.nest.queen = false;
+        cfg.nest.initial_satiation = 0.5;
+        cfg.world.random_food = None;
+        cfg.world.food_sources = vec![
+            FoodSource::pool(Position::new(28, 15), 1, 1.0e6, 1.0),
+            FoodSource::prey(Position::new(12, 15), 1, 1.0e6),
+        ];
+        let larvae = |n: usize| {
+            (0..n)
+                .map(|_| BroodItem {
+                    stage: BroodStage::Larva,
+                    stage_age_s: 0.0,
+                    fed_mg: 0.0,
+                    protein_mg: 0.0,
+                    unfed_s: 0.0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut sim = Simulation::new(cfg.clone(), 4);
+        sim.nest_mut().brood = larvae(15);
+        assert!((sim.nest().protein_demand(sim.species().larva_protein_mg) - 1.0).abs() < 1e-12);
+        sim.run(3000);
+        let s = sim.stats();
+        assert!(s.prey_picked > 0 && s.protein_delivered_mg > 0.0, "{s:?}");
+        assert!(
+            sim.nest().count(BroodStage::Pupa) > 0,
+            "fed larvae should pupate: {:?}",
+            sim.nest()
+        );
+        // Without prey the larvae stay larvae however much sugar they get.
+        cfg.world.food_sources.pop();
+        let mut starved = Simulation::new(cfg, 4);
+        starved.nest_mut().brood = larvae(15);
+        starved.run(3000);
+        assert_eq!(starved.stats().prey_picked, 0);
+        assert_eq!(starved.nest().count(BroodStage::Pupa), 0);
+        assert!(starved.stats().food_delivered > 0);
     }
 
     #[test]

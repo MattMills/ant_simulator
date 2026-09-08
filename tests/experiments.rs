@@ -154,6 +154,25 @@ fn foraging_effort_tracks_source_productivity() {
 }
 
 #[test]
+fn larvae_turn_foraging_towards_protein() {
+    // Dussutour & Simpson 2009: colonies with larvae collect protein;
+    // colonies of workers alone take carbohydrate and leave prey.
+    let run =
+        |larvae: bool| run_communal_nutrition(Species::lasius_niger(), 60, larvae, 30.0 * 60.0, 2);
+    let with = run(true);
+    let without = run(false);
+    assert!(
+        with.delivered > 20 && without.delivered > 20,
+        "{with:?} {without:?}"
+    );
+    assert!(
+        with.protein_share > without.protein_share + 0.2,
+        "larvae should raise the protein share: {with:?} vs {without:?}"
+    );
+    assert!(without.protein_share < 0.3, "{without:?}");
+}
+
+#[test]
 fn richer_source_wins_the_colony() {
     // Beckers, Deneubourg, Goss & Pasteels 1990: two sources at equal
     // distance; quality-modulated trail laying and site fidelity focus the

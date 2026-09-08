@@ -146,6 +146,23 @@ fn main() {
         );
     }
 
+    println!("\n== communal nutrition: sugar or prey, with and without larvae (Dussutour & Simpson 2009) ==");
+    for larvae in [false, true] {
+        let outcomes: Vec<NutritionOutcome> = seeds
+            .iter()
+            .map(|&seed| run_communal_nutrition(Species::lasius_niger(), 60, larvae, seconds, seed))
+            .collect();
+        let n = outcomes.len() as f64;
+        println!(
+            "   {:<14} protein share {:.2}, sugar {:.1} mg, protein {:.1} mg, {:.0} loads",
+            if larvae { "with larvae:" } else { "no larvae:" },
+            outcomes.iter().map(|o| o.protein_share).sum::<f64>() / n,
+            outcomes.iter().map(|o| o.sugar_mg).sum::<f64>() / n,
+            outcomes.iter().map(|o| o.protein_mg).sum::<f64>() / n,
+            outcomes.iter().map(|o| o.delivered as f64).sum::<f64>() / n
+        );
+    }
+
     println!("\n== division of labour with and without threshold reinforcement (Theraulaz et al. 1998) ==");
     let o = run_division_of_labor(&Species::lasius_niger(), 60, seconds, 1);
     println!(

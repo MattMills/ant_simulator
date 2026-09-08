@@ -15,7 +15,7 @@
 //!   threshold reinforcement (Theraulaz, Bonabeau & Deneubourg 1998).
 
 use crate::ant::{BASE_FEATURES, F_CROWD, F_RECENT, F_ROUTE};
-use crate::colony::{SimConfig, Simulation};
+use crate::colony::{BroodItem, BroodStage, SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::pheromone::Pheromone;
 use crate::species::Species;
@@ -595,6 +595,84 @@ pub fn run_productivity_response(
             }
         })
         .collect()
+}
+
+/// A sugar source east of the nest and a heap of prey west of it, at the
+/// same distance (Dussutour & Simpson 2009: a choice between the two
+/// macronutrients).
+pub fn sugar_and_prey(distance: i32) -> WorldConfig {
+    let margin = 4;
+    let width = (2 * distance + 2 * margin + 1) as usize;
+    let height = (2 * margin + 9) as usize;
+    let nest = Position::new(distance + margin, margin + 4);
+    WorldConfig {
+        width,
+        height,
+        nest,
+        nest_radius: 1,
+        food_sources: vec![
+            FoodSource::pool(Position::new(nest.x + distance, nest.y), 1, 1.0e6, 1.0),
+            FoodSource::prey(Position::new(nest.x - distance, nest.y), 1, 1.0e6),
+        ],
+        random_food: None,
+        ..WorldConfig::default()
+    }
+}
+
+/// Outcome of one communal-nutrition replicate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NutritionOutcome {
+    /// Whether the colony had larvae to feed.
+    pub with_larvae: bool,
+    /// Sugar delivered, milligrams.
+    pub sugar_mg: f64,
+    /// Protein delivered, milligrams.
+    pub protein_mg: f64,
+    /// Protein as a share of everything delivered by mass (0.5 if nothing).
+    pub protein_share: f64,
+    /// Loads delivered.
+    pub delivered: u64,
+}
+
+/// Run one communal-nutrition replicate: a colony of `ants` workers, with
+/// one larva per worker or none, choosing between sugar and prey.
+pub fn run_communal_nutrition(
+    species: Species,
+    ants: usize,
+    with_larvae: bool,
+    seconds: f64,
+    seed: u64,
+) -> NutritionOutcome {
+    let larva_protein_mg = species.larva_protein_mg;
+    let _ = larva_protein_mg;
+    let cfg = experiment_config(species, sugar_and_prey(12), ants);
+    let mut sim = Simulation::new(cfg, seed);
+    if with_larvae {
+        let larvae = (0..ants)
+            .map(|_| BroodItem {
+                stage: BroodStage::Larva,
+                stage_age_s: 0.0,
+                fed_mg: 0.0,
+                protein_mg: 0.0,
+                unfed_s: 0.0,
+            })
+            .collect();
+        sim.nest_mut().brood = larvae;
+    }
+    sim.run_seconds(seconds);
+    let s = sim.stats();
+    let total = s.sugar_delivered_mg + s.protein_delivered_mg;
+    NutritionOutcome {
+        with_larvae,
+        sugar_mg: s.sugar_delivered_mg,
+        protein_mg: s.protein_delivered_mg,
+        protein_share: if total > 0.0 {
+            s.protein_delivered_mg / total
+        } else {
+            0.5
+        },
+        delivered: s.food_delivered,
+    }
 }
 
 /// Division of labour with and without threshold reinforcement.

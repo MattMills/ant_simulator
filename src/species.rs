@@ -187,6 +187,20 @@ pub struct Species {
     pub lay_load_exponent: f64,
     /// Time to unload by trophallaxis in a hungry nest, seconds.
     pub unloading_time_s: f64,
+
+    // ---- protein foraging ----
+    /// Mass of prey a worker cuts off and carries, milligrams.
+    pub prey_load_mg: f64,
+    /// Time to cut a piece of prey, seconds.
+    pub prey_handling_s: f64,
+    /// Probability that a forager takes prey it finds when the colony has
+    /// no protein demand: workers themselves avoid protein, which shortens
+    /// their lives (Dussutour & Simpson 2012, *Proc. R. Soc. B* 279:2402);
+    /// with larvae to feed the colony turns to protein (Dussutour &
+    /// Simpson 2009, *Curr. Biol.* 19:740).
+    pub protein_acceptance_base: f64,
+    /// Foraging stimulus per unit of the colony's protein demand.
+    pub protein_demand_gain: f64,
     /// Extra unloading time per unit of colony satiation, as a factor.
     pub unloading_satiation_factor: f64,
 
@@ -265,6 +279,8 @@ pub struct Species {
     /// Q10 of brood development (Kipyatkov & Lopatina 2015, *Adv. Insect
     /// Physiol.* 48:129).
     pub q10_development: f64,
+    /// Protein a larva must receive to pupate, milligrams.
+    pub larva_protein_mg: f64,
     /// Sugar a larva must receive to pupate, milligrams.
     pub larva_food_mg: f64,
     /// Time a larva survives without being fed, seconds.
@@ -370,6 +386,10 @@ impl Species {
             crop_capacity_ul: 0.5,
             intake_max_ul_s: 0.015,
             intake_half_molarity: 0.7,
+            prey_load_mg: 1.0,
+            prey_handling_s: 60.0,
+            protein_acceptance_base: 0.1,
+            protein_demand_gain: 0.3,
             feeding_patience_s: 300.0,
             lay_load_exponent: 1.0,
             unloading_time_s: 30.0,
@@ -402,6 +422,7 @@ impl Species {
             larva_s: 14.0 * day,
             pupa_s: 12.0 * day,
             q10_development: 2.5,
+            larva_protein_mg: 0.3,
             larva_food_mg: 0.8,
             larva_starvation_s: 5.0 * day,
             nursing_rate_mg_s: 0.5 / 3600.0,

@@ -18,6 +18,28 @@ use crate::species::Species;
 /// paths must keep this clearance from walls.
 pub const BODY_RADIUS: f64 = 0.1;
 
+/// The two macronutrients a colony forages for: sugar solutions
+/// (honeydew, nectar), which fuel the workers, and protein prey, which the
+/// larvae need to grow (Dussutour & Simpson 2009, *Curr. Biol.* 19:740).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Nutrient {
+    /// Sucrose solution, drunk into the crop.
+    #[default]
+    Sugar,
+    /// Solid prey, cut and carried in the mandibles.
+    Protein,
+}
+
+impl Nutrient {
+    /// Human-readable name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Nutrient::Sugar => "sugar",
+            Nutrient::Protein => "protein",
+        }
+    }
+}
+
 /// What a cell fundamentally is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Terrain {
@@ -44,6 +66,8 @@ pub struct Cell {
     /// Renewal rate of the solution here (a drop fed by a syringe, an
     /// aphid colony), microlitres per second; zero for a fixed pool.
     pub renewal_ul_per_s: f64,
+    /// Mass of protein prey lying here (a dead insect), milligrams.
+    pub prey_mg: f64,
     /// Concentration of every pheromone channel, indexed by
     /// [`Pheromone::index`].
     pub pheromone: [f64; Pheromone::COUNT],
@@ -78,9 +102,19 @@ impl Cell {
         others as f64 / self.capacity.max(1) as f64
     }
 
-    /// Whether any food remains.
+    /// Whether any food remains, solution or prey.
     pub fn has_food(&self) -> bool {
+        self.has_solution() || self.has_prey()
+    }
+
+    /// Whether any solution remains.
+    pub fn has_solution(&self) -> bool {
         self.food_ul > 1e-9
+    }
+
+    /// Whether any prey remains.
+    pub fn has_prey(&self) -> bool {
+        self.prey_mg > 1e-9
     }
 }
 
@@ -98,6 +132,8 @@ pub struct FoodSource {
     /// Rate at which each cell refills towards its placed volume,
     /// microlitres per second (zero: a fixed pool).
     pub renewal_ul_per_s: f64,
+    /// Milligrams of protein prey placed on every cell of the cluster.
+    pub prey_mg_per_cell: f64,
 }
 
 impl FoodSource {
@@ -109,6 +145,19 @@ impl FoodSource {
             volume_ul_per_cell,
             molarity,
             renewal_ul_per_s: 0.0,
+            prey_mg_per_cell: 0.0,
+        }
+    }
+
+    /// Prey (dead insects) of `mass_mg_per_cell` on every cell.
+    pub fn prey(center: Position, radius: i32, mass_mg_per_cell: f64) -> Self {
+        FoodSource {
+            center,
+            radius,
+            volume_ul_per_cell: 0.0,
+            molarity: 0.0,
+            renewal_ul_per_s: 0.0,
+            prey_mg_per_cell: mass_mg_per_cell,
         }
     }
 
@@ -168,6 +217,10 @@ pub struct RandomFood {
     pub molarity: (f64, f64),
     /// Renewal rate of every cluster cell, microlitres per second.
     pub renewal_ul_per_s: f64,
+    /// Number of prey clusters (dead insects) placed as well.
+    pub prey_clusters: usize,
+    /// Milligrams of prey on each prey cluster cell.
+    pub prey_mg_per_cell: f64,
 }
 
 /// A region whose crossings are counted (the "bridge counters" of the
@@ -237,6 +290,8 @@ impl Default for WorldConfig {
                 min_distance_from_nest: 12,
                 molarity: (0.4, 1.0),
                 renewal_ul_per_s: 0.0,
+                prey_clusters: 1,
+                prey_mg_per_cell: 30.0,
             }),
             walls: Vec::new(),
             open: Vec::new(),
@@ -381,16 +436,17 @@ impl World {
             for dx in -src.radius..=src.radius {
                 if let Some(c) = self.cell_mut(src.center.offset(dx, dy)) {
                     if c.terrain == Terrain::Open {
-                        // Mixing: the molarity becomes the volume-weighted mean.
-                        let total = c.food_ul + src.volume_ul_per_cell;
-                        if total > 0.0 {
+                        if src.volume_ul_per_cell > 0.0 {
+                            // Mixing: the molarity becomes the volume-weighted mean.
+                            let total = c.food_ul + src.volume_ul_per_cell;
                             c.molarity = (c.molarity * c.food_ul
                                 + src.molarity.max(0.0) * src.volume_ul_per_cell)
                                 / total;
+                            c.food_ul = total;
+                            c.food_capacity_ul = c.food_capacity_ul.max(total);
+                            c.renewal_ul_per_s = c.renewal_ul_per_s.max(src.renewal_ul_per_s);
                         }
-                        c.food_ul = total;
-                        c.food_capacity_ul = c.food_capacity_ul.max(total);
-                        c.renewal_ul_per_s = c.renewal_ul_per_s.max(src.renewal_ul_per_s);
+                        c.prey_mg += src.prey_mg_per_cell.max(0.0);
                     }
                 }
             }
@@ -433,7 +489,27 @@ impl World {
                     volume_ul_per_cell: random.volume_ul_per_cell,
                     molarity,
                     renewal_ul_per_s: random.renewal_ul_per_s,
+                    prey_mg_per_cell: 0.0,
                 });
+                break;
+            }
+        }
+        for _ in 0..random.prey_clusters {
+            for _attempt in 0..200 {
+                let x = rng.below(w.max(1) as usize) as i32;
+                let y = rng.below(h.max(1) as usize) as i32;
+                let center = Position::new(x, y);
+                if center.chebyshev(self.config.nest) < random.min_distance_from_nest {
+                    continue;
+                }
+                if self
+                    .cell(center)
+                    .map(|c| c.terrain != Terrain::Open || c.has_food())
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                self.place_food(&FoodSource::prey(center, 0, random.prey_mg_per_cell));
                 break;
             }
         }
@@ -692,6 +768,21 @@ impl World {
         }
     }
 
+    /// Cut up to `mass_mg` of prey from cell `p`; returns the mass taken.
+    pub fn take_prey(&mut self, p: Position, mass_mg: f64) -> f64 {
+        match self.cell_mut(p) {
+            Some(c) if c.has_prey() => {
+                let taken = mass_mg.max(0.0).min(c.prey_mg);
+                c.prey_mg -= taken;
+                if c.prey_mg < 1e-9 {
+                    c.prey_mg = 0.0;
+                }
+                taken
+            }
+            _ => 0.0,
+        }
+    }
+
     /// Record an ant entering cell `p` in every counter covering it.
     pub fn record_crossing(&mut self, p: Position) {
         for c in self.counters.iter_mut() {
@@ -801,6 +892,11 @@ impl World {
             }
         }
         total
+    }
+
+    /// Total prey over the grid, milligrams.
+    pub fn total_prey(&self) -> f64 {
+        self.cells.iter().map(|c| c.prey_mg).sum()
     }
 
     /// Number of ants on the grid inside a rectangle.
@@ -1077,6 +1173,28 @@ mod tests {
         assert!((taken - 5.0).abs() < 1e-12);
         world.step_food();
         assert!(!world.cell(Position::new(0, 0)).unwrap().has_food());
+    }
+
+    #[test]
+    fn prey_is_placed_and_cut() {
+        let cfg = WorldConfig {
+            food_sources: vec![FoodSource::prey(Position::new(2, 7), 0, 3.0)],
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        let p = Position::new(2, 7);
+        let c = world.cell(p).unwrap();
+        assert!(c.has_prey() && c.has_food() && !c.has_solution());
+        assert!((world.total_prey() - 3.0).abs() < 1e-12);
+        assert!((world.take_prey(p, 1.0) - 1.0).abs() < 1e-12);
+        assert!((world.take_prey(p, 5.0) - 2.0).abs() < 1e-12);
+        assert_eq!(world.take_prey(p, 1.0), 0.0);
+        assert!(!world.cell(p).unwrap().has_food());
+        assert_eq!(
+            world.take_prey(Position::new(0, 0), 1.0),
+            0.0,
+            "a solution cell has no prey"
+        );
     }
 
     #[test]
