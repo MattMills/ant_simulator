@@ -185,8 +185,27 @@ pub struct Species {
     /// trail on the way home: foragers that ingested little do not recruit
     /// (Mailleux, Deneubourg & Detrain 2000, *Anim. Behav.* 59:1061).
     pub lay_load_exponent: f64,
-    /// Time to unload by trophallaxis in a hungry nest, seconds.
-    pub unloading_time_s: f64,
+    // ---- trophallaxis ----
+    /// Interval between the contacts of a returning forager offering its
+    /// load, seconds (Greenwald, Baltiansky & Feinerman 2018, *eLife*
+    /// 7:e31730: interactions every few seconds).
+    pub contact_interval_s: f64,
+    /// Share of the receiver's empty crop space handed over in one contact
+    /// (the amount given is proportional to the receiver's deficit:
+    /// Greenwald et al. 2018).
+    pub transfer_fraction: f64,
+    /// A forager stops offering once its crop is below this fraction of
+    /// its capacity, and keeps the rest for itself.
+    pub unload_residual_fraction: f64,
+    /// Contacts after which a forager that still cannot unload gives up.
+    pub max_unloading_contacts: u32,
+    /// Interval between the sharing contacts of a worker inside, seconds:
+    /// at each, the fuller of two crops passes part of the difference to
+    /// the emptier, so food spreads through the colony and crop loads even
+    /// out (Buffin et al. 2009, *PLoS ONE* 4:e5919; Greenwald, Segre &
+    /// Feinerman 2015, *Sci. Rep.* 5:12496). The nest's reserve takes part
+    /// as one more nestmate.
+    pub sharing_interval_s: f64,
 
     // ---- protein foraging ----
     /// Mass of prey a worker cuts off and carries, milligrams.
@@ -218,8 +237,6 @@ pub struct Species {
     pub refuse_distance_cm: f64,
     /// Stimulus per corpse inside the nest for a worker to carry one out.
     pub undertaking_gain: f64,
-    /// Extra unloading time per unit of colony satiation, as a factor.
-    pub unloading_satiation_factor: f64,
 
     // ---- survival ----
     /// Hazard rate outside the nest, per second.
@@ -270,9 +287,6 @@ pub struct Species {
     pub forage_max_c: f64,
 
     // ---- colony ----
-    /// Nestmates a returning forager contacts while unloading (recruitment
-    /// by contact: Greene & Gordon 2007, *Behav. Ecol.* 18:451).
-    pub contacts_per_return: usize,
     /// Excitation a contact adds to a nestmate per unit of load quality.
     pub excitation_per_contact: f64,
     /// Half-life of a worker's excitation, seconds.
@@ -418,8 +432,11 @@ impl Species {
             protein_demand_gain: 0.3,
             feeding_patience_s: 300.0,
             lay_load_exponent: 1.0,
-            unloading_time_s: 30.0,
-            unloading_satiation_factor: 3.0,
+            contact_interval_s: 5.0,
+            transfer_fraction: 0.5,
+            unload_residual_fraction: 0.2,
+            max_unloading_contacts: 30,
+            sharing_interval_s: 20.0,
             forager_hazard_per_s: 1.0 / day,
             starvation_s: 8.0 * 3600.0,
             size_cv: 0.15,
@@ -438,7 +455,6 @@ impl Species {
             threshold_bounds: (0.1, 10.0),
             forage_min_c: 10.0,
             forage_max_c: 42.0,
-            contacts_per_return: 5,
             excitation_per_contact: 0.3,
             excitation_half_life_s: 120.0,
             hunger_gain: 0.3,
@@ -619,10 +635,10 @@ impl Species {
         f + (1.0 - f) * quality.clamp(0.0, 1.0)
     }
 
-    /// Time to unload by trophallaxis when the colony's satiation is
-    /// `satiation` (0 hungry .. 1 replete), seconds.
-    pub fn unloading_time(&self, satiation: f64) -> f64 {
-        self.unloading_time_s * (1.0 + self.unloading_satiation_factor * satiation.clamp(0.0, 1.0))
+    /// Sugar a typical worker's crop holds, milligrams: the crop volume of
+    /// solution at the reference molarity.
+    pub fn crop_sugar_capacity_mg(&self) -> f64 {
+        self.sugar_mg(self.crop_capacity_ul, self.reference_molarity)
     }
 
     /// Response-threshold engagement probability per decision:
@@ -775,7 +791,7 @@ mod tests {
             (s.lay_probability(0.3) - 0.45).abs() < 1e-9,
             "half at the half quality"
         );
-        assert!(s.unloading_time(1.0) > s.unloading_time(0.0));
+        assert!(s.crop_sugar_capacity_mg() > 0.0);
         assert!(s.site_fidelity(1.0) > 0.95 && s.site_fidelity(0.1) < 0.4);
         assert!((s.site_fidelity(0.15) - 0.5).abs() < 1e-9);
         assert!((s.load_fraction(0.0) - 0.3).abs() < 1e-12 && s.load_fraction(1.0) == 1.0);

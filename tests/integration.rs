@@ -178,6 +178,9 @@ fn geometry_run(deformation: Deformation, selection: Selection, seed: u64) -> St
         ..SimConfig::default()
     };
     config.nest.initial_satiation = 0.05;
+    // Searching ants run hotter than the dial; keep every decision on the
+    // same budget so that only the geometry differs between runs.
+    config.species.search_temperature_factor = 1.0;
     let mut sim = Simulation::new(config, seed);
     sim.run(900);
     sim.stats().clone()

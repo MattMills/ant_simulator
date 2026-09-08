@@ -137,9 +137,12 @@ impl Environment {
 /// Nest and colony-level parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NestConfig {
-    /// Sugar store capacity per worker, milligrams.
+    /// Capacity of the nest's sugar reserve per simulated worker,
+    /// milligrams: the crops of the queen, the brood and any nestmates not
+    /// simulated, filled by workers inside passing on their surplus. The
+    /// simulated workers hold their own crops on top of it.
     pub store_capacity_mg_per_ant: f64,
-    /// Initial fill of the store as a fraction of capacity.
+    /// Initial fill of every crop and of the reserve, as a fraction.
     pub initial_satiation: f64,
     /// Initial brood items per worker, spread over the three stages.
     pub initial_brood_per_ant: f64,
@@ -161,7 +164,7 @@ pub struct NestConfig {
 impl Default for NestConfig {
     fn default() -> Self {
         NestConfig {
-            store_capacity_mg_per_ant: 0.4,
+            store_capacity_mg_per_ant: 0.2,
             initial_satiation: 0.3,
             initial_brood_per_ant: 0.5,
             max_brood_per_ant: 1.0,
@@ -269,10 +272,18 @@ pub struct BroodItem {
 /// The nest interior.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nest {
-    /// Sugar in store, milligrams.
+    /// Sugar in the reserve (the crops of the queen, brood and nestmates
+    /// not simulated), milligrams.
     pub store_mg: f64,
-    /// Store capacity, milligrams.
+    /// Reserve capacity, milligrams.
     pub capacity_mg: f64,
+    /// Nestmates the reserve stands for, in worker crops.
+    pub virtual_nestmates: f64,
+    /// Sugar in the crops of the workers inside, milligrams (updated each
+    /// tick).
+    pub crops_mg: f64,
+    /// Crop capacity of the workers inside, milligrams (updated each tick).
+    pub crops_capacity_mg: f64,
     /// Protein (prey) in store, milligrams.
     pub protein_mg: f64,
     /// Dead nestmates inside, waiting to be carried out.
@@ -312,12 +323,29 @@ impl Nest {
         }
     }
 
-    /// Fill of the store, 0 (empty) to 1 (full).
+    /// Sugar held inside the nest, in workers' crops and in the reserve,
+    /// milligrams.
+    pub fn sugar_mg(&self) -> f64 {
+        self.store_mg + self.crops_mg
+    }
+
+    /// Fill of the colony's crops and reserve together, 0 (empty) to 1
+    /// (full).
     pub fn satiation(&self) -> f64 {
-        if self.capacity_mg <= 0.0 {
+        let capacity = self.capacity_mg + self.crops_capacity_mg;
+        if capacity <= 0.0 {
             0.0
         } else {
-            (self.store_mg / self.capacity_mg).clamp(0.0, 1.0)
+            (self.sugar_mg() / capacity).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Empty space in the reserve per nestmate it stands for, milligrams.
+    pub fn reserve_deficit_per_nestmate(&self) -> f64 {
+        if self.virtual_nestmates <= 0.0 {
+            0.0
+        } else {
+            (self.capacity_mg - self.store_mg).max(0.0) / self.virtual_nestmates
         }
     }
 
@@ -494,6 +522,8 @@ pub struct Snapshot {
     pub store_mg: f64,
     /// Store fill.
     pub satiation: f64,
+    /// Mean crop fill of the workers inside.
+    pub crop_fill: f64,
     /// Mean recruitment excitation inside.
     pub excitation: f64,
     /// Eggs, larvae and pupae.
@@ -566,8 +596,15 @@ pub struct Stats {
     pub alive: usize,
     /// Workers outside at the end of the last tick.
     pub outside: usize,
-    /// Sugar in store at the end of the last tick, milligrams.
+    /// Sugar inside the nest (crops and reserve) at the end of the last
+    /// tick, milligrams.
     pub store_mg: f64,
+    /// Trophallactic contacts made by unloading foragers.
+    pub unloading_contacts: u64,
+    /// Sugar handed over by trophallaxis, milligrams.
+    pub trophallaxis_mg: f64,
+    /// Unloadings abandoned with a load still in the crop.
+    pub failed_unloads: u64,
     /// Periodic snapshots.
     pub log: Vec<Snapshot>,
 }
@@ -750,6 +787,9 @@ impl Simulation {
         let nest = Nest {
             store_mg: capacity * config.nest.initial_satiation.clamp(0.0, 1.0),
             capacity_mg: capacity,
+            virtual_nestmates: capacity / species.crop_sugar_capacity_mg().max(1e-9),
+            crops_mg: 0.0,
+            crops_capacity_mg: 0.0,
             protein_mg: 0.0,
             corpses: 0,
             brood: Vec::new(),
@@ -812,7 +852,7 @@ impl Simulation {
             sim.nest.brood.push(item);
         }
         sim.stats.alive = sim.alive;
-        sim.stats.store_mg = sim.nest.store_mg;
+        sim.stats.store_mg = sim.nest.sugar_mg();
         sim
     }
 
@@ -864,14 +904,17 @@ impl Simulation {
             self.tick_s,
             &mut self.rng,
         );
-        let ant = Ant::new(
+        let crop_capacity = self.species.crop_sugar_capacity_mg() * traits.size;
+        let mut ant = Ant::new(
             id,
             self.world.nest(),
             heading,
             leaf,
             traits,
             self.species.starvation_s,
+            crop_capacity,
         );
+        ant.sugar_mg = crop_capacity * self.config.nest.initial_satiation.clamp(0.0, 1.0);
         self.ants.push(ant);
         self.alive += 1;
         id
@@ -989,7 +1032,7 @@ impl Simulation {
         self.stats = Stats::new(nodes);
         self.stats.alive = self.alive;
         self.stats.outside = self.outside;
-        self.stats.store_mg = self.nest.store_mg;
+        self.stats.store_mg = self.nest.sugar_mg();
         self.trace = Trace::new(nodes);
     }
 
@@ -1076,7 +1119,7 @@ impl Simulation {
         self.stats.time_s += self.tick_s;
         self.stats.alive = self.alive;
         self.stats.outside = self.outside;
-        self.stats.store_mg = self.nest.store_mg;
+        self.stats.store_mg = self.nest.sugar_mg();
         if self.log_every_ticks > 0 && self.tick.is_multiple_of(self.log_every_ticks) {
             self.snapshot();
         }
@@ -1128,8 +1171,19 @@ impl Simulation {
             outside: self.outside,
             nursing,
             resting,
-            store_mg: self.nest.store_mg,
+            store_mg: self.nest.sugar_mg(),
             satiation: self.nest.satiation(),
+            crop_fill: {
+                let (sum, n) = self
+                    .living()
+                    .filter(|a| a.is_inside())
+                    .fold((0.0, 0usize), |(s, n), a| (s + a.crop_fill(), n + 1));
+                if n == 0 {
+                    0.0
+                } else {
+                    sum / n as f64
+                }
+            },
             excitation: self.nest.excitation,
             brood: (
                 self.nest.count(BroodStage::Egg),
@@ -1140,6 +1194,68 @@ impl Simulation {
             trail_total: self.world.total_pheromone(Pheromone::Trail),
             counters: self.world.counters().iter().map(|c| c.crossings).collect(),
         });
+    }
+
+    /// Trophallaxis inside the nest: every sharing interval a worker meets
+    /// a random nestmate, or the reserve standing in for the nestmates not
+    /// simulated, and the fuller crop passes part of the difference in
+    /// fill to the emptier one, so crop loads even out through the colony
+    /// (Buffin et al. 2009; Greenwald et al. 2015). Then the nest's crop
+    /// totals are refreshed.
+    fn share_food(&mut self) {
+        let fraction = self.species.transfer_fraction;
+        let p_share = (self.tick_s / self.species.sharing_interval_s.max(1e-9)).min(1.0);
+        let inside: Vec<usize> = (0..self.ants.len())
+            .filter(|&j| self.ants[j].alive && self.ants[j].is_inside())
+            .collect();
+        let virtual_nestmates = self.nest.virtual_nestmates;
+        for &i in &inside {
+            if self.ants[i].activity == Activity::Unloading || !self.rng.chance(p_share) {
+                continue;
+            }
+            let others = (inside.len() - 1) as f64;
+            let meet_reserve = virtual_nestmates > 0.0
+                && self
+                    .rng
+                    .chance(virtual_nestmates / (virtual_nestmates + others));
+            let (si, ci) = (self.ants[i].sugar_mg, self.ants[i].crop_capacity_mg);
+            if meet_reserve {
+                // The reserve behaves as a nestmate of the same crop size
+                // filled to the reserve's own level.
+                let fill_r = if self.nest.capacity_mg > 0.0 {
+                    (self.nest.store_mg / self.nest.capacity_mg).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let amount = fraction * (si - fill_r * ci) / 2.0;
+                let amount = if amount > 0.0 {
+                    amount.min((self.nest.capacity_mg - self.nest.store_mg).max(0.0))
+                } else {
+                    -((-amount).min(self.nest.store_mg))
+                };
+                self.ants[i].sugar_mg -= amount;
+                self.nest.store_mg += amount;
+                self.stats.trophallaxis_mg += amount.abs();
+            } else if others > 0.0 {
+                let j = inside[self.rng.below(inside.len())];
+                if j != i && self.ants[j].activity != Activity::Unloading {
+                    // The transfer that would equalise the two fills.
+                    let (sj, cj) = (self.ants[j].sugar_mg, self.ants[j].crop_capacity_mg);
+                    let equalising = (si * cj - sj * ci) / (ci + cj).max(1e-12);
+                    let amount = fraction * equalising;
+                    if amount.abs() > 1e-9 {
+                        self.ants[i].sugar_mg -= amount;
+                        self.ants[j].sugar_mg += amount;
+                        self.stats.trophallaxis_mg += amount.abs();
+                    }
+                }
+            }
+        }
+        let (crops, capacity) = inside.iter().fold((0.0, 0.0), |(s, c), &i| {
+            (s + self.ants[i].sugar_mg, c + self.ants[i].crop_capacity_mg)
+        });
+        self.nest.crops_mg = crops;
+        self.nest.crops_capacity_mg = capacity;
     }
 
     // ---------------------------------------------------------------
@@ -1198,8 +1314,8 @@ impl Simulation {
     }
 
     fn rest(&mut self, i: usize) {
-        let hunger = self.nest.hunger();
-        let (site_bonus, threshold, nursing_threshold, excitement) = {
+        let colony_hunger = self.nest.hunger();
+        let (site_bonus, threshold, nursing_threshold, excitement, own_hunger) = {
             let a = &self.ants[i];
             let age_s = a.age as f64 * self.tick_s;
             (
@@ -1210,11 +1326,17 @@ impl Simulation {
                     .threshold_at_age(a.traits.foraging_threshold, age_s),
                 a.traits.nursing_threshold,
                 a.excitement,
+                1.0 - a.crop_fill(),
             )
         };
-        // A known source is a reason to go again only while the colony
-        // can take the food: satiated nestmates refuse to unload foragers,
-        // which stops re-foraging (Mailleux, Detrain & Deneubourg 2006).
+        // Hunger is felt in the worker's own crop, amplified by what it
+        // reads off its nestmates: a full crop keeps a worker in, so a
+        // forager that could not unload stays in, which is how a satiated
+        // colony stops foraging (Greenwald et al. 2018: exits fall steeply
+        // with the forager's crop load; Mailleux, Detrain & Deneubourg
+        // 2006), while a starving individual goes out even when its
+        // nestmates are replete (Mailleux et al. 2011).
+        let hunger = own_hunger * (0.5 * own_hunger + 0.5 * colony_hunger);
         let protein_demand = self.nest.protein_demand(self.species.larva_protein_mg);
         let stimulus = self.species.hunger_gain * hunger
             + self.species.protein_demand_gain * protein_demand
@@ -1293,7 +1415,8 @@ impl Simulation {
     fn nurse(&mut self, i: usize) {
         let rate = self.species.nursing_rate_mg_s * self.tick_s;
         let need_cap = self.species.larva_food_mg;
-        let available = rate.min(self.nest.store_mg);
+        // Larvae are fed from the nurse's own crop.
+        let available = rate.min(self.ants[i].sugar_mg);
         if available > 0.0 {
             if let Some(hungriest) = self
                 .nest
@@ -1309,7 +1432,7 @@ impl Simulation {
                 let amount = available.min((need_cap - hungriest.fed_mg).max(0.0));
                 hungriest.fed_mg += amount;
                 hungriest.unfed_s = 0.0;
-                self.nest.store_mg -= amount;
+                self.ants[i].sugar_mg -= amount;
             }
         }
         // Protein goes to the larva that still needs the most of it.
@@ -1342,49 +1465,83 @@ impl Simulation {
         }
     }
 
+    /// Unloading by trophallaxis: every contact interval the forager
+    /// offers its load to a nestmate inside (or to the reserve, standing
+    /// for nestmates not simulated), which takes a share of its own empty
+    /// crop space (Greenwald et al. 2018). Each contact also excites the
+    /// receiver in proportion to the food's quality. The forager stops
+    /// once its crop is down to its residual, or gives up after too many
+    /// contacts and keeps what is left.
     fn unload(&mut self, i: usize) {
-        let a = &mut self.ants[i];
-        a.timer = a.timer.saturating_sub(1);
-        if a.timer > 0 {
+        {
+            let a = &mut self.ants[i];
+            a.timer = a.timer.saturating_sub(1);
+            if a.timer > 0 {
+                return;
+            }
+        }
+        let quality = self.ants[i].load_quality;
+        let residual = self.species.unload_residual_fraction * self.ants[i].crop_capacity_mg;
+        let offered = self.ants[i].sugar_mg;
+        let mut done = offered <= residual + 1e-12;
+        if !done {
+            // Choose a receiver: a simulated nestmate inside, or the reserve.
+            let inside: Vec<usize> = (0..self.ants.len())
+                .filter(|&j| {
+                    j != i
+                        && self.ants[j].alive
+                        && matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing)
+                })
+                .collect();
+            let virtual_share = self.nest.virtual_nestmates
+                / (self.nest.virtual_nestmates + inside.len() as f64).max(1e-9);
+            let fraction = self.species.transfer_fraction;
+            let taken = if inside.is_empty() || self.rng.chance(virtual_share) {
+                let deficit = self.nest.reserve_deficit_per_nestmate();
+                let amount = (fraction * deficit).min(offered - residual).max(0.0);
+                self.nest.store_mg += amount;
+                amount
+            } else {
+                let j = inside[self.rng.below(inside.len())];
+                let amount = (fraction * self.ants[j].crop_deficit_mg())
+                    .min(offered - residual)
+                    .max(0.0);
+                self.ants[j].sugar_mg += amount;
+                // The food carries the message: a contact that passes
+                // little excites little.
+                let share =
+                    (amount / (fraction * self.ants[j].crop_capacity_mg).max(1e-12)).min(1.0);
+                self.ants[j].excitement += self.species.excitation_per_contact * quality * share;
+                amount
+            };
+            self.ants[i].sugar_mg -= taken;
+            self.ants[i].contacts += 1;
+            self.stats.unloading_contacts += 1;
+            self.stats.trophallaxis_mg += taken;
+            let contacts = self.ants[i].contacts;
+            if self.ants[i].sugar_mg <= residual + 1e-12 {
+                done = true;
+            } else if contacts >= self.species.max_unloading_contacts {
+                done = true;
+                self.stats.failed_unloads += 1;
+            }
+        }
+        if !done {
+            self.ants[i].timer = self.seconds_to_ticks(self.species.contact_interval_s);
             return;
         }
-        let load_ul = a.crop_ul;
-        let molarity = a.load_molarity;
-        let quality = a.load_quality;
-        let fill = a.load_fill;
-        let item = a.item_mg;
-        a.crop_ul = 0.0;
-        a.item_mg = 0.0;
-        a.activity = Activity::Resting;
+        let fill = self.ants[i].load_fill;
+        {
+            let a = &mut self.ants[i];
+            a.crop_ul = 0.0;
+            a.activity = Activity::Resting;
+        }
         // Poor sources are abandoned: the memory survives with a
         // probability that depends on the quality of the food and on how
         // much of it there was to drink.
         let keep = self.species.site_fidelity(quality * fill);
         if !self.rng.chance(keep) {
             self.ants[i].site = None;
-        }
-        // The store gains the load's sugar content, or the prey.
-        let sugar = self.species.sugar_mg(load_ul, molarity);
-        self.nest.store_mg = (self.nest.store_mg + sugar).min(self.nest.capacity_mg);
-        self.stats.sugar_delivered_mg += sugar;
-        self.nest.protein_mg += item;
-        self.stats.protein_delivered_mg += item;
-        let leaf = self.ants[i].leaf;
-        let reward = self.config.reward.sugar_mg * sugar + self.config.reward.protein_mg * item;
-        self.credit(leaf, reward, false);
-        // Recruitment by contact: the returning forager excites nestmates.
-        let inside: Vec<usize> = (0..self.ants.len())
-            .filter(|&j| {
-                j != i
-                    && self.ants[j].alive
-                    && matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing)
-            })
-            .collect();
-        if !inside.is_empty() {
-            for _ in 0..self.species.contacts_per_return {
-                let j = inside[self.rng.below(inside.len())];
-                self.ants[j].excitement += self.species.excitation_per_contact * quality;
-            }
         }
     }
 
@@ -1399,7 +1556,19 @@ impl Simulation {
             let desired = self.species.crop_capacity_ul
                 * a.traits.size
                 * self.species.load_fraction(a.load_quality);
-            (a.load_molarity, a.load_quality, a.crop_ul, desired)
+            // What the crop can still take, given what it already holds.
+            let per_ul = self.species.sugar_mg(1.0, a.load_molarity);
+            let space_ul = if per_ul > 0.0 {
+                a.crop_deficit_mg() / per_ul + a.crop_ul
+            } else {
+                desired
+            };
+            (
+                a.load_molarity,
+                a.load_quality,
+                a.crop_ul,
+                desired.min(space_ul),
+            )
         };
         let rate = self.species.intake_rate(molarity) * self.tick_s;
         let want = rate.min((want_total - crop).max(0.0));
@@ -1409,6 +1578,7 @@ impl Simulation {
             (0.0, molarity)
         };
         self.ants[i].crop_ul += taken;
+        self.ants[i].sugar_mg += self.species.sugar_mg(taken, molarity);
         self.stats.food_collected_ul += taken;
         let short = taken < want - 1e-12;
         let full = self.ants[i].crop_ul >= want_total - 1e-9;
@@ -1563,8 +1733,7 @@ impl Simulation {
 
     fn arrive(&mut self, i: usize) {
         self.drop_corpse_here(i);
-        let satiation = self.nest.satiation();
-        let unloading = self.seconds_to_ticks(self.species.unloading_time(satiation));
+        let contact = self.seconds_to_ticks(self.species.contact_interval_s);
         let nest = self.world.nest();
         let cell = self.ants[i].cell();
         if let Some(c) = self.world.cell_mut(cell) {
@@ -1582,7 +1751,8 @@ impl Simulation {
             a.search_steps = 0;
             if a.carrying() {
                 a.activity = Activity::Unloading;
-                a.timer = unloading;
+                a.timer = contact;
+                a.contacts = 0;
                 a.deliveries += 1;
                 let length = a.trip_length;
                 let direct = a
@@ -1605,6 +1775,21 @@ impl Simulation {
             for &node in &self.leaf_paths[leaf] {
                 self.stats.delivered_by_node[node] += 1;
             }
+            // The load is in the nest: prey goes to the protein store at
+            // once, the sugar stays in the forager's crop until nestmates
+            // take it.
+            let (load_ul, molarity, item) = {
+                let a = &mut self.ants[i];
+                let out = (a.crop_ul, a.load_molarity, a.item_mg);
+                a.item_mg = 0.0;
+                out
+            };
+            let sugar = self.species.sugar_mg(load_ul, molarity);
+            self.stats.sugar_delivered_mg += sugar;
+            self.nest.protein_mg += item;
+            self.stats.protein_delivered_mg += item;
+            let reward = self.config.reward.sugar_mg * sugar + self.config.reward.protein_mg * item;
+            self.credit(leaf, reward, false);
         }
     }
 
@@ -1920,23 +2105,30 @@ impl Simulation {
         self.credit(leaf, reward, false);
     }
 
+    /// Every worker lives off its own crop: metabolism (scaled by body
+    /// mass to the three quarters and by temperature) drains it, and the
+    /// starvation clock runs only while it is empty.
     fn metabolize(&mut self, i: usize) {
         let mortality = self.config.nest.mortality;
         let starvation = self.species.starvation_s;
         let tick_s = self.tick_s;
-        let store_has_food = self.nest.store_mg > 0.0;
         let hazard = self.hazard_per_tick;
         let inside = self.ants[i].is_inside();
-        if inside {
+        let burn = self.species.consumption_mg_per_ant_per_s
+            * self.metabolism_factor
+            * tick_s
+            * self.ants[i].traits.size.powf(0.75);
+        {
             let a = &mut self.ants[i];
-            if store_has_food {
+            if a.sugar_mg > 0.0 {
+                a.sugar_mg = (a.sugar_mg - burn).max(0.0);
                 a.energy = starvation;
             } else {
                 a.energy -= tick_s;
             }
-        } else {
+        }
+        if !inside {
             self.ants[i].time_foraging += 1;
-            self.ants[i].energy -= tick_s;
             if self.ants[i].activity == Activity::Feeding {
                 self.ants[i].energy = starvation;
             }
@@ -2002,18 +2194,7 @@ impl Simulation {
     // ---------------------------------------------------------------
 
     fn nest_step(&mut self) {
-        // Metabolism scales with body mass to the three quarters.
-        let metabolic_mass: f64 = self
-            .ants
-            .iter()
-            .filter(|a| a.alive && a.is_inside())
-            .map(|a| a.traits.size.powf(0.75))
-            .sum();
-        let consumption = metabolic_mass
-            * self.species.consumption_mg_per_ant_per_s
-            * self.metabolism_factor
-            * self.tick_s;
-        self.nest.store_mg = (self.nest.store_mg - consumption).max(0.0);
+        self.share_food();
 
         // Mean excitation of the workers inside, for reporting.
         let (sum, n) = self
@@ -2551,6 +2732,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unloading_slows_and_foraging_stops_as_the_colony_fills() {
+        // Greenwald, Baltiansky & Feinerman 2018: receivers take a share of
+        // their empty crop space, so as crops fill a forager needs more
+        // contacts to unload, and eventually keeps its load and stays in.
+        let mut cfg = hungry_fast();
+        cfg.nest.store_capacity_mg_per_ant = 0.0;
+        cfg.nest.initial_brood_per_ant = 0.0;
+        cfg.nest.mortality = false;
+        cfg.world.random_food = None;
+        cfg.world.food_sources = vec![FoodSource::pool(Position::new(26, 15), 1, 1.0e6, 1.0)];
+        let mut sim = Simulation::new(cfg, 9);
+        sim.run(600);
+        let early = sim.stats().clone();
+        assert!(early.food_delivered > 5, "{early:?}");
+        let contacts_early = early.unloading_contacts as f64 / early.food_delivered as f64;
+        sim.reset_stats();
+        sim.run(3000);
+        let late = sim.stats().clone();
+        let contacts_late = late.unloading_contacts as f64 / late.food_delivered.max(1) as f64;
+        assert!(
+            contacts_late > contacts_early,
+            "unloading should take more contacts once crops fill: {contacts_early} then {contacts_late}"
+        );
+        assert!(sim.nest().satiation() > 0.85, "{:?}", sim.nest());
+        assert!(late.failed_unloads > 0, "{late:?}");
+        assert!(
+            late.foraging_fraction() < 0.5 * early.foraging_fraction(),
+            "foraging should wind down: {} then {}",
+            early.foraging_fraction(),
+            late.foraging_fraction()
+        );
+        // Everyone inside has been fed by trophallaxis.
+        let hungry = sim
+            .living()
+            .filter(|a| a.is_inside() && a.crop_fill() < 0.3)
+            .count();
+        assert_eq!(hungry, 0);
+    }
+
+    #[test]
+    fn crop_loads_converge_by_sharing() {
+        // Food from a small pool reaches a few foragers first and is then
+        // spread through the colony (Buffin et al. 2009; Greenwald et al.
+        // 2015): the crop fills of the workers inside even out.
+        let mut cfg = hungry_fast();
+        cfg.nest.store_capacity_mg_per_ant = 0.0;
+        cfg.nest.initial_satiation = 0.0;
+        cfg.nest.initial_brood_per_ant = 0.0;
+        cfg.nest.mortality = false;
+        cfg.world.random_food = None;
+        cfg.world.food_sources = vec![FoodSource::pool(Position::new(26, 15), 0, 3.0, 1.0)];
+        let mut sim = Simulation::new(cfg, 11);
+        let spread = |sim: &Simulation| {
+            let fills: Vec<f64> = sim
+                .living()
+                .filter(|a| a.is_inside())
+                .map(|a| a.crop_fill())
+                .collect();
+            let n = fills.len().max(1) as f64;
+            let mean = fills.iter().sum::<f64>() / n;
+            let var = fills.iter().map(|f| (f - mean).powi(2)).sum::<f64>() / n;
+            (mean, var.sqrt())
+        };
+        sim.run(1200);
+        assert!(sim.stats().food_delivered > 0);
+        assert!(
+            !sim.world().cell(Position::new(26, 15)).unwrap().has_food(),
+            "pool drunk up"
+        );
+        let (mean_then, sd_then) = spread(&sim);
+        sim.run(2400);
+        let (mean_now, sd_now) = spread(&sim);
+        assert!(mean_then > 0.0 && mean_now > 0.0);
+        assert!(
+            sd_now < 0.5 * sd_then,
+            "crop fills should even out: sd {sd_then:.3} → {sd_now:.3}"
+        );
+        assert!(sim.stats().trophallaxis_mg > 0.0);
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub fn render(sim: &Simulation) -> String {
         sim.outside(),
         s.food_delivered,
         s.sugar_delivered_mg,
-        sim.nest().store_mg,
+        sim.nest().sugar_mg(),
         100.0 * sim.nest().satiation(),
         world.total_food(),
         world.total_pheromone(Pheromone::Trail),

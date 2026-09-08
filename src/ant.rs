@@ -212,8 +212,15 @@ pub struct Ant {
     pub accepts_prey: bool,
     /// Whether the ant is carrying a dead nestmate.
     pub corpse: bool,
-    /// Seconds of reserve before starvation.
+    /// Seconds of reserve before starvation once the crop is empty.
     pub energy: f64,
+    /// Sugar in the crop, milligrams (the ant's own reserve, and on the
+    /// way home the load it will hand over).
+    pub sugar_mg: f64,
+    /// Sugar the crop can hold, milligrams.
+    pub crop_capacity_mg: f64,
+    /// Contacts made while unloading the current load.
+    pub contacts: u32,
     /// Ticks lived.
     pub age: u64,
     /// Dead ants stay in the roster but do nothing.
@@ -272,6 +279,7 @@ impl Ant {
         leaf: usize,
         traits: Traits,
         energy: f64,
+        crop_capacity_mg: f64,
     ) -> Self {
         Ant {
             id,
@@ -288,6 +296,9 @@ impl Ant {
             accepts_prey: false,
             corpse: false,
             energy,
+            sugar_mg: 0.0,
+            crop_capacity_mg,
+            contacts: 0,
             age: 0,
             alive: true,
             leaf,
@@ -329,6 +340,20 @@ impl Ant {
     /// Whether the ant carries food.
     pub fn carrying(&self) -> bool {
         self.crop_ul > 1e-9 || self.item_mg > 1e-9
+    }
+
+    /// Fill of the crop, 0 (empty) to 1 (full).
+    pub fn crop_fill(&self) -> f64 {
+        if self.crop_capacity_mg <= 0.0 {
+            0.0
+        } else {
+            (self.sugar_mg / self.crop_capacity_mg).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Empty space in the crop, milligrams of sugar.
+    pub fn crop_deficit_mg(&self) -> f64 {
+        (self.crop_capacity_mg - self.sugar_mg).max(0.0)
     }
 
     /// Record a cell in the short-term memory ring.
@@ -775,7 +800,7 @@ mod tests {
     fn ant_at(cell: Position, heading: f64) -> Ant {
         let species = Species::lasius_niger();
         let traits = Traits::draw(&species, 2.0, 1.0, &mut Rng::seed_from_u64(1));
-        let mut a = Ant::new(0, Position::new(5, 5), heading, 0, traits, 100.0);
+        let mut a = Ant::new(0, Position::new(5, 5), heading, 0, traits, 100.0, 0.17);
         a.position = Point::center_of(cell);
         a.activity = Activity::Outbound;
         a
