@@ -201,15 +201,16 @@ fn corpses_are_gathered_into_piles() {
 #[test]
 fn food_odour_speeds_up_discovery() {
     // Buehlmann et al. 2014: ants locate food by its smell; here a hidden
-    // pool is found sooner by a party of scouts when it gives off an
-    // odour (with many more scouts leaving at once, one of them walks
-    // straight into it either way).
+    // pool 20 cm off, whose plume reaches the ground the scouts cross, is
+    // found sooner by a party of twenty when it gives off an odour (far
+    // off, or with many more scouts leaving at once, one of them walks
+    // into it by luck either way).
     let seeds = [1u64, 2, 3];
     let time = |odour: bool| -> f64 {
         seeds
             .iter()
             .map(|&s| {
-                run_discovery(Species::lasius_niger(), 20, odour, 20.0 * 60.0, s)
+                run_discovery(Species::lasius_niger(), 20, 10, odour, 20.0 * 60.0, s)
                     .first_find_s
                     .unwrap_or(20.0 * 60.0)
             })
@@ -384,8 +385,13 @@ fn queen_thoughts_are_written_into_the_non_invariant_flow() {
         "a hotter colony walks more tortuously: {}",
         probe.straightness_correlation
     );
-    assert_eq!(probe.capacities.len(), 3);
+    assert_eq!(
+        probe.capacities.len(),
+        4,
+        "invariant, residual, both, and the memo"
+    );
     assert_eq!(probe.capacities[1].component, Component::Residual);
+    assert_eq!(probe.capacities[3].component, Component::Memo);
     let closed = run_closed_loop(
         &mut probe.simulation,
         6,

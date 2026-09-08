@@ -24,6 +24,7 @@ use crate::hive::{HistoryConfig, MovementHistory, Queen, QueenConfig};
 use crate::landscape::{
     ring_heading, turn_magnitude, EntropyLedger, Landscape, Sucker, RING, RING_STEP,
 };
+use crate::memo::{Leg, Memo, MemoConfig, Stop, Transit, TransitKey, TransitRecord, INSIDE};
 use crate::pheromone::Pheromone;
 use crate::rng::Rng;
 use crate::scaling::{Phase, Profile};
@@ -215,6 +216,9 @@ pub struct SimConfig {
     pub history: Option<HistoryConfig>,
     /// A queen who thinks through the movement history (needs `history`).
     pub mind: Option<QueenConfig>,
+    /// Keep the behavioural memo (what is done where, over the quadtree;
+    /// see [`crate::memo`]).
+    pub memo: Option<MemoConfig>,
 }
 
 impl Default for SimConfig {
@@ -249,6 +253,7 @@ impl SimConfig {
             surface_rows: 256,
             history: None,
             mind: None,
+            memo: None,
         }
     }
 }
@@ -311,6 +316,12 @@ pub struct Nest {
     pub larvae_starved: u64,
     /// Tick of the last egg.
     pub last_egg_tick: u64,
+    /// Larvae at the last refresh.
+    pub larvae_now: usize,
+    /// Protein demand at the last refresh.
+    pub protein_demand_now: f64,
+    /// Where the nurses' line of larvae stands.
+    pub feed_cursor: usize,
 }
 
 impl Nest {
@@ -368,6 +379,45 @@ impl Nest {
     /// Number of brood items in a stage.
     pub fn count(&self, stage: BroodStage) -> usize {
         self.brood.iter().filter(|b| b.stage == stage).count()
+    }
+
+    /// Bring the per-tick summaries of the brood up to date: the number
+    /// of larvae and the protein demand (so that no worker's decision has
+    /// to scan the brood).
+    pub fn refresh(&mut self, larva_protein_mg: f64) {
+        self.larvae_now = self.larvae();
+        self.protein_demand_now = self.protein_demand(larva_protein_mg);
+    }
+
+    /// Sort the brood hungriest first, so that nurses feed from the
+    /// front of the line.
+    pub fn sort_by_hunger(&mut self) {
+        self.brood.sort_by(|a, b| {
+            a.fed_mg
+                .partial_cmp(&b.fed_mg)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.feed_cursor = 0;
+    }
+
+    /// The next larva in line, if one is found within a short scan from
+    /// the cursor: the line is walked round and round, so that every
+    /// larva is tended in turn (fed what it still wants, its starvation
+    /// clock reset), and it is re-formed hungriest first every minute.
+    pub fn next_larva(&mut self) -> Option<usize> {
+        let n = self.brood.len();
+        if n == 0 {
+            return None;
+        }
+        for k in 0..n.min(32) {
+            let idx = (self.feed_cursor + k) % n;
+            if self.brood[idx].stage == BroodStage::Larva {
+                self.feed_cursor = (idx + 1) % n;
+                return Some(idx);
+            }
+        }
+        self.feed_cursor = (self.feed_cursor + 32) % n;
+        None
     }
 
     /// Number of larvae.
@@ -662,6 +712,8 @@ pub struct Stats {
     /// Corpses fetched from where they lay inside the nest by
     /// undertakers (`corpses_moved` counts every pick-up, outside too).
     pub corpses_fetched: u64,
+    /// Of the decisions, those stood in for by replayed transits.
+    pub decisions_replayed: u64,
     /// Position fixes taken from familiar landmarks.
     pub landmark_fixes: u64,
     /// Periodic snapshots.
@@ -844,6 +896,9 @@ pub struct Simulation {
     hierarchy: Hierarchy,
     rng: Rng,
     policies: Vec<EffectivePolicy>,
+    /// For each leaf, which distinct policy it acts through (transit
+    /// kernels are keyed by it).
+    policy_classes: Vec<u8>,
     leaf_paths: Vec<Vec<NodeId>>,
     dirty: bool,
     stats: Stats,
@@ -851,6 +906,7 @@ pub struct Simulation {
     surface: Vec<SurfaceRow>,
     history: Option<MovementHistory>,
     mind: Option<Queen>,
+    memo: Option<Memo>,
     profile: Profile,
     decisions_time: std::time::Duration,
     nest: Nest,
@@ -909,6 +965,10 @@ impl Simulation {
         let tick_s = world.tick_s();
         let cell_cm = world.cell_cm();
         let (world_width, world_height) = (world.width(), world.height());
+        let memo = config
+            .memo
+            .clone()
+            .map(|m| Memo::new(world_width, world_height, tick_s, m).with_transits(&world));
         let hierarchy_for_queen = hierarchy.clone();
         let nodes = hierarchy.len();
         let leaf_paths = hierarchy
@@ -931,10 +991,14 @@ impl Simulation {
             emerged: 0,
             larvae_starved: 0,
             last_egg_tick: 0,
+            larvae_now: 0,
+            protein_demand_now: 0.0,
+            feed_cursor: 0,
         };
         let nest_cells = world.nest_cells();
         let temperature_c = config.environment.temperature(0.0);
         let mut sim = Simulation {
+            policy_classes: Self::policy_classes(&hierarchy.compile()),
             policies: hierarchy.compile(),
             leaf_paths,
             hierarchy,
@@ -954,6 +1018,7 @@ impl Simulation {
                 .clone()
                 .map(|m| Queen::new(m, &hierarchy_for_queen)),
             profile: Profile::default(),
+            memo,
             decisions_time: std::time::Duration::ZERO,
             nest,
             nest_cells,
@@ -1000,6 +1065,8 @@ impl Simulation {
             let item = sim.random_brood_item();
             sim.nest.brood.push(item);
         }
+        sim.nest.sort_by_hunger();
+        sim.nest.refresh(sim.species.larva_protein_mg);
         sim.stats.alive = sim.alive;
         sim.stats.store_mg = sim.nest.sugar_mg();
         sim
@@ -1198,24 +1265,47 @@ impl Simulation {
         self.inside_total
     }
 
-    /// Workers inside within reach of worker `i`: on its cell or the eight
-    /// around it.
-    fn neighbours_inside(&self, i: usize) -> Vec<usize> {
+    /// One worker inside within reach of worker `i`, drawn uniformly from
+    /// those on its cell and the eight around it that pass `ok` (a few
+    /// draws, so that a crowded nest costs no more per contact than an
+    /// empty one).
+    fn random_neighbour_inside(&mut self, i: usize, ok: impl Fn(&Ant) -> bool) -> Option<usize> {
         let here = self.ants[i].cell();
-        let mut out = Vec::new();
+        let mut cells = [(0usize, 0usize); 9];
+        let mut n = 0;
+        let mut total = 0usize;
         for dy in -1..=1 {
             for dx in -1..=1 {
                 if let Some(k) = self.world.index(here.offset(dx, dy)) {
-                    out.extend(
-                        self.inside_by_cell[k]
-                            .iter()
-                            .copied()
-                            .filter(|&j| j != i && self.ants[j].alive),
-                    );
+                    let count = self.inside_by_cell[k].len();
+                    if count > 0 {
+                        cells[n] = (k, count);
+                        n += 1;
+                        total += count;
+                    }
                 }
             }
         }
-        out
+        if total <= 1 {
+            return None;
+        }
+        for _ in 0..4 {
+            let mut pick = self.rng.below(total);
+            let mut chosen = None;
+            for &(k, count) in &cells[..n] {
+                if pick < count {
+                    chosen = Some(self.inside_by_cell[k][pick]);
+                    break;
+                }
+                pick -= count;
+            }
+            if let Some(j) = chosen {
+                if j != i && self.ants[j].alive && ok(&self.ants[j]) {
+                    return Some(j);
+                }
+            }
+        }
+        None
     }
 
     /// Count a trophallaxis contact between two workers inside.
@@ -1568,12 +1658,345 @@ impl Simulation {
     /// Recompute the per-leaf effective policies from the hierarchy.
     pub fn recompile(&mut self) {
         self.policies = self.hierarchy.compile();
+        self.policy_classes = Self::policy_classes(&self.policies);
         self.dirty = false;
+    }
+
+    /// Number each distinct policy among the leaves' (identical leaves
+    /// share one).
+    fn policy_classes(policies: &[EffectivePolicy]) -> Vec<u8> {
+        let mut distinct: Vec<&EffectivePolicy> = Vec::new();
+        policies
+            .iter()
+            .map(|p| {
+                let class = match distinct.iter().position(|d| *d == p) {
+                    Some(k) => k,
+                    None => {
+                        distinct.push(p);
+                        distinct.len() - 1
+                    }
+                };
+                class.min(u8::MAX as usize) as u8
+            })
+            .collect()
     }
 
     /// The colony's movement history, if kept.
     pub fn history(&self) -> Option<&MovementHistory> {
         self.history.as_ref()
+    }
+
+    /// The behavioural memo, if kept (its nodes above the leaves are
+    /// composed at the queen's epochs and by [`Simulation::extract_memo`]).
+    pub fn memo(&self) -> Option<&Memo> {
+        self.memo.as_ref()
+    }
+
+    /// A composed copy of the behavioural memo, as an object of its own.
+    pub fn extract_memo(&self) -> Option<Memo> {
+        self.memo.as_ref().map(|m| m.extract())
+    }
+
+    /// Note a stop in the memo at the ant's cell, and close any transit
+    /// being recorded as one that ended inside its node.
+    fn note_stop(&mut self, i: usize, stop: Stop) {
+        let cell = self.ants[i].cell();
+        if let Some(m) = &mut self.memo {
+            m.record_stop(cell, stop);
+        }
+        self.close_record(i, INSIDE, 0.0);
+        self.ants[i].transit = None;
+    }
+
+    /// Lay pheromone on a cell and note it in the memo and in the
+    /// transit being recorded.
+    fn lay(
+        world: &mut World,
+        memo: Option<&mut Memo>,
+        record: Option<&mut TransitRecord>,
+        cell: Position,
+        kind: Pheromone,
+        amount: f64,
+    ) {
+        world.deposit(cell, kind, amount);
+        if let Some(m) = memo {
+            m.record_deposit(cell, kind, amount);
+        }
+        if let Some(r) = record {
+            r.deposits[kind.index()] += amount as f32;
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Memoized transits
+    // ---------------------------------------------------------------
+
+    /// The level of the memo's nodes, when transits are memoized.
+    fn transit_level(&self) -> Option<u8> {
+        self.memo
+            .as_ref()
+            .and_then(|m| m.transits.as_ref())
+            .map(|t| t.level())
+    }
+
+    /// The leg an ant is on, as a transit key codes it.
+    fn leg_code(&self, i: usize) -> u8 {
+        match self.ants[i].activity {
+            Activity::Searching => 2,
+            Activity::Inbound => 1,
+            _ => 0,
+        }
+    }
+
+    /// The side of a node's rectangle that a cell outside it lies beyond.
+    fn side_towards(rect: (usize, usize, usize, usize), cell: Position) -> u8 {
+        let (x0, y0, x1, y1) = rect;
+        let dn = y0 as i32 - cell.y;
+        let de = cell.x - (x1 as i32 - 1);
+        let ds = cell.y - (y1 as i32 - 1);
+        let dw = x0 as i32 - cell.x;
+        let mut best = (dn, 0u8);
+        for (d, side) in [(de, 1u8), (ds, 2u8), (dw, 3u8)] {
+            if d > best.0 {
+                best = (d, side);
+            }
+        }
+        best.1
+    }
+
+    /// Position along a side, 0 to 1, of a point.
+    fn along_side(rect: (usize, usize, usize, usize), side: u8, p: Point) -> f32 {
+        let (x0, y0, x1, y1) = rect;
+        let t = match side {
+            0 | 2 => (p.x - x0 as f64) / (x1 - x0).max(1) as f64,
+            _ => (p.y - y0 as f64) / (y1 - y0).max(1) as f64,
+        };
+        t.clamp(0.0, 1.0) as f32
+    }
+
+    /// The point just across a side of a node, at a position along it.
+    fn across_side(rect: (usize, usize, usize, usize), side: u8, along: f32) -> Point {
+        let (x0, y0, x1, y1) = rect;
+        let along = along as f64;
+        match side {
+            0 => Point::new(x0 as f64 + along * (x1 - x0) as f64, y0 as f64 - 0.5),
+            1 => Point::new(x1 as f64 + 0.5, y0 as f64 + along * (y1 - y0) as f64),
+            2 => Point::new(x0 as f64 + along * (x1 - x0) as f64, y1 as f64 + 0.5),
+            _ => Point::new(x0 as f64 - 0.5, y0 as f64 + along * (y1 - y0) as f64),
+        }
+    }
+
+    /// Close the transit being recorded, if any, as an outcome.
+    fn close_record(&mut self, i: usize, exit_side: u8, exit_along: f32) {
+        let Some(record) = self.ants[i].record.take() else {
+            return;
+        };
+        let heading = self.ants[i].heading;
+        let outcome = record.close(self.tick, exit_side, exit_along, heading);
+        if let Some(t) = self.memo.as_mut().and_then(|m| m.transits.as_mut()) {
+            t.record(record.key, outcome, &mut self.rng);
+        }
+    }
+
+    /// An ant leaves the node it was in for `to_cell`: close its record
+    /// by the side it left through.
+    fn leave_node(&mut self, i: usize, to_cell: Position, to: Point) {
+        let Some(record) = self.ants[i].record else {
+            return;
+        };
+        let rect = self
+            .memo
+            .as_ref()
+            .map(|m| m.rect(record.key.node))
+            .unwrap_or((0, 0, 0, 0));
+        let side = Self::side_towards(rect, to_cell);
+        let along = Self::along_side(rect, side, to);
+        self.close_record(i, side, along);
+    }
+
+    /// An ant enters the node holding `to_cell` from `from_cell`: replay
+    /// a mature kernel's outcome if the node is plain and invariant and
+    /// the ant qualifies, or open a record. Returns whether a replay
+    /// began.
+    fn enter_node(&mut self, i: usize, from_cell: Position, to_cell: Position, to: Point) -> bool {
+        let Some(level) = self.transit_level() else {
+            return false;
+        };
+        let Some(node) = self.memo.as_ref().and_then(|m| m.key_of(to_cell, level)) else {
+            return false;
+        };
+        let plain = self
+            .memo
+            .as_ref()
+            .and_then(|m| m.transits.as_ref())
+            .map(|t| t.is_plain(node))
+            .unwrap_or(false);
+        if !plain || self.ants[i].corpse || !self.ants[i].activity.is_moving() {
+            return false;
+        }
+        let rect = self
+            .memo
+            .as_ref()
+            .map(|m| m.rect(node))
+            .unwrap_or((0, 0, 0, 0));
+        let side = Self::side_towards(rect, from_cell);
+        let (heading, leaf, laden, searching) = {
+            let a = &self.ants[i];
+            (
+                a.heading,
+                a.leaf,
+                a.carrying(),
+                a.activity == Activity::Searching,
+            )
+        };
+        let tempering = if searching {
+            self.policies[leaf]
+                .tempering
+                .heated(self.species.search_temperature_factor)
+        } else {
+            self.policies[leaf].tempering
+        };
+        let k = self.world.channel(Pheromone::Trail).k.max(1e-9);
+        let trail = self.world.level(to_cell, Pheromone::Trail) / k;
+        let crowded = self
+            .world
+            .cell(to_cell)
+            .map(|c| c.crowding(false) > 0.5)
+            .unwrap_or(false);
+        let key = TransitKey {
+            node,
+            side,
+            heading: TransitKey::heading_class(heading),
+            leg: self.leg_code(i),
+            laden,
+            policy: self.policy_classes.get(leaf).copied().unwrap_or(0),
+            dial: TransitKey::dial_class(tempering),
+            context: TransitKey::context_class(trail, crowded),
+        };
+        // Corpses on the ground change what happens; so does a field that
+        // is not what it always was.
+        let (x0, y0, x1, y1) = rect;
+        let corpses = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| Position::new(x as i32, y as i32)))
+            .any(|p| self.world.cell(p).map(|c| c.corpses > 0).unwrap_or(false));
+        let invariant = match (
+            &self.history,
+            self.memo.as_ref().and_then(|m| m.transits.as_ref()),
+        ) {
+            (Some(h), Some(t)) => h
+                .key_of(to_cell, level)
+                .map(|hk| h.node_variance(hk) <= t.config().invariance)
+                .unwrap_or(false),
+            _ => true,
+        };
+        if !corpses && invariant {
+            let outcome = self
+                .memo
+                .as_mut()
+                .and_then(|m| m.transits.as_mut())
+                .and_then(|t| t.replay(&key, &mut self.rng));
+            if let Some(outcome) = outcome {
+                let exit = Self::across_side(rect, outcome.exit_side, outcome.exit_along);
+                if self.world.has_clearance(exit) {
+                    let until = self.tick + outcome.ticks.max(1) as u64;
+                    self.ants[i].transit = Some(Transit {
+                        until,
+                        entry: to,
+                        exit,
+                        outcome,
+                        key,
+                    });
+                    return true;
+                }
+            }
+        }
+        self.ants[i].record = Some(TransitRecord::open(key, self.tick, to));
+        false
+    }
+
+    /// A replayed transit ends: apply what the outcome carried and put
+    /// the ant at the exit, entering the next node.
+    fn complete_transit(&mut self, i: usize) {
+        let Some(t) = self.ants[i].transit.take() else {
+            return;
+        };
+        let o = t.outcome;
+        let from_cell = self.ants[i].cell();
+        let to_cell = t.exit.cell();
+        // The body moves from the entry cell to the exit cell.
+        if let Some(c) = self.world.cell_mut(from_cell) {
+            c.occupancy = c.occupancy.saturating_sub(1);
+        }
+        if let Some(c) = self.world.cell_mut(to_cell) {
+            c.occupancy = c.occupancy.saturating_add(1);
+        }
+        self.world.record_crossing(to_cell);
+        let leg = match t.key.leg {
+            1 => Leg::Inbound,
+            2 => Leg::Searching,
+            _ => Leg::Outbound,
+        };
+        let laden = t.key.laden;
+        let leaf = self.ants[i].leaf;
+        let species_trail = self.species.uses_home_pheromone;
+        let _ = species_trail;
+        // What was laid and walked, spread along the straight line from
+        // entry to exit.
+        let (dx, dy) = t.entry.to(t.exit);
+        let samples = (o.length.ceil().max(1.0) as usize).clamp(1, 64);
+        let per = 1.0 / samples as f64;
+        let mut prev = t.entry;
+        for s in 1..=samples {
+            let f = s as f64 / samples as f64;
+            let p = Point::new(t.entry.x + dx * f, t.entry.y + dy * f);
+            let cell = p.cell();
+            for (k, &amount) in o.deposits.iter().enumerate() {
+                if amount > 0.0 {
+                    let kind = Pheromone::ALL[k];
+                    self.world.deposit(cell, kind, amount as f64 * per);
+                    if let Some(m) = &mut self.memo {
+                        m.record_deposit(cell, kind, amount as f64 * per);
+                    }
+                }
+            }
+            if let Some(h) = &mut self.history {
+                h.record(prev, p, 0.0);
+            }
+            if let Some(m) = &mut self.memo {
+                m.record_move(cell, o.length as f64 * per);
+                m.record_replay(
+                    cell,
+                    o.decisions as f64 * per,
+                    o.entropy as f64 * per,
+                    o.straight as f64 * per,
+                    leg,
+                    laden,
+                );
+            }
+            prev = p;
+        }
+        // Accounting, as if the decisions had been made.
+        self.stats.decisions += o.decisions as u64;
+        self.stats.decisions_replayed += o.decisions as u64;
+        self.stats.entropy_sum += o.entropy as f64;
+        self.stats.selected_entropy_sum += o.entropy as f64;
+        self.stats.path.moves += o.decisions as u64;
+        self.stats.path.length += o.length as f64;
+        for &node in &self.leaf_paths[leaf] {
+            self.stats.path_by_node[node].moves += o.decisions as u64;
+            self.stats.path_by_node[node].length += o.length as f64;
+        }
+        // The ant itself: where it is, where it faces, what it has walked
+        // and integrated.
+        let species = &self.species;
+        let a = &mut self.ants[i];
+        a.position = t.exit;
+        a.heading = o.heading as f64;
+        a.trip_length += o.length as f64;
+        a.integrate(dx, dy, species, &mut self.rng);
+        a.remember(from_cell);
+        // Into the next node.
+        self.enter_node(i, from_cell, to_cell, t.exit);
     }
 
     /// The queen's mind, if she has one.
@@ -1717,11 +2140,23 @@ impl Simulation {
         if let Some(h) = &mut self.history {
             h.step();
         }
+        if let Some(m) = &mut self.memo {
+            m.step();
+        }
         let t5 = std::time::Instant::now();
         self.tick += 1;
         if let (Some(queen), Some(history)) = (&mut self.mind, &self.history) {
             if queen.due(self.tick) {
-                queen.epoch(self.tick, history, &mut self.hierarchy, &mut self.rng);
+                if let Some(m) = &mut self.memo {
+                    m.compose();
+                }
+                queen.epoch(
+                    self.tick,
+                    history,
+                    self.memo.as_ref(),
+                    &mut self.hierarchy,
+                    &mut self.rng,
+                );
                 self.dirty = true;
             }
         }
@@ -1873,14 +2308,10 @@ impl Simulation {
                 self.ants[i].sugar_mg -= amount;
                 self.nest.store_mg += amount;
                 self.stats.trophallaxis_mg += amount.abs();
-            } else {
-                let near: Vec<usize> = self
-                    .neighbours_inside(i)
-                    .into_iter()
-                    .filter(|&j| self.ants[j].activity != Activity::Unloading)
-                    .collect();
-                if !near.is_empty() {
-                    let j = near[self.rng.below(near.len())];
+            } else if let Some(j) =
+                self.random_neighbour_inside(i, |a| a.activity != Activity::Unloading)
+            {
+                {
                     // The transfer that would equalise the two fills.
                     let (sj, cj) = (self.ants[j].sugar_mg, self.ants[j].crop_capacity_mg);
                     let equalising = (si * cj - sj * ci) / (ci + cj).max(1e-12);
@@ -1982,14 +2413,14 @@ impl Simulation {
         // 2006), while a starving individual goes out even when its
         // nestmates are replete (Mailleux et al. 2011).
         let hunger = own_hunger * (0.5 * own_hunger + 0.5 * colony_hunger);
-        let protein_demand = self.nest.protein_demand(self.species.larva_protein_mg);
+        let protein_demand = self.nest.protein_demand_now;
         let stimulus = self.species.hunger_gain * hunger
             + self.species.protein_demand_gain * protein_demand
             + excitement
             + site_bonus * hunger.max(protein_demand);
         let p_forage =
             self.species.response(stimulus, threshold) * self.decision_prob * self.activity_factor;
-        let larvae = self.nest.larvae() as f64;
+        let larvae = self.nest.larvae_now as f64;
         let demand = if larvae <= 0.0 {
             0.0
         } else {
@@ -2039,7 +2470,7 @@ impl Simulation {
         let outbound_laying = self.species.outbound_laying;
         let exploratory_laying = self.species.exploratory_laying;
         // A protein trip or a sugar trip, from the colony's demand.
-        let demand = self.nest.protein_demand(self.species.larva_protein_mg);
+        let demand = self.nest.protein_demand_now;
         let base = self.species.protein_acceptance_base;
         let accepts_prey = self.rng.chance(base + (1.0 - base) * demand);
         let sight = self.species.sight_cm / self.world.cell_cm().max(1e-9);
@@ -2059,6 +2490,8 @@ impl Simulation {
         a.accepts_prey = accepts_prey;
         a.item_mg = 0.0;
         a.goal = None;
+        a.record = None;
+        a.transit = None;
         if nest_view.is_some() {
             a.nest_view = nest_view;
         }
@@ -2101,50 +2534,31 @@ impl Simulation {
         } else {
             0.0
         };
-        if available > 0.0 {
-            if let Some(hungriest) = self
-                .nest
-                .brood
-                .iter_mut()
-                .filter(|b| b.stage == BroodStage::Larva)
-                .min_by(|a, b| {
-                    a.fed_mg
-                        .partial_cmp(&b.fed_mg)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                let amount = available.min((need_cap - hungriest.fed_mg).max(0.0));
-                hungriest.fed_mg += amount;
-                hungriest.unfed_s = 0.0;
-                self.ants[i].sugar_mg -= amount;
-            }
-        }
-        // Protein goes to the larva that still needs the most of it.
         let protein_available = if in_chamber {
             rate.min(self.nest.protein_mg)
         } else {
             0.0
         };
-        if protein_available > 0.0 {
+        // A nurse with something to give tends the next larva in line:
+        // its starvation clock is reset, and it is fed what it still
+        // wants of sugar and of protein.
+        let tended = if available > 0.0 || protein_available > 0.0 {
+            self.nest.next_larva()
+        } else {
+            None
+        };
+        if let Some(idx) = tended {
             let need = self.species.larva_protein_mg;
-            if let Some(neediest) = self
-                .nest
-                .brood
-                .iter_mut()
-                .filter(|b| b.stage == BroodStage::Larva && b.protein_mg < need)
-                .min_by(|a, b| {
-                    a.protein_mg
-                        .partial_cmp(&b.protein_mg)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            {
-                let amount = protein_available.min(need - neediest.protein_mg);
-                neediest.protein_mg += amount;
-                neediest.unfed_s = 0.0;
-                self.nest.protein_mg -= amount;
-            }
+            let larva = &mut self.nest.brood[idx];
+            larva.unfed_s = 0.0;
+            let sugar = available.min((need_cap - larva.fed_mg).max(0.0));
+            larva.fed_mg += sugar;
+            let protein = protein_available.min((need - larva.protein_mg).max(0.0));
+            larva.protein_mg += protein;
+            self.ants[i].sugar_mg -= sugar;
+            self.nest.protein_mg -= protein;
         }
-        let no_larvae = self.nest.larvae() == 0;
+        let no_larvae = self.nest.larvae_now == 0;
         let a = &mut self.ants[i];
         a.time_nursing += 1;
         a.timer = a.timer.saturating_sub(1);
@@ -2178,23 +2592,25 @@ impl Simulation {
             // met in proportion to their number), or a nestmate within
             // reach; with nobody within reach the contact passes nothing.
             let inside_total = self.inside_count().saturating_sub(1) as f64;
-            let receivers: Vec<usize> = self
-                .neighbours_inside(i)
-                .into_iter()
-                .filter(|&j| matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing))
-                .collect();
             let virtual_share = self.nest.virtual_nestmates
                 / (self.nest.virtual_nestmates + inside_total).max(1e-9);
             let fraction = self.species.transfer_fraction;
-            let taken = if self.rng.chance(virtual_share) {
+            let receiver = if self.rng.chance(virtual_share) {
+                None
+            } else {
+                self.random_neighbour_inside(i, |a| {
+                    matches!(a.activity, Activity::Resting | Activity::Nursing)
+                })
+            };
+            let taken = if receiver.is_none() && self.rng.chance(virtual_share) {
                 let deficit = self.nest.reserve_deficit_per_nestmate();
                 let amount = (fraction * deficit).min(offered - residual).max(0.0);
                 self.nest.store_mg += amount;
                 amount
-            } else if receivers.is_empty() {
+            } else if receiver.is_none() {
                 0.0
             } else {
-                let j = receivers[self.rng.below(receivers.len())];
+                let j = receiver.expect("a receiver");
                 let amount = (fraction * self.ants[j].crop_deficit_mg())
                     .min(offered - residual)
                     .max(0.0);
@@ -2422,6 +2838,7 @@ impl Simulation {
 
     fn give_up(&mut self, i: usize) {
         self.drop_corpse_here(i);
+        self.note_stop(i, Stop::GaveUp);
         let uses_no_entry = self.species.uses_no_entry;
         let a = &mut self.ants[i];
         a.failed_trips += 1;
@@ -2456,6 +2873,7 @@ impl Simulation {
         let contact = self.seconds_to_ticks(self.species.contact_interval_s);
         let nest = self.world.nest();
         let cell = self.ants[i].cell();
+        self.note_stop(i, Stop::Nest);
         if let Some(c) = self.world.cell_mut(cell) {
             c.occupancy = c.occupancy.saturating_sub(1);
         }
@@ -2515,6 +2933,28 @@ impl Simulation {
     }
 
     fn walk(&mut self, i: usize) {
+        // A replayed transit: nothing to decide until it ends.
+        if let Some(until) = self.ants[i].transit.as_ref().map(|t| t.until) {
+            if self.tick < until {
+                self.tick_timers(i);
+                return;
+            }
+            self.complete_transit(i);
+            if !self.ants[i].alive || self.ants[i].transit.is_some() {
+                self.tick_timers(i);
+                return;
+            }
+            if self.check_transitions(i) {
+                return;
+            }
+        }
+        // A change of leg inside a node ends the transit being recorded
+        // as one that stopped inside.
+        if let Some(record) = &self.ants[i].record {
+            if record.key.leg != self.leg_code(i) {
+                self.close_record(i, INSIDE, 0.0);
+            }
+        }
         // Speed: cells per tick at the current temperature, faster on a
         // strong trail, slower when loaded and in a crowd.
         let speed = {
@@ -2554,7 +2994,11 @@ impl Simulation {
                 let ring = self.decide(i, mode, step);
                 self.decisions_time += decided.elapsed();
                 if let Some(ring) = ring {
-                    self.move_ant(i, ring, step);
+                    if self.move_ant(i, ring, step) {
+                        // A replayed transit began: the tick's walking is
+                        // done.
+                        return;
+                    }
                 }
                 if self.check_transitions(i) {
                     return;
@@ -2564,7 +3008,7 @@ impl Simulation {
         self.tick_timers(i);
     }
 
-    fn move_ant(&mut self, i: usize, ring: usize, step: f64) {
+    fn move_ant(&mut self, i: usize, ring: usize, step: f64) -> bool {
         let leaf = self.ants[i].leaf;
         let (from, heading) = {
             let a = &self.ants[i];
@@ -2629,26 +3073,54 @@ impl Simulation {
             .map(|c| c.crowding(true))
             .unwrap_or(0.0);
         let crowd_factor = 1.0 / (1.0 + species.crowding_deposition * crowding);
+        if let Some(m) = &mut self.memo {
+            m.record_move(to_cell, step);
+        }
+        if let Some(r) = &mut self.ants[i].record {
+            r.length += step as f32;
+        }
         match laying {
-            Some(Pheromone::Trail) => self.world.deposit(
+            Some(Pheromone::Trail) => Self::lay(
+                &mut self.world,
+                self.memo.as_mut(),
+                self.ants[i].record.as_mut(),
                 to_cell,
                 Pheromone::Trail,
                 species.trail_deposit * strength * step * crowd_factor,
             ),
-            Some(Pheromone::NoEntry) => self.world.deposit(
+            Some(Pheromone::NoEntry) => Self::lay(
+                &mut self.world,
+                self.memo.as_mut(),
+                self.ants[i].record.as_mut(),
                 to_cell,
                 Pheromone::NoEntry,
                 species.no_entry_deposit * strength * step,
             ),
-            Some(kind) => self.world.deposit(to_cell, kind, strength * step),
+            Some(kind) => Self::lay(
+                &mut self.world,
+                self.memo.as_mut(),
+                self.ants[i].record.as_mut(),
+                to_cell,
+                kind,
+                strength * step,
+            ),
             None => {}
         }
         if home {
-            self.world
-                .deposit(to_cell, Pheromone::Home, species.trail_deposit * step);
+            Self::lay(
+                &mut self.world,
+                self.memo.as_mut(),
+                self.ants[i].record.as_mut(),
+                to_cell,
+                Pheromone::Home,
+                species.trail_deposit * step,
+            );
         }
         if species.territory_deposit > 0.0 {
-            self.world.deposit(
+            Self::lay(
+                &mut self.world,
+                self.memo.as_mut(),
+                self.ants[i].record.as_mut(),
                 to_cell,
                 Pheromone::Territory,
                 species.territory_deposit * step,
@@ -2693,6 +3165,18 @@ impl Simulation {
             self.fix_position_by_landmarks(i);
             self.handle_corpses(i, to_cell);
         }
+        // Crossing into another memo node closes the transit being
+        // recorded and opens the next, or replays one.
+        let mut in_transit = false;
+        if let Some(level) = self.transit_level() {
+            let node_from = self.memo.as_ref().and_then(|m| m.key_of(from_cell, level));
+            let node_to = self.memo.as_ref().and_then(|m| m.key_of(to_cell, level));
+            if node_from != node_to {
+                self.leave_node(i, to_cell, to);
+                in_transit = self.enter_node(i, from_cell, to_cell, to);
+            }
+        }
+        in_transit
     }
 
     /// View-based position fixing: when the landmark of a stored view is
@@ -2863,6 +3347,7 @@ impl Simulation {
         let outbound = (a.trip_length, a.position);
         a.trip_length = 0.0;
         self.record_outbound(i, outbound);
+        self.note_stop(i, Stop::Food);
         self.stats.food_picked += 1;
         let reward = self.config.reward.food_picked;
         self.credit(leaf, reward, false);
@@ -2898,6 +3383,7 @@ impl Simulation {
         let outbound = (a.trip_length, a.position);
         a.trip_length = 0.0;
         self.record_outbound(i, outbound);
+        self.note_stop(i, Stop::Food);
         self.stats.food_picked += 1;
         self.stats.prey_picked += 1;
         let reward = self.config.reward.food_picked;
@@ -2950,6 +3436,9 @@ impl Simulation {
         let leaf = self.ants[i].leaf;
         let outside = !self.ants[i].is_inside();
         let cell = self.ants[i].cell();
+        if outside {
+            self.note_stop(i, Stop::Death);
+        }
         if self.ants[i].activity == Activity::Nursing {
             self.nurses = self.nurses.saturating_sub(1);
         }
@@ -3002,6 +3491,9 @@ impl Simulation {
 
     fn nest_step(&mut self) {
         self.nest.corpses = self.nest_corpses();
+        if self.tick.is_multiple_of(60) {
+            self.nest.sort_by_hunger();
+        }
         self.share_food();
 
         // Mean excitation of the workers inside, for reporting.
@@ -3096,6 +3588,7 @@ impl Simulation {
                 self.stats.eggs += 1;
             }
         }
+        self.nest.refresh(self.species.larva_protein_mg);
     }
 
     // ---------------------------------------------------------------
@@ -3183,6 +3676,21 @@ impl Simulation {
         // Accounting.
         self.stats.decisions += 1;
         self.stats.entropy_sum += tempered.entropy;
+        if let Some(m) = &mut self.memo {
+            let leg = if searching {
+                Leg::Searching
+            } else if matches!(mode, Mode::Inbound) {
+                Leg::Inbound
+            } else {
+                Leg::Outbound
+            };
+            m.record_decision(position.cell(), chosen, tempered.entropy, leg, carrying);
+        }
+        if let Some(r) = &mut self.ants[i].record {
+            r.decisions = r.decisions.saturating_add(1);
+            r.entropy += tempered.entropy as f32;
+            r.straight += (turn_magnitude(chosen) as f64 * RING_STEP).cos() as f32;
+        }
         let selected_entropy = if keep {
             entropy(&selected)
         } else {

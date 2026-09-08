@@ -33,6 +33,7 @@ use crate::hierarchy::NodeId;
 use crate::hive::{
     memory_capacity, Capacity, Component, FieldSummary, HistoryConfig, QueenConfig, Recursion,
 };
+use crate::memo::MemoConfig;
 use crate::pheromone::Pheromone;
 use crate::species::Species;
 use crate::world::{CapacityZone, Counter, FoodSource, Rect, WorldConfig};
@@ -790,6 +791,7 @@ pub struct DiscoveryOutcome {
 pub fn run_discovery(
     species: Species,
     ants: usize,
+    distance: i32,
     odour: bool,
     seconds: f64,
     seed: u64,
@@ -798,7 +800,7 @@ pub fn run_discovery(
     if !odour {
         species.food_odour = crate::pheromone::PheromoneParams::inert();
     }
-    let cfg = experiment_config(species, hidden_source(14), ants);
+    let cfg = experiment_config(species, hidden_source(distance), ants);
     let mut sim = Simulation::new(cfg, seed);
     let steps = (seconds / sim.tick_s()).round().max(1.0) as usize;
     let mut first_find_s = None;
@@ -1185,6 +1187,9 @@ pub struct MemoryProbeConfig {
     pub renewal_ul_per_s: f64,
     /// Seed of the map and of the run.
     pub seed: u64,
+    /// Whether the colony keeps the behavioural memo too, read at the
+    /// history's sector grain, so that its capacity is measured as well.
+    pub memo: bool,
 }
 
 impl Default for MemoryProbeConfig {
@@ -1208,6 +1213,7 @@ impl Default for MemoryProbeConfig {
             drain_mg_per_ant_per_h: 0.5,
             renewal_ul_per_s: 0.02,
             seed: 7,
+            memo: true,
         }
     }
 }
@@ -1234,6 +1240,16 @@ pub fn sustained_colony(cfg: &MemoryProbeConfig) -> SimConfig {
     if history.fast_half_life_s <= 0.0 {
         history.fast_half_life_s = cfg.epoch_s;
     }
+    sim.memo = if cfg.memo {
+        Some(MemoConfig {
+            slow_half_life_s: history.slow_half_life_s,
+            fast_half_life_s: history.fast_half_life_s,
+            grain: history.sector,
+            transits: None,
+        })
+    } else {
+        None
+    };
     sim.history = Some(history);
     sim
 }
@@ -1242,7 +1258,8 @@ pub fn sustained_colony(cfg: &MemoryProbeConfig) -> SimConfig {
 pub struct MemoryProbe {
     /// Epochs recorded.
     pub epochs: usize,
-    /// Memory capacity of the invariant, the residual and both components.
+    /// Memory capacity of the invariant, the residual and both
+    /// components, then of the behavioural memo when the colony keeps one.
     pub capacities: Vec<Capacity>,
     /// Correlation, over epochs, of the thought with the colony's decision
     /// entropy: whether the dial took effect.
@@ -1298,7 +1315,11 @@ pub fn run_memory_probe(cfg: &MemoryProbeConfig) -> MemoryProbe {
     }
     let epochs = thoughts.len();
     let queen = sim.queen().expect("the probe has a queen");
-    let capacities = [Component::Invariant, Component::Residual, Component::Both]
+    let mut components = vec![Component::Invariant, Component::Residual, Component::Both];
+    if cfg.memo {
+        components.push(Component::Memo);
+    }
+    let capacities = components
         .into_iter()
         .map(|c| memory_capacity(&queen.epochs, c, cfg.lags, cfg.ridge, cfg.train_fraction))
         .collect();

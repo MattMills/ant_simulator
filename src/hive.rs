@@ -25,6 +25,8 @@
 use crate::entropy::EntropyControl;
 use crate::geometry::{Point, Position};
 use crate::hierarchy::{Hierarchy, NodeId};
+use crate::memo::{Layer, Memo};
+use crate::quad::{QuadKey, QuadTree};
 use crate::rng::Rng;
 
 /// How the movement history is kept.
@@ -125,6 +127,16 @@ impl Flow {
         }
     }
 
+    /// Length of the summed unit directions.
+    fn polar_norm(&self) -> f64 {
+        (self.vx * self.vx + self.vy * self.vy).sqrt()
+    }
+
+    /// Length of the summed axis vectors.
+    fn axial_norm(&self) -> f64 {
+        (self.cx * self.cx + self.sx * self.sx).sqrt()
+    }
+
     /// Axial order of the flow: 1 when every move lies along one line
     /// (either way along it), 0 when moves point every way. Straight
     /// two-way traffic on a trail scores high; wandering scores low.
@@ -165,6 +177,9 @@ pub enum Component {
     Residual,
     /// Both together.
     Both,
+    /// The behavioural memo's current record, when the colony keeps one
+    /// (see [`crate::memo`]): what was done where over the last epoch.
+    Memo,
 }
 
 /// Topology of the invariant skeleton: its channels (eight-connected groups
@@ -196,19 +211,34 @@ pub struct FieldSummary {
     pub topology: Topology,
 }
 
-/// The colony's movement history, collapsed over time at two grains and
-/// two time constants.
+/// A node of the history's trees: the flow through it, and the coherence
+/// of its leaves (the summed lengths of the leaves' mean-direction and
+/// axis vectors, which survive the coarse grain as the local alignment
+/// and axial order).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Node {
+    flow: Flow,
+    polar: f64,
+    axial: f64,
+}
+
+impl Node {
+    fn scale_in_place(&mut self, k: f64) {
+        self.flow.scale_in_place(k);
+        self.polar *= k;
+        self.axial *= k;
+    }
+}
+
+/// The colony's movement history, collapsed over time at every grain of
+/// a quadtree and two time constants.
 #[derive(Clone, Debug)]
 pub struct MovementHistory {
     width: usize,
     height: usize,
-    sector: usize,
-    cols: usize,
-    rows: usize,
-    fine_slow: Vec<Flow>,
-    fine_fast: Vec<Flow>,
-    coarse_slow: Vec<Flow>,
-    coarse_fast: Vec<Flow>,
+    sector_level: u8,
+    slow: QuadTree<Node>,
+    fast: QuadTree<Node>,
     slow_r: f64,
     fast_r: f64,
     /// Forgetting is lazy: the accumulators store values divided by the
@@ -218,16 +248,19 @@ pub struct MovementHistory {
     slow_g: f64,
     fast_g: f64,
     cfg: HistoryConfig,
+    /// Ticks elapsed, for unbiased rate readings before the accumulators
+    /// have filled.
+    ticks: u64,
     /// Moves recorded so far.
     pub moves: u64,
 }
 
 impl MovementHistory {
+    /// Numbers per node in a reading.
+    pub const READING: usize = 6;
+
     /// An empty history for a world of the given size and tick.
     pub fn new(width: usize, height: usize, tick_s: f64, cfg: HistoryConfig) -> Self {
-        let sector = cfg.sector.max(1);
-        let cols = width.div_ceil(sector);
-        let rows = height.div_ceil(sector);
         let retention = |half_life: f64| -> f64 {
             if half_life <= 0.0 {
                 0.0
@@ -235,69 +268,123 @@ impl MovementHistory {
                 0.5f64.powf(tick_s / half_life)
             }
         };
+        let slow: QuadTree<Node> = QuadTree::new(width, height);
+        let sector_level = slow.level_for_side(cfg.sector.max(1));
         MovementHistory {
             width,
             height,
-            sector,
-            cols,
-            rows,
-            fine_slow: vec![Flow::default(); width * height],
-            fine_fast: vec![Flow::default(); width * height],
-            coarse_slow: vec![Flow::default(); cols * rows],
-            coarse_fast: vec![Flow::default(); cols * rows],
+            sector_level,
+            fast: slow.clone(),
+            slow,
             slow_r: retention(cfg.slow_half_life_s),
             fast_r: retention(cfg.fast_half_life_s),
             slow_g: 1.0,
             fast_g: 1.0,
             cfg,
+            ticks: 0,
             moves: 0,
         }
+    }
+
+    /// Levels of the quadtree below the root (the leaf level).
+    pub fn tree_levels(&self) -> u8 {
+        self.slow.levels()
+    }
+
+    /// The level whose nodes are the sectors.
+    pub fn sector_level(&self) -> u8 {
+        self.sector_level
+    }
+
+    /// The nodes of a level that meet the grid, in Z-order.
+    pub fn keys(&self, level: u8) -> Vec<QuadKey> {
+        self.slow.keys(level)
+    }
+
+    /// The node at a level holding a cell.
+    pub fn key_of(&self, cell: Position, level: u8) -> Option<QuadKey> {
+        self.slow.key_of(cell, level)
+    }
+
+    /// The cells of a node, `(x0, y0, x1, y1)` with exclusive far corners.
+    pub fn rect(&self, key: QuadKey) -> (usize, usize, usize, usize) {
+        self.slow.rect(key)
+    }
+
+    /// Sectors across and down.
+    pub fn sectors(&self) -> (usize, usize) {
+        self.slow.extent(self.sector_level)
+    }
+
+    /// Cells per sector side.
+    pub fn sector_size(&self) -> usize {
+        self.slow.node_side(self.sector_level)
+    }
+
+    /// The sector a cell belongs to (row-major).
+    pub fn sector_of(&self, cell: Position) -> Option<usize> {
+        let key = self.slow.key_of(cell, self.sector_level)?;
+        let (cols, _) = self.sectors();
+        Some(key.row() as usize * cols + key.col() as usize)
+    }
+
+    /// The node of a row-major sector index.
+    pub fn sector_key(&self, sector: usize) -> Option<QuadKey> {
+        let (cols, rows) = self.sectors();
+        if cols == 0 || sector >= cols * rows {
+            return None;
+        }
+        Some(QuadKey::new(
+            self.sector_level,
+            (sector % cols) as u32,
+            (sector / cols) as u32,
+        ))
     }
 
     /// Fold the running decay factors into the stores.
     fn renormalise(&mut self) {
         let (sg, fg) = (self.slow_g, self.fast_g);
-        for f in self.fine_slow.iter_mut().chain(self.coarse_slow.iter_mut()) {
-            f.scale_in_place(sg);
+        for n in self.slow.values_mut() {
+            n.scale_in_place(sg);
         }
-        for f in self.fine_fast.iter_mut().chain(self.coarse_fast.iter_mut()) {
-            f.scale_in_place(fg);
+        for n in self.fast.values_mut() {
+            n.scale_in_place(fg);
         }
         self.slow_g = 1.0;
         self.fast_g = 1.0;
     }
 
-    /// Sectors across and down.
-    pub fn sectors(&self) -> (usize, usize) {
-        (self.cols, self.rows)
-    }
-
-    /// Cells per sector side.
-    pub fn sector_size(&self) -> usize {
-        self.sector
-    }
-
-    /// The sector a cell belongs to.
-    pub fn sector_of(&self, cell: Position) -> Option<usize> {
-        if cell.x < 0
-            || cell.y < 0
-            || cell.x as usize >= self.width
-            || cell.y as usize >= self.height
-        {
-            return None;
+    /// Add one move to the leaf holding `cell` and to every node above
+    /// it, carrying the change in the leaf's coherence up the tree.
+    fn add_move(
+        tree: &mut QuadTree<Node>,
+        cell: Position,
+        ux: f64,
+        uy: f64,
+        turn_cos: f64,
+        w: f64,
+    ) {
+        if w <= 0.0 {
+            return;
         }
-        Some((cell.y as usize / self.sector) * self.cols + cell.x as usize / self.sector)
-    }
-
-    fn cell_index(&self, cell: Position) -> Option<usize> {
-        if cell.x < 0
-            || cell.y < 0
-            || cell.x as usize >= self.width
-            || cell.y as usize >= self.height
-        {
-            return None;
+        let Some(leaf) = tree.leaf(cell) else {
+            return;
+        };
+        let (d_polar, d_axial) = {
+            let n = tree.get_mut(leaf);
+            let (p0, a0) = (n.flow.polar_norm(), n.flow.axial_norm());
+            n.flow.add(ux, uy, turn_cos, w);
+            let (p1, a1) = (n.flow.polar_norm(), n.flow.axial_norm());
+            n.polar = p1;
+            n.axial = a1;
+            (p1 - p0, a1 - a0)
+        };
+        for key in leaf.ancestors() {
+            let n = tree.get_mut(key);
+            n.flow.add(ux, uy, turn_cos, w);
+            n.polar += d_polar;
+            n.axial += d_axial;
         }
-        Some(cell.y as usize * self.width + cell.x as usize)
     }
 
     /// Record one move, weighted by its length, at the cell it ends in;
@@ -324,20 +411,15 @@ impl MovementHistory {
         } else {
             0.0
         };
-        if let Some(i) = self.cell_index(cell) {
-            self.fine_slow[i].add(ux, uy, turn_cos, ws);
-            self.fine_fast[i].add(ux, uy, turn_cos, wf);
-        }
-        if let Some(s) = self.sector_of(cell) {
-            self.coarse_slow[s].add(ux, uy, turn_cos, ws);
-            self.coarse_fast[s].add(ux, uy, turn_cos, wf);
-        }
+        Self::add_move(&mut self.slow, cell, ux, uy, turn_cos, ws);
+        Self::add_move(&mut self.fast, cell, ux, uy, turn_cos, wf);
         self.moves += 1;
     }
 
     /// Let one tick pass: both accumulators forget (lazily, by advancing
     /// their decay factors).
     pub fn step(&mut self) {
+        self.ticks += 1;
         self.slow_g *= self.slow_r;
         self.fast_g *= self.fast_r;
         if self.slow_g < 1e-150 || self.fast_g < 1e-150 {
@@ -345,167 +427,190 @@ impl MovementHistory {
         }
     }
 
-    /// Normalisation that turns an accumulator into a steady rate per tick
-    /// (moves are added before the tick's forgetting, so a constant rate
-    /// `λ` settles at `λ r / (1 − r)`).
-    fn slow_norm(&self) -> f64 {
-        if self.slow_r <= 0.0 {
+    /// Normalisation that turns an accumulator into a rate per tick after
+    /// the ticks elapsed (moves are added before the tick's forgetting,
+    /// so a constant rate `λ` stands at `λ r (1 − rᵗ) / (1 − r)` after
+    /// `t` ticks and settles at `λ r / (1 − r)`).
+    fn norm(r: f64, ticks: u64) -> f64 {
+        if r <= 0.0 || ticks == 0 {
             0.0
         } else {
-            (1.0 - self.slow_r) / self.slow_r
+            let filled = 1.0 - r.powi(ticks.min(1 << 30) as i32);
+            (1.0 - r) / (r * filled.max(1e-300))
         }
     }
 
+    fn slow_norm(&self) -> f64 {
+        Self::norm(self.slow_r, self.ticks)
+    }
+
     fn fast_norm(&self) -> f64 {
-        if self.fast_r <= 0.0 {
-            0.0
+        Self::norm(self.fast_r, self.ticks)
+    }
+
+    /// Scale that turns a slow store into a steady rate per tick.
+    fn slow_scale(&self) -> f64 {
+        self.slow_g * self.slow_norm()
+    }
+
+    /// Scale that turns a fast store into a rate per tick.
+    fn fast_scale(&self) -> f64 {
+        self.fast_g * self.fast_norm()
+    }
+
+    /// The invariant flow through a node, as a steady rate per tick.
+    pub fn node_invariant(&self, key: QuadKey) -> Flow {
+        self.slow.get(key).flow.scaled(self.slow_scale())
+    }
+
+    /// The current flow through a node, as a rate per tick.
+    pub fn node_current(&self, key: QuadKey) -> Flow {
+        self.fast.get(key).flow.scaled(self.fast_scale())
+    }
+
+    /// The non-invariant residual of a node: the current density minus
+    /// the invariant one, and the current mean direction minus the
+    /// invariant one.
+    pub fn node_residual(&self, key: QuadKey) -> (f64, (f64, f64)) {
+        let inv = self.node_invariant(key);
+        let cur = self.node_current(key);
+        let (ix, iy) = inv.mean();
+        let (cx, cy) = cur.mean();
+        (cur.weight - inv.weight, (cx - ix, cy - iy))
+    }
+
+    /// How far a node's current flow departs from its invariant one,
+    /// relative to the invariant density: zero where the colony moves as
+    /// it always has, large where the movement is new.
+    pub fn node_variance(&self, key: QuadKey) -> f64 {
+        let inv = self.node_invariant(key);
+        let cur = self.node_current(key);
+        if inv.weight <= 0.0 {
+            if cur.weight > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
         } else {
-            (1.0 - self.fast_r) / self.fast_r
+            (cur.weight - inv.weight).abs() / inv.weight
         }
     }
 
     /// The invariant flow through a sector, as a steady rate per tick.
     pub fn invariant(&self, sector: usize) -> Flow {
-        self.coarse_slow[sector].scaled(self.slow_g * self.slow_norm())
+        self.sector_key(sector)
+            .map(|k| self.node_invariant(k))
+            .unwrap_or_default()
     }
 
     /// The current flow through a sector, as a rate per tick.
     pub fn current(&self, sector: usize) -> Flow {
-        self.coarse_fast[sector].scaled(self.fast_g * self.fast_norm())
+        self.sector_key(sector)
+            .map(|k| self.node_current(k))
+            .unwrap_or_default()
     }
 
     /// The invariant flow over the whole field, as a steady rate per tick.
     pub fn invariant_whole(&self) -> Flow {
-        let mut whole = Flow::default();
-        for f in &self.coarse_slow {
-            whole.weight += f.weight;
-            whole.vx += f.vx;
-            whole.vy += f.vy;
-            whole.cx += f.cx;
-            whole.sx += f.sx;
-            whole.straight += f.straight;
-        }
-        whole.scaled(self.slow_g * self.slow_norm())
+        self.node_invariant(QuadKey::ROOT)
     }
 
     /// The current flow over the whole field, as a rate per tick.
     pub fn current_whole(&self) -> Flow {
-        let mut whole = Flow::default();
-        for f in &self.coarse_fast {
-            whole.weight += f.weight;
-            whole.vx += f.vx;
-            whole.vy += f.vy;
-            whole.cx += f.cx;
-            whole.sx += f.sx;
-            whole.straight += f.straight;
-        }
-        whole.scaled(self.fast_g * self.fast_norm())
+        self.node_current(QuadKey::ROOT)
     }
 
     /// The non-invariant residual of a sector: the current density minus
     /// the invariant one, and the current mean direction minus the
     /// invariant one.
     pub fn residual(&self, sector: usize) -> (f64, (f64, f64)) {
-        let inv = self.invariant(sector);
-        let cur = self.current(sector);
-        let (ix, iy) = inv.mean();
-        let (cx, cy) = cur.mean();
-        (cur.weight - inv.weight, (cx - ix, cy - iy))
+        self.sector_key(sector)
+            .map(|k| self.node_residual(k))
+            .unwrap_or((0.0, (0.0, 0.0)))
     }
 
     /// The invariant flow through a cell, as a steady rate per tick.
     pub fn fine_invariant(&self, cell: Position) -> Flow {
-        self.cell_index(cell)
-            .map(|i| self.fine_slow[i].scaled(self.slow_g * self.slow_norm()))
+        self.slow
+            .leaf(cell)
+            .map(|k| self.node_invariant(k))
             .unwrap_or_default()
     }
 
     /// The current flow through a cell, as a rate per tick.
     pub fn fine_current(&self, cell: Position) -> Flow {
-        self.cell_index(cell)
-            .map(|i| self.fine_fast[i].scaled(self.fast_g * self.fast_norm()))
+        self.fast
+            .leaf(cell)
+            .map(|k| self.node_current(k))
             .unwrap_or_default()
     }
 
-    /// Numbers per block in a reading.
-    pub const READING: usize = 6;
-
-    /// The blocks a reading is taken over, as cell rectangles
-    /// `(x0, y0, x1, y1)` with exclusive far corners: the pyramid of
-    /// grains from the whole field down to the sector (each level halves
-    /// the grain), or the sectors alone when the reading is not
-    /// multi-scale.
-    pub fn blocks(&self) -> Vec<(usize, usize, usize, usize)> {
-        let mut grain = self.sector;
+    /// The levels a reading is taken over: the pyramid from the root down
+    /// to the sectors, or the sector level alone.
+    fn levels_read(&self) -> Vec<u8> {
         if self.cfg.multiscale {
-            while grain < self.width.max(self.height) {
-                grain *= 2;
-            }
+            (0..=self.sector_level).collect()
+        } else {
+            vec![self.sector_level]
         }
-        let mut out = Vec::new();
-        loop {
-            let cols = self.width.div_ceil(grain);
-            let rows = self.height.div_ceil(grain);
-            for r in 0..rows {
-                for c in 0..cols {
-                    out.push((
-                        c * grain,
-                        r * grain,
-                        ((c + 1) * grain).min(self.width),
-                        ((r + 1) * grain).min(self.height),
-                    ));
-                }
-            }
-            if grain <= self.sector {
-                break;
-            }
-            grain /= 2;
-        }
-        out
     }
 
-    /// Reading of one accumulator over a block of cells, built from the
-    /// cells so that local coherence survives the coarse grain: density
-    /// (moves per tick), the weighted mean polar alignment of the cells,
-    /// their weighted mean axial order, the straightness of the paths,
-    /// and the block's mean direction.
-    fn block_reading(
-        &self,
-        block: (usize, usize, usize, usize),
-        slow: bool,
-    ) -> [f64; Self::READING] {
-        let (norm, fine) = if slow {
-            (self.slow_g * self.slow_norm(), &self.fine_slow)
+    /// The blocks a reading is taken over, as cell rectangles
+    /// `(x0, y0, x1, y1)` with exclusive far corners: the nodes of the
+    /// pyramid from the whole field down to the sectors (each level
+    /// halves the grain), or the sectors alone when the reading is not
+    /// multi-scale, in Z-order.
+    pub fn blocks(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.levels_read()
+            .into_iter()
+            .flat_map(|level| self.slow.keys(level))
+            .map(|k| self.slow.rect(k))
+            .collect()
+    }
+
+    /// Reading of one accumulator at a node: density (moves per tick),
+    /// the local polar alignment of its cells, their local axial order,
+    /// the straightness of the paths, and the node's mean direction.
+    fn node_reading(&self, key: QuadKey, slow: bool) -> [f64; Self::READING] {
+        let (tree, scale) = if slow {
+            (&self.slow, self.slow_scale())
         } else {
-            (self.fast_g * self.fast_norm(), &self.fine_fast)
+            (&self.fast, self.fast_scale())
         };
-        let (x0, y0, x1, y1) = block;
-        let (mut align, mut nematic) = (0.0, 0.0);
-        let mut whole = Flow::default();
-        for y in y0..y1.min(self.height) {
-            for x in x0..x1.min(self.width) {
-                let f = &fine[y * self.width + x];
-                align += f.weight * f.alignment();
-                nematic += f.weight * f.nematic();
-                whole.weight += f.weight;
-                whole.vx += f.vx;
-                whole.vy += f.vy;
-                whole.straight += f.straight;
+        let n = tree.get(key);
+        let w = n.flow.weight;
+        if w <= 0.0 {
+            return [0.0; Self::READING];
+        }
+        let (mx, my) = n.flow.mean();
+        [
+            w * scale,
+            n.polar / w,
+            n.axial / w,
+            n.flow.straightness(),
+            mx,
+            my,
+        ]
+    }
+
+    /// The reading of one component at a node: six numbers (invariant or
+    /// residual) or twelve (both).
+    pub fn reading(&self, key: QuadKey, component: Component) -> Vec<f64> {
+        if component == Component::Memo {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(2 * Self::READING);
+        if matches!(component, Component::Invariant | Component::Both) {
+            out.extend_from_slice(&self.node_reading(key, true));
+        }
+        if matches!(component, Component::Residual | Component::Both) {
+            let inv = self.node_reading(key, true);
+            let cur = self.node_reading(key, false);
+            for k in 0..Self::READING {
+                out.push(cur[k] - inv[k]);
             }
         }
-        let (mx, my) = whole.mean();
-        if whole.weight > 0.0 {
-            [
-                whole.weight * norm,
-                align / whole.weight,
-                nematic / whole.weight,
-                whole.straightness(),
-                mx,
-                my,
-            ]
-        } else {
-            [0.0; Self::READING]
-        }
+        out
     }
 
     /// The coarse-grained reading of one component: six numbers per
@@ -514,19 +619,26 @@ impl MovementHistory {
     /// straightness, mean direction (x, y). Residual: the same six for
     /// the current flow minus the invariant ones.
     pub fn features(&self, component: Component) -> Vec<f64> {
-        let blocks = self.blocks();
-        let mut out = Vec::with_capacity(2 * blocks.len() * Self::READING);
+        if component == Component::Memo {
+            return Vec::new();
+        }
+        let keys: Vec<QuadKey> = self
+            .levels_read()
+            .into_iter()
+            .flat_map(|level| self.slow.keys(level))
+            .collect();
+        let mut out = Vec::with_capacity(2 * keys.len() * Self::READING);
         if matches!(component, Component::Invariant | Component::Both) {
-            for &b in &blocks {
-                out.extend_from_slice(&self.block_reading(b, true));
+            for &k in &keys {
+                out.extend_from_slice(&self.node_reading(k, true));
             }
         }
         if matches!(component, Component::Residual | Component::Both) {
-            for &b in &blocks {
-                let inv = self.block_reading(b, true);
-                let cur = self.block_reading(b, false);
-                for k in 0..Self::READING {
-                    out.push(cur[k] - inv[k]);
+            for &k in &keys {
+                let inv = self.node_reading(k, true);
+                let cur = self.node_reading(k, false);
+                for j in 0..Self::READING {
+                    out.push(cur[j] - inv[j]);
                 }
             }
         }
@@ -539,18 +651,20 @@ impl MovementHistory {
     /// other cells that channels enclose (regions not reaching the edge
     /// of the world).
     pub fn topology(&self) -> Topology {
-        let norm = self.slow_g * self.slow_norm();
-        let channel: Vec<bool> = self
-            .fine_slow
-            .iter()
-            .map(|f| {
-                f.weight * norm >= self.cfg.channel_rate
-                    && f.nematic() >= self.cfg.channel_alignment
-            })
-            .collect();
+        let scale = self.slow_scale();
         let w = self.width as i32;
         let h = self.height as i32;
         let idx = |x: i32, y: i32| (y as usize) * self.width + x as usize;
+        let mut channel = vec![false; self.width * self.height];
+        for y in 0..h {
+            for x in 0..w {
+                if let Some(k) = self.slow.leaf(Position::new(x, y)) {
+                    let f = &self.slow.get(k).flow;
+                    channel[idx(x, y)] = f.weight * scale >= self.cfg.channel_rate
+                        && f.nematic() >= self.cfg.channel_alignment;
+                }
+            }
+        }
         let cells = channel.iter().filter(|&&c| c).count();
         // Channels: eight-connected components of channel cells.
         let mut seen = vec![false; channel.len()];
@@ -620,7 +734,8 @@ impl MovementHistory {
 
     /// Global summary.
     pub fn summary(&self) -> FieldSummary {
-        let n = self.cols * self.rows;
+        let (cols, rows) = self.sectors();
+        let n = cols * rows;
         let mut density = 0.0;
         let mut aligned = 0.0;
         let mut residual_sq = 0.0;
@@ -653,7 +768,7 @@ impl MovementHistory {
                 0.0
             },
             spatial_entropy,
-            residual_energy: if density > 0.0 {
+            residual_energy: if density > 0.0 && n > 0 {
                 (residual_sq / n as f64).sqrt() / (density / n as f64)
             } else {
                 0.0
@@ -687,14 +802,15 @@ impl MovementHistory {
     /// traffic, a dot for flow without either; for the residual, an
     /// arrow for the direction the current flow departs in.
     pub fn render(&self, component: Component) -> String {
+        let (cols, rows) = self.sectors();
         let mut out = String::new();
-        let max_density = (0..self.cols * self.rows)
+        let max_density = (0..cols * rows)
             .map(|s| self.invariant(s).weight)
             .fold(0.0, f64::max)
             .max(1e-12);
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                let s = r * self.cols + c;
+        for r in 0..rows {
+            for c in 0..cols {
+                let s = r * cols + c;
                 let ch = match component {
                     Component::Residual => {
                         let (dd, (mx, my)) = self.residual(s);
@@ -723,11 +839,10 @@ impl MovementHistory {
     /// by the glyph of their flow, other cells with some steady flow as a
     /// dot, the rest blank.
     pub fn render_skeleton(&self) -> String {
-        let norm = self.slow_g * self.slow_norm();
         let mut out = String::with_capacity((self.width + 1) * self.height);
         for y in 0..self.height {
             for x in 0..self.width {
-                let f = self.fine_slow[y * self.width + x].scaled(norm);
+                let f = self.fine_invariant(Position::new(x as i32, y as i32));
                 let ch = if f.weight >= self.cfg.channel_rate
                     && f.nematic() >= self.cfg.channel_alignment
                 {
@@ -896,6 +1011,9 @@ pub struct Epoch {
     pub invariant: Vec<f64>,
     /// Coarse residual features at the end of the epoch.
     pub residual: Vec<f64>,
+    /// The behavioural memo's current features at the end of the epoch
+    /// (empty without a memo).
+    pub memo: Vec<f64>,
 }
 
 impl Epoch {
@@ -909,6 +1027,7 @@ impl Epoch {
                 v.extend_from_slice(&self.residual);
                 v
             }
+            Component::Memo => self.memo.clone(),
         }
     }
 }
@@ -1107,12 +1226,21 @@ impl Queen {
         self.cfg.random_input = random;
     }
 
-    /// Recall the thought `lag` epochs back from the field as it stands.
-    pub fn recall(&self, history: &MovementHistory, lag: usize) -> Option<Vec<f64>> {
+    /// Recall the thought `lag` epochs back from the field (or the memo)
+    /// as it stands.
+    pub fn recall(
+        &self,
+        history: &MovementHistory,
+        memo: Option<&Memo>,
+        lag: usize,
+    ) -> Option<Vec<f64>> {
         if lag == 0 || self.readouts.is_empty() {
             return None;
         }
-        let features = history.features(self.cfg.component);
+        let features = match self.cfg.component {
+            Component::Memo => memo.map(|m| m.features(m.level(), Layer::Current))?,
+            component => history.features(component),
+        };
         let mut out = Vec::with_capacity(self.readouts.len());
         for per_lag in &self.readouts {
             let r = per_lag.get(lag - 1)?;
@@ -1161,6 +1289,7 @@ impl Queen {
         &mut self,
         tick: u64,
         history: &MovementHistory,
+        memo: Option<&Memo>,
         hierarchy: &mut Hierarchy,
         rng: &mut Rng,
     ) {
@@ -1183,10 +1312,13 @@ impl Queen {
             thought: self.thought.clone(),
             invariant: history.features(Component::Invariant),
             residual: history.features(Component::Residual),
+            memo: memo
+                .map(|m| m.features(m.level(), Layer::Current))
+                .unwrap_or_default(),
         });
         let recalled = match &self.cfg.recursion {
             Some(r) => self
-                .recall(history, r.lag)
+                .recall(history, memo, r.lag)
                 .map(|v| v.into_iter().map(|x| r.gain * x).collect::<Vec<f64>>()),
             None => None,
         };
@@ -1424,6 +1556,7 @@ mod tests {
                 thought: vec![thought],
                 invariant: vec![0.3 * thought + 0.1 * rng.normal(), prev],
                 residual: vec![rng.normal()],
+                memo: Vec::new(),
             });
         }
         let cap = memory_capacity(&epochs, Component::Invariant, 4, 0.1, 0.7);
@@ -1455,7 +1588,7 @@ mod tests {
         );
         assert_eq!(queen.targets().len(), 3);
         assert!(!queen.due(5) && queen.due(10));
-        queen.epoch(10, &h, &mut hierarchy, &mut rng);
+        queen.epoch(10, &h, None, &mut hierarchy, &mut rng);
         assert_eq!(queen.epoch_count(), 1);
         assert!(queen.due(20) && !queen.due(19));
         let t = &queen.thought;
@@ -1468,6 +1601,6 @@ mod tests {
         assert!((gain_of(castes[2]) - 1.0).abs() < 1e-12);
         assert!(!policies.is_empty());
         assert_eq!(queen.epochs.len(), 1);
-        assert!(queen.recall(&h, 1).is_none(), "nothing fitted yet");
+        assert!(queen.recall(&h, None, 1).is_none(), "nothing fitted yet");
     }
 }

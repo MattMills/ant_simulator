@@ -13,6 +13,7 @@
 
 use crate::geometry::{Point, Position};
 use crate::landscape::{ring_heading, turn_magnitude, RING, RING_STEP};
+use crate::memo::{Transit, TransitRecord};
 use crate::pheromone::{perceived, Pheromone};
 use crate::rng::Rng;
 use crate::species::Species;
@@ -299,6 +300,11 @@ pub struct Ant {
     pub goal: Option<Position>,
     /// Recruitment excitation from contacts with successful foragers.
     pub excitement: f64,
+    /// The transit through a memo node being recorded, if any.
+    pub record: Option<TransitRecord>,
+    /// The transit being replayed, if any: the ant is inside a node and
+    /// appears at its exit when the transit ends.
+    pub transit: Option<Transit>,
     /// Fractional movement credit (unused sub-cell movement).
     pub move_credit: f64,
     routes: HashMap<Position, Route>,
@@ -359,6 +365,8 @@ impl Ant {
             time_nursing: 0,
             goal: None,
             excitement: 0.0,
+            record: None,
+            transit: None,
             move_credit: 0.0,
             routes: HashMap::new(),
             memory: [nest; MEMORY_LEN],

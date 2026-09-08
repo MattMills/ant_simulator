@@ -131,7 +131,7 @@ fn main() {
     }
 
     println!(
-        "\n== finding a hidden pool by its smell (Buehlmann et al. 2014): a party of 20 scouts =="
+        "\n== finding a hidden pool by its smell (Buehlmann et al. 2014): a party of 20 scouts, the pool 20 cm off =="
     );
     for odour in [false, true] {
         let times: Vec<f64> = seeds
@@ -140,6 +140,7 @@ fn main() {
                 run_discovery(
                     Species::lasius_niger(),
                     20,
+                    10,
                     odour,
                     seconds.min(1200.0),
                     seed,

@@ -268,6 +268,12 @@ pub struct WorldConfig {
     pub cell_capacity: u16,
     /// Regions with their own capacity.
     pub capacity_zones: Vec<CapacityZone>,
+    /// Step the chemical kinetics every this many ticks, with the
+    /// evaporation and diffusion of the ticks skipped applied at once
+    /// (deposits accumulate meanwhile). One is exact; a few is
+    /// indistinguishable for half-lives of minutes and cheaper by as
+    /// much on large grids.
+    pub kinetics_stride: u32,
     /// Corpses scattered at random over open cells when the world is built
     /// (the arenas of the cemetery-formation experiments).
     pub scattered_corpses: usize,
@@ -308,6 +314,7 @@ impl Default for WorldConfig {
             open: Vec::new(),
             counters: Vec::new(),
             cell_capacity: 8,
+            kinetics_stride: 1,
             capacity_zones: Vec::new(),
             scattered_corpses: 0,
             landmarks: Vec::new(),
@@ -338,6 +345,8 @@ pub struct World {
     present: [bool; Pheromone::COUNT],
     /// Whether the grid has any wall (open worlds skip clearance sweeps).
     has_walls: bool,
+    /// Calls to the kinetics so far, for the stride.
+    kinetics_calls: u64,
     /// Indices of the cells that carry or renew food, the only ones the
     /// food kinetics visit.
     food_cells: Vec<usize>,
@@ -387,6 +396,7 @@ impl World {
             scratch: vec![[0.0; Pheromone::COUNT]; n],
             present: [false; Pheromone::COUNT],
             has_walls: false,
+            kinetics_calls: 0,
             food_cells: Vec::new(),
             landmarks: config.landmarks.clone(),
             params,
@@ -975,10 +985,26 @@ impl World {
     pub fn step_pheromones(&mut self) {
         let w = self.config.width as i32;
         let h = self.config.height as i32;
+        self.kinetics_calls += 1;
+        let stride = self.config.kinetics_stride.max(1);
+        if !self.kinetics_calls.is_multiple_of(stride as u64) {
+            return;
+        }
+        // The ticks skipped are applied at once.
+        let retention: Vec<f64> = self
+            .retention
+            .iter()
+            .map(|r| r.powi(stride as i32))
+            .collect();
+        let diffusion: Vec<f64> = self
+            .diffusion
+            .iter()
+            .map(|d| (d * stride as f64).min(0.9))
+            .collect();
         // Only channels that carry something somewhere are stepped; a
         // cell counts as empty below a millionth of a unit.
         let active: Vec<usize> = (0..Pheromone::COUNT)
-            .filter(|&k| self.retention[k] > 0.0 && self.present[k])
+            .filter(|&k| retention[k] > 0.0 && self.present[k])
             .collect();
         if active.is_empty() {
             return;
@@ -996,11 +1022,11 @@ impl World {
                     continue;
                 }
                 for &k in &active {
-                    let amount = cell.pheromone[k] * self.retention[k];
+                    let amount = cell.pheromone[k] * retention[k];
                     if amount <= 0.0 {
                         continue;
                     }
-                    let diffusion = self.diffusion[k];
+                    let diffusion = diffusion[k];
                     if diffusion > 0.0 {
                         // Conservative diffusion: shares that would cross
                         // into a wall or off the grid stay in the cell.
@@ -1567,6 +1593,7 @@ mod tests {
     fn capacity_zones_and_crowding() {
         let cfg = WorldConfig {
             cell_capacity: 8,
+            kinetics_stride: 1,
             capacity_zones: vec![CapacityZone {
                 rect: Rect::new(Position::new(0, 0), Position::new(3, 3)),
                 capacity: 2,

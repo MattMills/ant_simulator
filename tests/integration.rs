@@ -348,3 +348,120 @@ fn food_is_handed_inward_and_corpses_carried_out() {
     );
     assert_eq!(sim.nest().corpses, 0);
 }
+
+fn memo_colony(memoize: bool) -> SimConfig {
+    let mut cfg = SimConfig::default();
+    cfg.world.seed = Some(2024);
+    cfg.ants = 200;
+    cfg.nest.initial_satiation = 0.1;
+    cfg.nest.mortality = false;
+    if let Some(food) = cfg.world.random_food.as_mut() {
+        food.renewal_ul_per_s = 0.02;
+    }
+    cfg.species.consumption_mg_per_ant_per_s = 0.5 / 3600.0;
+    cfg.history = Some(HistoryConfig::default());
+    cfg.memo = Some(MemoConfig {
+        transits: if memoize {
+            Some(TransitConfig::default())
+        } else {
+            None
+        },
+        ..MemoConfig::default()
+    });
+    cfg
+}
+
+#[test]
+fn memo_classifies_trails_apart_from_search_ground() {
+    let mut sim = Simulation::new(memo_colony(false), 7);
+    sim.run_seconds(20.0 * 60.0);
+    let memo = sim.extract_memo().expect("memo on");
+    assert!(memo.is_composed());
+    let root = memo.signature(QuadKey::ROOT, Layer::Invariant);
+    let s = sim.stats();
+    let rate = s.decisions as f64 / sim.tick() as f64;
+    assert!(
+        (root.decisions - rate).abs() < 0.25 * rate,
+        "the root composes the colony's decision rate: {} against {rate}",
+        root.decisions
+    );
+    assert!(
+        (root.mean_entropy() - s.mean_entropy()).abs() < 0.1,
+        "and its mean entropy: {} against {}",
+        root.mean_entropy(),
+        s.mean_entropy()
+    );
+    let classes = memo.classify(memo.level(), 3, 1);
+    assert_eq!(classes.categories(), 3);
+    assert!(classes.labels.len() > 20, "{classes:?}");
+    // The busiest category is the trail: straighter and more laden than
+    // the most populous one, the search ground.
+    let most = (0..3)
+        .max_by_key(|&c| classes.sizes[c])
+        .expect("three categories");
+    assert_ne!(most, 0, "the trail is not the commonest ground");
+    assert!(
+        classes.centroids[0][2] > classes.centroids[most][2],
+        "straighter: {:?}",
+        classes.centroids
+    );
+    assert!(
+        classes.centroids[0][7] > classes.centroids[most][7],
+        "more laden: {:?}",
+        classes.centroids
+    );
+    assert!(
+        memo.render(&classes).contains('0'),
+        "{}",
+        memo.render(&classes)
+    );
+    assert_eq!(
+        memo.features(memo.level(), Layer::Current).len(),
+        memo.keys(memo.level()).len() * ant_simulator::memo::FEATURES
+    );
+}
+
+#[test]
+fn memoized_transits_stand_in_for_the_simulation() {
+    // A colony with memoized transits replays a good share of its
+    // movement decisions from the kernels and still forages, keeps its
+    // decision entropy and its trails, as the full simulation does.
+    let mut full = Simulation::new(memo_colony(false), 7);
+    full.run_seconds(30.0 * 60.0);
+    let mut memoized = Simulation::new(memo_colony(true), 7);
+    memoized.run_seconds(30.0 * 60.0);
+    let (f, m) = (full.stats(), memoized.stats());
+    let transits = memoized
+        .memo()
+        .and_then(|memo| memo.transits.as_ref())
+        .expect("transits on");
+    assert!(transits.replayed > 0, "{}", transits.report());
+    let share = m.decisions_replayed as f64 / m.decisions as f64;
+    assert!(share > 0.1, "replayed share {share}: {}", transits.report());
+    let within = |a: f64, b: f64, tol: f64| (a - b).abs() <= tol * a.abs().max(b.abs()).max(1e-9);
+    assert!(
+        within(f.food_delivered as f64, m.food_delivered as f64, 0.2),
+        "deliveries {} full, {} memoized",
+        f.food_delivered,
+        m.food_delivered
+    );
+    assert!(
+        within(f.mean_entropy(), m.mean_entropy(), 0.15),
+        "entropy {} full, {} memoized",
+        f.mean_entropy(),
+        m.mean_entropy()
+    );
+    assert!(
+        (f.foraging_fraction() - m.foraging_fraction()).abs() < 0.08,
+        "outside {} full, {} memoized",
+        f.foraging_fraction(),
+        m.foraging_fraction()
+    );
+    let (tf, tm) = (
+        full.world().total_pheromone(Pheromone::Trail),
+        memoized.world().total_pheromone(Pheromone::Trail),
+    );
+    assert!(within(tf, tm, 0.3), "trail {tf} full, {tm} memoized");
+    // Replayed ants are accounted for like the rest.
+    assert_eq!(memoized.alive(), 200);
+}

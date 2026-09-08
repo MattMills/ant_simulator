@@ -18,6 +18,7 @@
 use crate::colony::{SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::hive::{HistoryConfig, QueenConfig};
+use crate::memo::{MemoConfig, TransitConfig};
 use crate::species::Species;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -166,6 +167,11 @@ pub struct Workload {
     pub history: bool,
     /// Whether the queen thinks (needs the history).
     pub mind: bool,
+    /// Whether transits through the memo's nodes are memoized (keeps the
+    /// history too, for the invariance check).
+    pub memoize: bool,
+    /// Ticks between steps of the chemical kinetics (one is exact).
+    pub kinetics_stride: u32,
     /// The species.
     pub species: Species,
     /// Seed of the map and the run.
@@ -181,6 +187,8 @@ impl Default for Workload {
             seconds: 600.0,
             history: false,
             mind: false,
+            memoize: false,
+            kinetics_stride: 1,
             species: Species::lasius_niger(),
             seed: 7,
         }
@@ -205,7 +213,11 @@ impl Workload {
         cfg.world.width = self.width;
         cfg.world.height = self.height;
         cfg.world.nest = Position::new(self.width as i32 / 2, self.height as i32 / 2);
+        // A nest that grows with the colony: about twenty workers per cell
+        // when everyone is in, three cells of radius at least.
+        cfg.world.nest_radius = ((self.ants as f64 / 20.0).sqrt() / 2.0).ceil().max(3.0) as i32;
         cfg.world.seed = Some(self.seed);
+        cfg.world.kinetics_stride = self.kinetics_stride.max(1);
         if let Some(food) = cfg.world.random_food.as_mut() {
             food.renewal_ul_per_s = 0.02;
             food.clusters = ((3 * self.cells()) as f64 / 2560.0).round().max(3.0) as usize;
@@ -214,8 +226,16 @@ impl Workload {
         cfg.nest.mortality = false;
         cfg.nest.max_ants = cfg.nest.max_ants.max(self.ants);
         cfg.nest.log_every_s = 0.0;
-        cfg.history = if self.history || self.mind {
+        cfg.history = if self.history || self.mind || self.memoize {
             Some(HistoryConfig::default())
+        } else {
+            None
+        };
+        cfg.memo = if self.memoize {
+            Some(MemoConfig {
+                transits: Some(TransitConfig::default()),
+                ..MemoConfig::default()
+            })
         } else {
             None
         };
@@ -244,6 +264,14 @@ pub struct Measurement {
     /// Share of ant-time spent outside the nest (walking is the costly
     /// part of an ant's tick).
     pub outside_fraction: f64,
+    /// Share of the movement decisions stood in for by memoized transits.
+    pub replayed_fraction: f64,
+    /// Loads delivered into the nest: what the colony achieved, to set a
+    /// memoized or strided run against the full one.
+    pub delivered: u64,
+    /// Mean entropy of the movement decisions, nats: how the colony
+    /// behaved, for the same comparison.
+    pub entropy: f64,
     /// The phase breakdown of the median run.
     pub profile: Profile,
 }
@@ -297,6 +325,16 @@ pub fn measure(workload: &Workload, repeats: usize) -> Measurement {
             0.0
         },
         outside_fraction: sim.stats().foraging_fraction(),
+        replayed_fraction: {
+            let s = sim.stats();
+            if s.decisions == 0 {
+                0.0
+            } else {
+                s.decisions_replayed as f64 / s.decisions as f64
+            }
+        },
+        delivered: sim.stats().food_delivered,
+        entropy: sim.stats().mean_entropy(),
         profile: sim.profile().clone(),
     }
 }
@@ -364,13 +402,16 @@ impl Scan {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "{:>8} {:>8} {:>9} {:>11} {:>8} {:>8} | {}",
+            "{:>8} {:>8} {:>9} {:>11} {:>8} {:>8} {:>8} {:>9} {:>7} | {}",
             self.dimension,
             "cells",
             "ticks/s",
             "ant-ticks/s",
             "ns/ant",
             "outside",
+            "replayed",
+            "delivered",
+            "entropy",
             Phase::ALL
                 .iter()
                 .map(|p| format!("{:>7}", p.name()))
@@ -380,13 +421,16 @@ impl Scan {
         for (x, m) in self.x.iter().zip(&self.measurements) {
             let _ = writeln!(
                 out,
-                "{:>8} {:>8} {:>9.0} {:>11.0} {:>8.0} {:>7.0}% | {}",
+                "{:>8} {:>8} {:>9.0} {:>11.0} {:>8.0} {:>7.0}% {:>7.0}% {:>9} {:>7.3} | {}",
                 x,
                 m.workload.cells(),
                 m.ticks_per_s,
                 m.ant_ticks_per_s,
                 m.nanos_per_ant_tick(),
                 100.0 * m.outside_fraction,
+                100.0 * m.replayed_fraction,
+                m.delivered,
+                m.entropy,
                 Phase::ALL
                     .iter()
                     .map(|&p| format!("{:>6.0}%", 100.0 * m.profile.fraction(p)))

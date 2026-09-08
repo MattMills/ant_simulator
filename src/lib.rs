@@ -65,6 +65,17 @@
 //!   measures how much the field carries, lag by lag, and
 //!   [`experiments::run_closed_loop`] closes the loop.
 //!
+//! * **Quadkeys, the behavioural memo and memoized transits** ([`quad`],
+//!   [`memo`]): a quadtree over the world whose nodes compose from their
+//!   children, so that the movement history and the memo of what ants do
+//!   where (decisions, their entropy and turns, legs, loads, what was
+//!   laid, what happened) exist at every grain, in an invariant and a
+//!   variant record. The memo can be extracted, classified into kinds of
+//!   ground and learned against. Transits through plain, invariant nodes
+//!   are memoized in kernels keyed by how an ant entered, and mature
+//!   kernels stand in for the simulation, as memoized neighbourhoods do
+//!   in a cellular automaton, so that colonies of thousands run.
+//!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
 //!   sweeps colony size and world area and fits the cost's exponents; and
@@ -151,7 +162,9 @@ pub mod hierarchy;
 pub mod hive;
 pub mod landscape;
 pub mod learner;
+pub mod memo;
 pub mod pheromone;
+pub mod quad;
 pub mod render;
 pub mod rng;
 pub mod rotation;
@@ -210,7 +223,12 @@ pub mod prelude {
         Arm, CrossEntropy, DialBandit, EntropyBandit, HillClimber, Learner, LeverView, Mutation,
         Outcome, PeriodDetector, PhaseAware, PolicyGradient, RandomLearner, StaticLearner,
     };
+    pub use crate::memo::{
+        Classification, Kernel, Layer, Leg, Memo, MemoConfig, Signature, Stop, TransitConfig,
+        TransitKey, TransitOutcome, Transits,
+    };
     pub use crate::pheromone::{perceived, Pheromone, PheromoneParams, PheromoneSet};
+    pub use crate::quad::{QuadKey, QuadTree};
     pub use crate::render::{render, render_surface};
     pub use crate::rng::Rng;
     pub use crate::rotation::{Mapping, Rotation, RotationSchedule};

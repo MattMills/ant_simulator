@@ -248,7 +248,7 @@ unit tests in `src/colony.rs` cover the trophallaxis and heat mechanisms.
 | Crowding on a narrow bridge (Dussutour et al. 2004) | one trail at low density; at high density on a narrow bridge both branches, without loss of throughput | 400 ants: mean deviation from an even split 0.15 on the wide bridge, 0.05 on the narrow one, at 212 and 178 crossings/min; 80 ants: 0.25 and 0.07 |
 | Two sources at equal distance, 1.0 vs 0.1 M (Beckers et al. 1990) | the colony focuses on the richer source | 94% ± 1% of the solution taken from the rich source, majority in every run |
 | A dripping source, 0.02 to 10 µl/min (Mailleux et al. 2003) | foraging effort and recruitment match the source's productivity | ants at the source 6.5 → 20.6, mean load 0.06 → 0.40 µl, recruiting returns 19% → 81% |
-| A hidden pool, with and without its smell (Buehlmann et al. 2014) | ants find food by its odour | a party of 20 scouts: first find after 127 s without odour, 94 s with (with 40 scouts leaving at once, one walks into it within a minute either way) |
+| A hidden pool, with and without its smell (Buehlmann et al. 2014) | ants find food by its odour | a party of 20 scouts, the pool 20 cm off: first find after 86 s without odour, 44 s with, over 8 seeds (far off, or with 40 scouts leaving at once, one walks into it by luck either way) |
 | Colony satiation 0.05 → 1.0 (Mailleux et al. 2006) | starved colonies forage and recruit more | ant-time outside falls monotonically from 50% to 0% |
 | Unloading as the colony fills (Greenwald et al. 2018) | receivers take less as their crops fill; foragers that cannot unload stop | unit test: contacts per return rise, foraging falls by more than half, no hungry worker left inside; crop loads even out by sharing |
 | Sugar or prey, with and without larvae (Dussutour & Simpson 2009) | larvae turn the colony to protein | protein share of what is collected 0.04 without larvae, 0.46 with |
@@ -258,7 +258,7 @@ unit tests in `src/colony.rs` cover the trophallaxis and heat mechanisms.
 | Spatial fidelity zones and social groups (Sendova-Franks & Franks 1995; Mersch et al. 2013) | young workers with the brood, old by the entrance; contacts mostly within a group | `nest` example, 80 workers in a 7 × 7 nest, 30 min: brood chamber 31 workers of mean age 2.2 d (24 nursing), between 29 of 2.8 d, entrance ring 8 of 4.4 d; age–depth correlation 0.35; no food changes hands directly between the chamber and the ring |
 | Food dissemination (Greenwald et al. 2015) | foragers unload near the entrance and the food percolates inward | 2.0 mg handed on inside per milligram delivered; the chamber's crops as full as the entrance's (0.92 against 0.84) |
 | Undertaking | corpses inside are carried out | 3 corpses placed in the brood chamber are fetched from where they lie and carried out within 30 min |
-| Colony size at a single feeder (Beekman, Sumpter & Ratnieks 2001) | below a critical size a trail cannot be kept and foraging is disordered | trail alone: 5% of trips direct at 10 workers, 96% at 80, per-capita output ×2.4; with memory, 79–94% at any size (see the scale analysis) |
+| Colony size at a single feeder (Beekman, Sumpter & Ratnieks 2001) | below a critical size a trail cannot be kept and foraging is disordered | trail alone: 12% of trips direct at 10 workers, 92% at 80, per-capita output ×1.6; with memory, 77–92% at any size (see the scale analysis) |
 
 Symmetry breaking on equal branches is a marginal instability, and getting
 it out of an individual-based model says a good deal about what real ants
@@ -337,8 +337,9 @@ hierarchy's entropy dials: a component `x` sets the root temperature to
 `exp(expression × x)` (or a relative gain below the root). A `Readout`
 (ridge regression on standardised features) retrodicts her past thoughts
 from the present field, and `memory_capacity` scores it lag by lag on
-held-out epochs for the invariant component, the residual, and both. With
-`Recursion` on, what she recalls from the field feeds her next thought.
+held-out epochs for the invariant component, the residual, both, and the
+behavioural memo (below). With `Recursion` on, what she recalls from the
+field feeds her next thought.
 
 `cargo run --release --example hive` runs the memory probe: 100 workers
 kept foraging by renewing sources and a steady drain on the reserve (the
@@ -348,35 +349,40 @@ the root temperature to `e^(2 × thought)`:
 
 ```
 the dial in force: corr(thought, decision entropy) = 1.00
-reaching the paths: corr(thought, residual straightness of the whole field) = -0.79
+reaching the paths: corr(thought, residual straightness of the whole field) = -0.78
 
 component    lag  1 lag  2 lag  3 lag  4 lag  5 lag  6   capacity
-invariant      0.31   0.03   0.04   0.05   0.02  -0.02   0.45
-residual       0.79   0.55   0.27   0.12   0.11   0.10   1.95
-both           0.84   0.59   0.27   0.13   0.13   0.11   2.07
+invariant      0.02  -0.02  -0.22  -0.18  -0.13  -0.07   0.02
+residual       0.75   0.50   0.21   0.01  -0.02  -0.03   1.46
+both           0.76   0.50   0.12  -0.04  -0.09  -0.03   1.38
+memo           0.81   0.38   0.11  -0.10  -0.09  -0.07   1.30
 ```
 
 Her thoughts are embedded in the non-invariant output: the residual
-retrodicts the thought of the epoch just ended with R² 0.79, the one
-before with 0.55, the one before that with 0.27, and a trace of the two
-before those, while the skeleton carries a shadow of the last epoch alone.
+retrodicts the thought of the epoch just ended with R² 0.75, the one
+before with 0.50 and the one before that with 0.21, while the invariant
+skeleton, which is where the colony persistently goes, carries none of it.
 What carries the thought is the tortuosity of the paths: a hotter colony
-turns more at every decision. The loop then closes. Readouts fitted,
-external input off, the queen recalls her last thought from the field and
-thinks its opposite (gain −10) for 24 more epochs:
+turns more at every decision. The behavioural memo's current signatures
+(the turns taken, the legs, what was laid, node by node) read the last
+epoch better still. The loop then closes. Readouts fitted, external input
+off, the queen recalls her last thought from the field and thinks its
+opposite (gain −10) for 24 more epochs:
 
 ```
-dial connected:    +-+-+-+-+-+-+-+-+-+-+-+-  alternations 23 of 23
-dial disconnected: ++++++++++++++++++++++++  alternations  0 of 23
+dial connected:    -++-+-+-+-+-+-+-+-+--+-+  alternations 21 of 23, conviction 0.91
+dial disconnected: -+++++++++++++++++++++++  alternations  1 of 23, conviction 0.91
 ```
 
 With the dial connected the alternation is sustained through the colony
 alone: nothing in her state remembers the last thought, only the ants'
-paths do. With the dial disconnected (expression zero) she still recalls
-and thinks, but nothing she thinks reaches the colony, and the field
-recalls only its noise. Cognitive material laid down in the colony's
-movement is thus included self-recursively in future cognition, at the
-epoch scale and over three to four epochs back.
+paths do (the two misses are the epochs in which the field's noise
+outweighed a thought one minute old). With the dial disconnected
+(expression zero) she still recalls and thinks, but nothing she thinks
+reaches the colony, and the field recalls only its noise. Cognitive
+material laid down in the colony's movement is thus included
+self-recursively in future cognition, at the epoch scale and over three
+epochs back.
 
 ## Examples
 
@@ -388,7 +394,8 @@ cargo run --release --example surface     [ticks] [seeds]
 cargo run --release --example hive        [epochs] [epoch_seconds]
 cargo run --release --example nest        [minutes]
 cargo run --release --example scale       [minutes]
-cargo bench                               [-- quick | phases]
+cargo run --release --example memo        [minutes] [categories]
+cargo bench                               [-- quick | phases | colony]
 ```
 
 `colony` renders the world, compares the four species on one map, sweeps
@@ -400,7 +407,10 @@ on fresh episodes. `surface` explores the geometric entropy channels.
 `nest` shows the nest interior: zones by age, food handed inward, and
 undertakers at work. `scale` runs the scale analysis: foraging
 organisation against colony size and the hive's memory against colony
-size and grain. `cargo bench` runs the throughput scan (see below).
+size and grain. `memo` extracts the behavioural memo and classifies the
+ground. `cargo bench` runs the throughput scan (see below); `colony`
+selects its colony-scale rows, memoized transits against the full
+simulation.
 
 ## The arena, turn by turn
 
@@ -455,7 +465,11 @@ dataset. The queen's mind is a probe, not a model of a real queen: a
 thought is a vector on a fixed clock, expressed through the entropy dials
 and read back by linear readouts, and the colony it thinks through is
 kept foraging by a reserve drain standing for nestmates that are not
-simulated.
+simulated. Memoized transits replay recorded outcomes: a replayed ant
+crosses its node in a straight line for laying and for the history,
+learns no route there, and takes the outcome of another ant of its kind;
+the field's kinetics can be stepped every few ticks with the evaporation
+and diffusion of the ticks skipped applied at once.
 
 ## Scale analysis
 
@@ -471,40 +485,41 @@ memory, no smell; *Monomorium pharaonis*):
 
 ```
   ants    loads  per ant/h  trail mid  ordered
-    10       18       5.40       0.16       5%
-    20       48       7.20       1.95      27%
-    40      110       8.25       4.07      50%
-    80      341      12.79      14.49      96%
-   160      601      11.27       2.82      85%
-   320      780       7.31      29.30      24%
-   640      815       3.82      32.14       9%
+    10       25       7.50       0.28      12%
+    20       47       7.05       2.11      41%
+    40      128       9.60       5.14      75%
+    80      329      12.34      13.73      92%
+   160      602      11.29      22.42      95%
+   320      785       7.36      28.78      24%
+   640      802       3.76      33.30       7%
 ```
 
 This is Beekman's transition: below a few dozen workers the returning
 foragers cannot lay trail faster than it evaporates (the mid-trail
 concentration sits below the perception constant), each forager searches
-for the feeder on its own, and one trip in twenty goes there directly;
-between 20 and 80 workers the trail takes hold and organises the traffic,
-so that per-capita output more than doubles and nearly every trip is
-direct. Beyond 320 workers the entrance corridor jams (Dussutour et al.
-2004), trips detour and per-capita output falls again. With individual
-navigation on, the same species forages as well at any size until the
-jam, and its output is proportional to its size rather than cooperative:
+for the feeder on its own, and one trip in eight goes there directly;
+between 20 and 160 workers the trail takes hold and organises the
+traffic, so that per-capita output rises by three quarters and nearly
+every trip is direct. Beyond 320 workers the entrance corridor jams
+(Dussutour et al. 2004), trips detour and per-capita output falls again.
+With individual navigation on, the same species forages as well at any
+size until the jam, and its output is proportional to its size rather
+than cooperative:
 
 ```
   ants    loads  per ant/h  trail mid  ordered      (Lasius niger: loads  per ant/h  ordered)
-    10       52      15.60       3.00      79%                       47      14.10      94%
-    40      218      16.35      12.01      91%                      192      14.40      94%
-    80      397      14.89      21.57      94%                      386      14.48      95%
-   160      701      13.14      32.65      91%                      712      13.35      93%
-   320      977       9.16      39.74      89%                     1061       9.95      91%
-   640     1226       5.75      44.57      10%                     1722       8.07      78%
+    10       55      16.50       2.89      77%                       45      13.50      91%
+    40      208      15.60      12.01      88%                      195      14.63      95%
+    80      398      14.93      21.77      92%                      361      13.54      97%
+   160      690      12.94      33.02      90%                      679      12.73      97%
+   320     1016       9.53      38.76      86%                     1052       9.86      91%
+   640     1272       5.96      45.90      11%                     1731       8.11      81%
 ```
 
 Memory removes the size dependence that the trail alone has: a colony of
-ten forages by memory three times better than by trail, and gains
+ten forages by memory more than twice as well as by trail, and gains
 nothing from growing except a jam. Over 10 to 640 workers the colony's
-output scales as N^0.96 by trail alone and as N^0.79 to N^0.87 by
+output scales as N^0.91 by trail alone and as N^0.78 to N^0.88 by
 memory, sublinear because of the corridor.
 
 The hive's memory (the residual readout of the queen's thought, held-out
@@ -513,20 +528,97 @@ the colony and shrinks with the grain of the reading:
 
 ```
   ants  sector  multiscale   lag 1   lag 2   lag 3  capacity
-    25      16         yes    0.47    0.32    0.12      1.08
-    50      16         yes    0.71    0.24   -0.13      0.94
-   100      16         yes    0.75    0.41    0.24      1.46
-   200      16         yes    0.80    0.34    0.45      1.82
-   100       8         yes    0.88    0.16    0.34      1.49
-   100       8          no    0.87    0.26    0.37      1.60
-   100      32         yes    0.64    0.33    0.22      1.22
-   100      32          no    0.62    0.31    0.19      1.16
+    25      16         yes    0.72    0.36   -0.10      1.08
+    50      16         yes    0.71    0.55    0.09      1.46
+   100      16         yes    0.84    0.50   -0.04      1.34
+   200      16         yes    0.85    0.66    0.47      1.98
+   100       8         yes    0.72    0.60    0.05      1.37
+   100       8          no    0.60    0.53    0.09      1.22
+   100      16          no    0.82    0.46   -0.10      1.29
+   100      32         yes    0.68    0.25    0.11      1.03
+   100      32          no    0.66    0.24    0.09      0.99
 ```
 
 More workers write the thought into more movement, so the field carries
-it more faithfully and for longer; a finer grain reads the last epoch
-better (R² 0.88 at 8-cell sectors against 0.64 at 32), and the coarser
-grains above the sectors add little once the sectors are fine.
+it more faithfully and for longer (capacity 1.08 at 25 workers, 1.98 at
+200). The grain cuts both ways: 32-cell sectors are too coarse to see the
+paths turn (R² 0.68 at lag 1), 8-cell sectors hand the readout more
+numbers than 80 epochs can fit (0.72), and 16-cell sectors read best
+(0.84); the coarser grains above the sectors, the quadtree's upper
+levels, add a little at every grain (0.04 to 0.12).
+
+## Quadkeys, the behavioural memo and memoized transits
+
+The world carries a quadtree: the root is the smallest power-of-two
+square covering the grid, each level splits every node in four, and a
+node's address is its *quadkey*, the level and the Z-order index of its
+column and row (printed as digits from the root down, `0` north-west to
+`3` south-east, as map tiles are). Anything whose value at a node is the
+sum of its children's composes bottom-up, so a reading at any grain is a
+lookup. The movement history lives on it, with the invariant and the
+variant flow at every node from the cells to the whole field.
+
+The **behavioural memo** (`Memo`) records, on the same tree, what the
+ants do where: decisions and their entropy, the turns taken, the legs
+(outbound, homing, searching), how often laden, cells walked, what was
+laid, and what happened (food found, nest reached, search given up,
+death). Every field is a sum, kept in a slow record (the invariant
+character of the ground, an hour's half-life) and a fast one whose
+departure from it is the variant part. `Simulation::extract_memo` hands
+the memo out as an object of its own, composed to every grain, which can
+be classified into kinds of ground (`Memo::classify`, k-means on the
+standardised signatures, categories named by what marks them out) and
+read as feature vectors (`Memo::features`). `cargo run --release
+--example memo` does this for a hundred workers after half an hour, at
+4-cell nodes:
+
+```
+cat nodes  character              decisions  entropy  straightness  outbound  homing  laden  marking
+  0     8  busy, marking              1.323    1.468         0.847     0.272   0.560  0.573    0.357
+  1    26  steady, searching          0.197    2.035         0.666     0.863   0.071  0.053    0.062
+  2    22  homing, laden              0.190    1.789         0.703     0.448   0.521  0.477    0.205
+  3   103  undecided, outbound        0.082    2.292         0.580     0.974   0.025  0.005    0.010
+```
+
+The eight busiest nodes are the two trails (straight, laden, marking,
+decided); the homing approaches and the search ground fall out as their
+own categories, and the map of category digits draws the trails through
+the search ground. The memo is also learned against: the queen's epochs
+carry its current features as a fourth component, and the memory probe
+retrodicts her thought from it as well as from the residual flow (see the
+hive table above).
+
+**Memoized transits** are the cellular-automaton idea applied to
+behaviour. Every transit of an ant through a node of *plain* ground (no
+food, nest, prey or landmark in it) is filed under a key: the node, the
+side entered by, the entry heading's class, the leg, whether laden, which
+distinct policy the ant acts through, the entropy dial's class, and the
+local field's class (the trail's strength, the crowding). What came of it
+is the outcome: the side and point left by, the heading, the ticks, the
+cells walked, the decisions and their entropy, what was laid. A key's
+kernel keeps a forgetting reservoir of outcomes. Once a kernel is mature
+(a dozen outcomes, next to none of which ended inside the node) and the
+node's current flow is within half of its invariant one, an ant entering
+under that key is advanced in one step: it sits inside the node for the
+outcome's ticks and appears at its exit with its path integrated, its
+deposits laid along the line it crossed, and its decisions counted, at a
+tick's cost of a comparison instead of one decision per cell. A tenth of
+eligible entries are still simulated in full, so that the kernels keep
+learning and a change in the ground shows; a change of leg, a corpse on
+the ground or a node whose flow has departed from its invariant turns
+memoization off there. Transits chain: an ant leaving one memoized node
+into another is advanced again.
+
+The memoized colony is the full one within a few percent. Over an hour
+on a 64 × 40 grid with 400 workers, deliveries were 6652 against 6488,
+the mean decision entropy 1.48 against 1.42, the share of ant-time
+outside 29% against 30%, with 47% of the movement decisions replayed
+after the first half hour. What is approximated: a replayed ant walks the
+straight line between its entry and its exit for the purposes of laying
+and of the history, learns no route inside the node, and carries the
+outcome of another ant of its kind; and the kernels lag a changing field
+by their memory (their entropy runs a few percent above the full
+simulation's while trails strengthen).
 
 ## Performance and scaling
 
