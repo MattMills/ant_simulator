@@ -609,16 +609,33 @@ the ground or a node whose flow has departed from its invariant turns
 memoization off there. Transits chain: an ant leaving one memoized node
 into another is advanced again.
 
-The memoized colony is the full one within a few percent. Over an hour
-on a 64 × 40 grid with 400 workers, deliveries were 6652 against 6488,
-the mean decision entropy 1.48 against 1.42, the share of ant-time
-outside 29% against 30%, with 47% of the movement decisions replayed
-after the first half hour. What is approximated: a replayed ant walks the
-straight line between its entry and its exit for the purposes of laying
-and of the history, learns no route inside the node, and carries the
-outcome of another ant of its kind; and the kernels lag a changing field
-by their memory (their entropy runs a few percent above the full
-simulation's while trails strengthen).
+`cargo bench -- colony` sets the memoized colony against the full one at
+colony scale: 400, 1600 and 6400 workers for a simulated hour on a
+128 × 128 world, the transits memoized and the field's kinetics stepped
+every four ticks, the kernels learning as they go (so the replayed share
+is that of the whole hour, and higher by its end):
+
+```
+         memoized transits, field every 4 ticks        |  full simulation
+  ants   ticks/s  ns/ant  replayed  delivered  entropy | ticks/s  ns/ant  delivered  entropy
+   400      1379    1813       33%       3697    1.597 |     764    3274       3589    1.530
+  1600       432    1445       42%      15684    1.459 |     278    2249      15234    1.396
+  6400        99    1578       42%      56026    1.496 |      64    2461      52984    1.478
+```
+
+The memoized colony is the full one within a few percent, at 1.5 to 1.8
+times the throughput: it delivers 3 to 6% more and decides 1 to 4%
+hotter, with the same share of ant-time outside, and its cost per
+ant-tick is flat from 400 to 6400 workers (the time per tick scales as
+N^0.95). On one core, 6400 workers live an hour in 36 seconds. What is
+approximated: a replayed ant walks the straight line between its entry
+and its exit for the purposes of laying and of the history, learns no
+route inside the node, and carries the outcome of another ant of its
+kind; the kernels lag a changing field by their memory, and the strided
+field evaporates in steps, which together leave the memoized colony a
+little hotter and a little more productive than the full one. What
+remains is the three fifths of the decisions still simulated, which is
+where the time goes at every size.
 
 ## Performance and scaling
 
@@ -674,7 +691,10 @@ keeps its counts, so none of those grows with the grid or the colony.
 What remains is the sweep of the grid by the chemical channels, which
 cannot be made sparse without changing the dynamics (a trace below a
 millionth of a unit is dropped, and diffusion carries mass that small to
-every cell within an hour), and the decisions, which are the model.
+every cell within an hour), and the decisions, which are the model. At
+colony scale the strided field takes the kinetics out of the picture and
+the memoized transits stand in for two fifths of the decisions (the
+colony-scale table in the memo section above).
 
 ## Reproducibility and tests
 
