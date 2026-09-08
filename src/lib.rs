@@ -9,17 +9,20 @@
 //! * **Colony simulation** ([`colony`], [`world`], [`ant`], [`pheromone`],
 //!   [`species`]): a world in physical units, with ants moving continuously
 //!   over a substrate grid that carries a nest, sucrose solutions of varying
-//!   molarity, and five pheromone channels with literature kinetics under a
-//!   temperature that may cycle through the day. Workers rest, nurse,
-//!   forage, feed, return, search and unload through an activity state
-//!   machine; they navigate by path integration and route memory, follow
-//!   trails through Deneubourg's choice function sensed by a forward
-//!   antennal probe, lay trail in proportion to food quality, recruit by
-//!   contact, and engage in tasks by reinforced response thresholds. The
-//!   nest stores sugar, gets hungry, lays eggs and raises brood through egg,
-//!   larva and pupa. The [`experiments`] module reproduces the classic
-//!   double-bridge, equal-bridge, two-source, hunger and division-of-labour
-//!   setups.
+//!   molarity (some refilling), heaps of prey, corpses, and five pheromone
+//!   channels with literature kinetics under a temperature that may cycle
+//!   through the day. Cells have a capacity, so traffic crowds, slows and
+//!   spreads. Workers rest, nurse, forage, feed, return, search, unload and
+//!   carry out the dead through an activity state machine; they navigate by
+//!   path integration and one-way route memory, follow trails through
+//!   Deneubourg's choice function sensed by a forward antennal probe, lay
+//!   trail in proportion to food quality and crop load, recruit by contact,
+//!   collect sugar or protein as the larvae demand, and engage in tasks by
+//!   reinforced response thresholds. The nest stores sugar and protein,
+//!   gets hungry, lays eggs and raises brood through egg, larva and pupa.
+//!   The [`experiments`] module reproduces the classic double-bridge,
+//!   equal-bridge, crowded-bridge, two-source, dripping-source, hunger,
+//!   communal-nutrition, cemetery and division-of-labour setups.
 //!
 //! * **Entropic behavioral surface** ([`surface`], [`entropy`]): the general
 //!   object that controls behaviour. It is a weight vector over the sensory

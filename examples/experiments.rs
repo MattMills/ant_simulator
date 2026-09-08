@@ -41,7 +41,7 @@ fn main() {
     }
 
     println!("\n== equal branches: symmetry breaking (Deneubourg et al. 1990) ==");
-    let long_run = seconds.max(45.0 * 60.0);
+    let long_run = seconds.max(60.0 * 60.0);
     for (label, pure) in [
         ("full behavioural model", false),
         (
@@ -130,7 +130,7 @@ fn main() {
         );
     }
 
-    println!("\n== foraging activity against colony satiation (Mailleux et al. 2003) ==");
+    println!("\n== foraging activity against colony satiation (Mailleux et al. 2006) ==");
     for o in run_hunger_response(
         &Species::lasius_niger(),
         60,
