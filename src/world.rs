@@ -31,7 +31,9 @@
 //! cells facing each other across their side, and a node with no open
 //! cell is never visited, so a shaped arena costs what its open ground
 //! costs, not its bounding box. [`World::field_tree`] reads the mass at
-//! every level above the grain.
+//! every level above the grain. A node whose open ground is in several
+//! pieces keeps a substrate mark at cell resolution, one mean being no
+//! account of two corridors.
 
 use crate::geometry::{Direction, Point, Position};
 use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
@@ -404,6 +406,10 @@ struct Grain {
     open: Vec<u32>,
     /// Nodes with a wall in them (their cells are checked one by one).
     walled: Vec<bool>,
+    /// Nodes whose open ground is in several pieces (two corridors, say),
+    /// which keep a substrate mark at cell resolution: one mean would
+    /// mix the pieces.
+    split: Vec<bool>,
     /// Nodes with no open cell at all, which the kinetics never visit.
     void: Vec<bool>,
     /// Per node and side (north, east, south, west), the neighbouring
@@ -471,6 +477,7 @@ impl Grain {
             height: config.height,
             open: vec![0; n],
             walled: vec![false; n],
+            split: vec![false; n],
             void: vec![false; n],
             nb: vec![[u32::MAX; 4]; n],
             sources: vec![0; n],
@@ -525,10 +532,43 @@ impl Grain {
             g.void[node] = open == 0;
             g.corpses[node] = corpses;
             g.sources[node] = sources;
+            // Is the open ground one piece? Flood it from its first
+            // open cell, within the node.
             if walled && open > 0 {
-                for k in 0..Pheromone::COUNT {
-                    if !g.volatile[k] {
-                        g.active[node][k] = true;
+                let side = x1 - x0;
+                let mut seen = vec![false; side * (y1 - y0)];
+                let mut stack = Vec::new();
+                'first: for y in y0..y1 {
+                    for x in x0..x1 {
+                        if cells[y * config.width + x].terrain != Terrain::Wall {
+                            stack.push((x, y));
+                            seen[(y - y0) * side + (x - x0)] = true;
+                            break 'first;
+                        }
+                    }
+                }
+                let mut reached = 0u32;
+                while let Some((x, y)) = stack.pop() {
+                    reached += 1;
+                    for (dx, dy) in [(0i64, -1i64), (1, 0), (0, 1), (-1, 0)] {
+                        let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                        if nx < x0 as i64 || ny < y0 as i64 || nx >= x1 as i64 || ny >= y1 as i64 {
+                            continue;
+                        }
+                        let (nx, ny) = (nx as usize, ny as usize);
+                        let s = (ny - y0) * side + (nx - x0);
+                        if !seen[s] && cells[ny * config.width + nx].terrain != Terrain::Wall {
+                            seen[s] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+                if reached < open {
+                    g.split[node] = true;
+                    for k in 0..Pheromone::COUNT {
+                        if !g.volatile[k] {
+                            g.active[node][k] = true;
+                        }
                     }
                 }
             }
@@ -1870,10 +1910,9 @@ impl World {
             for &k in channels {
                 let limit = 0.5 * g.threshold[k];
                 for node in 0..nodes {
-                    // A node with walls in it is left at cell resolution:
-                    // its open ground may be two corridors that one mean
-                    // would mix.
-                    if !g.active[node][k] || g.has_sources(node, k) || g.walled[node] {
+                    // A node whose open ground is in pieces is left at
+                    // cell resolution: one mean would mix the pieces.
+                    if !g.active[node][k] || g.has_sources(node, k) || g.split[node] {
                         continue;
                     }
                     let (x0, y0, x1, y1) = g.rect(node);

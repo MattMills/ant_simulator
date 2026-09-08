@@ -396,7 +396,7 @@ cargo run --release --example nest        [minutes]
 cargo run --release --example scale       [minutes]
 cargo run --release --example memo        [minutes] [categories]
 cargo run --release --example lens
-cargo bench                               [-- quick | phases | colony]
+cargo bench                               [-- quick | phases | colony | shapes]
 ```
 
 `colony` renders the world, compares the four species on one map, sweeps
@@ -412,7 +412,8 @@ size and grain. `memo` extracts the behavioural memo and classifies the
 ground. `lens` draws the two-position tessellation of the quadtree and
 the geodesic over it. `cargo bench` runs the throughput scan (see
 below); `colony` selects its colony-scale rows, the memoized and
-pipelined colony against the full simulation.
+pipelined colony against the full simulation, and `shapes` its larger
+and shaped arenas, the field's grain against the dense sweep.
 
 ## The arena, turn by turn
 
