@@ -84,7 +84,7 @@ fn richer_source_wins_the_colony() {
     // colony on the richer one.
     for seed in [1, 2] {
         let o = run_two_sources_once(12, 1.0, 0.1, Species::lasius_niger(), 60, 20.0 * 60.0, seed);
-        assert!(o.loads_a + o.loads_b > 50, "{o:?}");
+        assert!(o.volume_a + o.volume_b > 10.0, "{o:?}");
         assert!(o.fraction_a > 0.6, "rich source should dominate: {o:?}");
     }
 }
@@ -159,8 +159,8 @@ fn pharaoh_ants_mark_exhausted_routes() {
         food_sources: vec![FoodSource {
             center: Position::new(50, 20),
             radius: 0,
-            amount_per_cell: 3,
-            quality: 1.0,
+            volume_ul_per_cell: 1.0,
+            molarity: 1.0,
         }],
         ..WorldConfig::default()
     };

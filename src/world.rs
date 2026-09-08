@@ -1,15 +1,22 @@
 //! The grid world: terrain, food, nest, pheromone fields, and counters.
 //!
-//! The grid has a physical scale (`cell_cm`) and the simulation a time step
-//! (`tick_s`), so species parameters in centimetres and seconds convert to
-//! cells and ticks. Each cell carries every [`Pheromone`] channel; the
-//! channels evaporate by first-order kinetics from their half-lives and
-//! diffuse a little to orthogonal neighbours each tick.
+//! The grid discretises the substrate. Cells are `cell_cm` centimetres
+//! across and ticks are `tick_s` seconds; ants move continuously across
+//! the grid (see [`crate::geometry::Point`]) while pheromone, food and
+//! occupancy live in cells. Each cell carries every [`Pheromone`] channel;
+//! the channels evaporate by first-order kinetics from their half-lives
+//! (scaled by temperature through [`World::set_evaporation_factor`]) and
+//! diffuse conservatively to orthogonal neighbours each tick. Food is a
+//! volume of sugar solution of a given molarity.
 
-use crate::geometry::{Direction, Position};
+use crate::geometry::{Direction, Point, Position};
 use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
 use crate::rng::Rng;
 use crate::species::Species;
+
+/// Half-width of an ant's body in cells (0.2 cm on the default 2-cm grid):
+/// paths must keep this clearance from walls.
+pub const BODY_RADIUS: f64 = 0.1;
 
 /// What a cell fundamentally is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -28,16 +35,15 @@ pub enum Terrain {
 pub struct Cell {
     /// Terrain type.
     pub terrain: Terrain,
-    /// Crop loads of food lying here.
-    pub food: u32,
-    /// Quality of that food in `0..=1` (sucrose concentration relative to
-    /// the most attractive solution).
-    pub quality: f32,
+    /// Volume of food solution lying here, microlitres.
+    pub food_ul: f64,
+    /// Sucrose molarity of that solution.
+    pub molarity: f64,
     /// Concentration of every pheromone channel, indexed by
     /// [`Pheromone::index`].
     pub pheromone: [f64; Pheromone::COUNT],
-    /// Number of living ants currently on the cell (ants inside the nest are
-    /// not on the grid).
+    /// Number of living ants currently in the cell (ants inside the nest
+    /// are not on the grid).
     pub occupancy: u16,
 }
 
@@ -45,6 +51,11 @@ impl Cell {
     /// Concentration of one channel.
     pub fn level(&self, kind: Pheromone) -> f64 {
         self.pheromone[kind.index()]
+    }
+
+    /// Whether any food remains.
+    pub fn has_food(&self) -> bool {
+        self.food_ul > 1e-9
     }
 }
 
@@ -55,10 +66,10 @@ pub struct FoodSource {
     pub center: Position,
     /// Chebyshev radius of the cluster.
     pub radius: i32,
-    /// Crop loads placed on every cell of the cluster.
-    pub amount_per_cell: u32,
-    /// Quality in `0..=1`.
-    pub quality: f64,
+    /// Microlitres of solution placed on every cell of the cluster.
+    pub volume_ul_per_cell: f64,
+    /// Sucrose molarity of the solution.
+    pub molarity: f64,
 }
 
 /// An inclusive axis-aligned rectangle of cells.
@@ -92,12 +103,12 @@ pub struct RandomFood {
     pub clusters: usize,
     /// Chebyshev radius of each cluster.
     pub radius: i32,
-    /// Crop loads per cell.
-    pub amount_per_cell: u32,
+    /// Microlitres per cell.
+    pub volume_ul_per_cell: f64,
     /// Minimum Chebyshev distance between a cluster centre and the nest.
     pub min_distance_from_nest: i32,
-    /// Quality range the clusters are drawn from.
-    pub quality: (f64, f64),
+    /// Molarity range the clusters are drawn from.
+    pub molarity: (f64, f64),
 }
 
 /// A region whose crossings are counted (the "bridge counters" of the
@@ -156,9 +167,9 @@ impl Default for WorldConfig {
             random_food: Some(RandomFood {
                 clusters: 3,
                 radius: 2,
-                amount_per_cell: 25,
+                volume_ul_per_cell: 20.0,
                 min_distance_from_nest: 12,
-                quality: (0.4, 1.0),
+                molarity: (0.4, 1.0),
             }),
             walls: Vec::new(),
             open: Vec::new(),
@@ -174,7 +185,7 @@ impl Default for WorldConfig {
 pub struct CounterState {
     /// The counter's definition.
     pub counter: Counter,
-    /// Ant moves that ended inside the region.
+    /// Ant cell entries inside the region.
     pub crossings: u64,
 }
 
@@ -185,8 +196,10 @@ pub struct World {
     cells: Vec<Cell>,
     scratch: Vec<[f64; Pheromone::COUNT]>,
     params: PheromoneSet,
+    base_retention: [f64; Pheromone::COUNT],
     retention: [f64; Pheromone::COUNT],
     diffusion: [f64; Pheromone::COUNT],
+    evaporation_factor: f64,
     counters: Vec<CounterState>,
 }
 
@@ -226,8 +239,10 @@ impl World {
             cells: vec![Cell::default(); n],
             scratch: vec![[0.0; Pheromone::COUNT]; n],
             params,
+            base_retention: retention,
             retention,
             diffusion,
+            evaporation_factor: 1.0,
             counters,
             config,
         };
@@ -279,8 +294,14 @@ impl World {
             for dx in -src.radius..=src.radius {
                 if let Some(c) = self.cell_mut(src.center.offset(dx, dy)) {
                     if c.terrain == Terrain::Open {
-                        c.food = c.food.saturating_add(src.amount_per_cell);
-                        c.quality = src.quality.clamp(0.0, 1.0) as f32;
+                        // Mixing: the molarity becomes the volume-weighted mean.
+                        let total = c.food_ul + src.volume_ul_per_cell;
+                        if total > 0.0 {
+                            c.molarity = (c.molarity * c.food_ul
+                                + src.molarity.max(0.0) * src.volume_ul_per_cell)
+                                / total;
+                        }
+                        c.food_ul = total;
                     }
                 }
             }
@@ -301,17 +322,17 @@ impl World {
                 }
                 if self
                     .cell(center)
-                    .map(|c| c.terrain != Terrain::Open || c.food > 0)
+                    .map(|c| c.terrain != Terrain::Open || c.has_food())
                     .unwrap_or(true)
                 {
                     continue;
                 }
-                let quality = rng.range(random.quality.0, random.quality.1);
+                let molarity = rng.range(random.molarity.0, random.molarity.1);
                 self.place_food(&FoodSource {
                     center,
                     radius: r,
-                    amount_per_cell: random.amount_per_cell,
-                    quality,
+                    volume_ul_per_cell: random.volume_ul_per_cell,
+                    molarity,
                 });
                 break;
             }
@@ -331,6 +352,25 @@ impl World {
     /// Parameters of one channel.
     pub fn channel(&self, kind: Pheromone) -> &PheromoneParams {
         &self.params[kind.index()]
+    }
+
+    /// Scale every channel's decay rate by `factor` (temperature: warmer
+    /// substrates lose pheromone faster). `1.0` restores the nominal
+    /// half-lives.
+    pub fn set_evaporation_factor(&mut self, factor: f64) {
+        let factor = factor.max(0.0);
+        if (factor - self.evaporation_factor).abs() < 1e-12 {
+            return;
+        }
+        self.evaporation_factor = factor;
+        for (r, base) in self.retention.iter_mut().zip(&self.base_retention) {
+            *r = if *base <= 0.0 { 0.0 } else { base.powf(factor) };
+        }
+    }
+
+    /// Current evaporation factor.
+    pub fn evaporation_factor(&self) -> f64 {
+        self.evaporation_factor
     }
 
     /// Grid width.
@@ -403,6 +443,56 @@ impl World {
             .unwrap_or(false)
     }
 
+    /// Whether an ant may stand at a continuous point.
+    pub fn is_passable_point(&self, p: Point) -> bool {
+        self.is_passable(p.cell())
+    }
+
+    /// Probe along a ray from `from` in direction `heading` for up to
+    /// `reach` cells, as an antenna does: the probe stops at the first
+    /// wall. Returns the farthest passable point reached and its distance
+    /// (zero, at `from`, when the very first quarter cell is blocked).
+    pub fn probe(&self, from: Point, heading: f64, reach: f64) -> (Point, f64) {
+        let samples = (reach / 0.25).ceil().max(1.0) as usize;
+        let mut last = (from, 0.0);
+        for i in 1..=samples {
+            let d = reach * i as f64 / samples as f64;
+            let p = from.advanced(heading, d);
+            if !self.is_passable_point(p) {
+                break;
+            }
+            last = (p, d);
+        }
+        last
+    }
+
+    /// Whether a body centred on `p` fits on passable ground: the point and
+    /// the corners of a square of half-width [`BODY_RADIUS`] around it.
+    pub fn has_clearance(&self, p: Point) -> bool {
+        const R: f64 = BODY_RADIUS;
+        self.is_passable_point(p)
+            && self.is_passable_point(Point::new(p.x - R, p.y - R))
+            && self.is_passable_point(Point::new(p.x + R, p.y - R))
+            && self.is_passable_point(Point::new(p.x - R, p.y + R))
+            && self.is_passable_point(Point::new(p.x + R, p.y + R))
+    }
+
+    /// Whether a body can travel the straight segment from `a` to `b`:
+    /// clearance is checked every quarter cell along it, so walls cannot be
+    /// clipped and corners cannot be cut.
+    pub fn segment_passable(&self, a: Point, b: Point) -> bool {
+        let len = a.distance(b);
+        let samples = (len / 0.25).ceil().max(1.0) as usize;
+        for i in 1..=samples {
+            let t = i as f64 / samples as f64;
+            let p = Point::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
+            if !self.has_clearance(p) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether `p` is a nest cell.
     pub fn is_nest(&self, p: Position) -> bool {
         self.cell(p)
@@ -424,9 +514,52 @@ impl World {
         out
     }
 
-    /// Concentration of a channel at `p` (0 outside the grid).
+    /// Concentration of a channel at a cell (0 outside the grid).
     pub fn level(&self, p: Position, kind: Pheromone) -> f64 {
         self.cell(p).map(|c| c.level(kind)).unwrap_or(0.0)
+    }
+
+    /// Concentration of a channel on the substrate patch (cell) under a
+    /// continuous point; walls and points off the grid read zero. Marks
+    /// are laid on the substrate cell by cell, and an antenna touching a
+    /// patch senses that patch: at a trail fork this keeps the two branch
+    /// trails distinct instead of blending them with the heavily marked
+    /// junction (see [`World::sample`] for the smooth field).
+    pub fn level_at(&self, p: Point, kind: Pheromone) -> f64 {
+        self.cell(p.cell())
+            .filter(|c| c.terrain != Terrain::Wall)
+            .map(|c| c.level(kind))
+            .unwrap_or(0.0)
+    }
+
+    /// Concentration of a channel at a continuous point, bilinearly
+    /// interpolated between the four nearest cell centres. Walls and cells
+    /// off the grid contribute nothing.
+    pub fn sample(&self, p: Point, kind: Pheromone) -> f64 {
+        let fx = p.x - 0.5;
+        let fy = p.y - 0.5;
+        let x0 = fx.floor();
+        let y0 = fy.floor();
+        let tx = fx - x0;
+        let ty = fy - y0;
+        let mut total = 0.0;
+        for (dx, dy, w) in [
+            (0, 0, (1.0 - tx) * (1.0 - ty)),
+            (1, 0, tx * (1.0 - ty)),
+            (0, 1, (1.0 - tx) * ty),
+            (1, 1, tx * ty),
+        ] {
+            if w <= 0.0 {
+                continue;
+            }
+            let cell = Position::new(x0 as i32 + dx, y0 as i32 + dy);
+            if let Some(c) = self.cell(cell) {
+                if c.terrain != Terrain::Wall {
+                    total += w * c.level(kind);
+                }
+            }
+        }
+        total
     }
 
     /// Add pheromone of one channel to a cell (clamped to the channel's cap;
@@ -442,7 +575,24 @@ impl World {
         }
     }
 
-    /// Record an ant move ending at `p` in every counter covering it.
+    /// Take up to `volume_ul` of solution from a cell; returns the volume
+    /// actually taken and its molarity.
+    pub fn take_food(&mut self, p: Position, volume_ul: f64) -> (f64, f64) {
+        match self.cell_mut(p) {
+            Some(c) if c.has_food() => {
+                let taken = volume_ul.max(0.0).min(c.food_ul);
+                c.food_ul -= taken;
+                let molarity = c.molarity;
+                if c.food_ul < 1e-9 {
+                    c.food_ul = 0.0;
+                }
+                (taken, molarity)
+            }
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// Record an ant entering cell `p` in every counter covering it.
     pub fn record_crossing(&mut self, p: Position) {
         for c in self.counters.iter_mut() {
             if c.counter.rect.contains(p) {
@@ -534,28 +684,28 @@ impl World {
         }
     }
 
-    /// Total food remaining on the ground.
-    pub fn total_food(&self) -> u64 {
-        self.cells.iter().map(|c| c.food as u64).sum()
+    /// Total volume of food remaining on the ground, microlitres.
+    pub fn total_food(&self) -> f64 {
+        self.cells.iter().map(|c| c.food_ul).sum()
+    }
+
+    /// Food volume remaining inside a region, microlitres.
+    pub fn food_in(&self, rect: &Rect) -> f64 {
+        let mut total = 0.0;
+        for y in rect.min.y..=rect.max.y {
+            for x in rect.min.x..=rect.max.x {
+                total += self
+                    .cell(Position::new(x, y))
+                    .map(|c| c.food_ul)
+                    .unwrap_or(0.0);
+            }
+        }
+        total
     }
 
     /// Total amount of one channel over the grid.
     pub fn total_pheromone(&self, kind: Pheromone) -> f64 {
         self.cells.iter().map(|c| c.level(kind)).sum()
-    }
-
-    /// Food remaining inside a region.
-    pub fn food_in(&self, rect: &Rect) -> u64 {
-        let mut total = 0;
-        for y in rect.min.y..=rect.max.y {
-            for x in rect.min.x..=rect.max.x {
-                total += self
-                    .cell(Position::new(x, y))
-                    .map(|c| c.food as u64)
-                    .unwrap_or(0);
-            }
-        }
-        total
     }
 
     /// Total of one channel inside a region.
@@ -583,8 +733,8 @@ mod tests {
             food_sources: vec![FoodSource {
                 center: Position::new(1, 1),
                 radius: 1,
-                amount_per_cell: 5,
-                quality: 0.7,
+                volume_ul_per_cell: 5.0,
+                molarity: 0.7,
             }],
             random_food: None,
             walls: vec![Rect::new(Position::new(9, 0), Position::new(9, 9))],
@@ -601,9 +751,34 @@ mod tests {
         assert!(!world.is_nest(Position::new(8, 5)));
         assert!(!world.is_passable(Position::new(9, 4)));
         assert!(!world.is_passable(Position::new(-1, 0)));
-        assert_eq!(world.total_food(), 45);
-        assert_eq!(world.cell(Position::new(1, 1)).unwrap().quality, 0.7);
+        assert!((world.total_food() - 45.0).abs() < 1e-9);
+        assert_eq!(world.cell(Position::new(1, 1)).unwrap().molarity, 0.7);
         assert_eq!(world.nest_cells().len(), 9);
+    }
+
+    #[test]
+    fn food_is_taken_and_mixed() {
+        let mut world = World::new(small_config(), &mut Rng::seed_from_u64(1));
+        let (taken, molarity) = world.take_food(Position::new(1, 1), 2.0);
+        assert!((taken - 2.0).abs() < 1e-12 && (molarity - 0.7).abs() < 1e-12);
+        let (rest, _) = world.take_food(Position::new(1, 1), 10.0);
+        assert!((rest - 3.0).abs() < 1e-12);
+        assert_eq!(world.take_food(Position::new(1, 1), 1.0), (0.0, 0.0));
+        assert!(!world.cell(Position::new(1, 1)).unwrap().has_food());
+        world.place_food(&FoodSource {
+            center: Position::new(1, 1),
+            radius: 0,
+            volume_ul_per_cell: 2.0,
+            molarity: 0.1,
+        });
+        world.place_food(&FoodSource {
+            center: Position::new(1, 1),
+            radius: 0,
+            volume_ul_per_cell: 2.0,
+            molarity: 0.5,
+        });
+        let c = world.cell(Position::new(1, 1)).unwrap();
+        assert!((c.food_ul - 4.0).abs() < 1e-12 && (c.molarity - 0.3).abs() < 1e-12);
     }
 
     #[test]
@@ -623,6 +798,27 @@ mod tests {
     }
 
     #[test]
+    fn segments_cannot_cut_corners() {
+        let cfg = WorldConfig {
+            open: vec![
+                Rect::new(Position::new(0, 5), Position::new(5, 5)),
+                Rect::new(Position::new(5, 0), Position::new(5, 5)),
+            ],
+            walls: Vec::new(),
+            nest_radius: 0,
+            nest: Position::new(0, 5),
+            ..small_config()
+        };
+        let world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        let corner = Point::center_of(Position::new(4, 5));
+        assert!(world.segment_passable(corner, Point::center_of(Position::new(5, 5))));
+        assert!(!world.segment_passable(corner, Point::center_of(Position::new(5, 4))));
+        assert!(!world.segment_passable(corner, Point::new(4.5, 3.0)));
+        assert!(world.is_passable_point(Point::new(5.9, 0.1)));
+        assert!(!world.is_passable_point(Point::new(6.1, 0.1)));
+    }
+
+    #[test]
     fn random_food_is_reproducible_from_config_seed() {
         let cfg = WorldConfig {
             seed: Some(99),
@@ -632,11 +828,11 @@ mod tests {
         let mut r2 = Rng::seed_from_u64(2);
         let a = World::new(cfg.clone(), &mut r1);
         let b = World::new(cfg, &mut r2);
-        let fa: Vec<(u32, f32)> = a.cells().iter().map(|c| (c.food, c.quality)).collect();
-        let fb: Vec<(u32, f32)> = b.cells().iter().map(|c| (c.food, c.quality)).collect();
+        let fa: Vec<(f64, f64)> = a.cells().iter().map(|c| (c.food_ul, c.molarity)).collect();
+        let fb: Vec<(f64, f64)> = b.cells().iter().map(|c| (c.food_ul, c.molarity)).collect();
         assert_eq!(fa, fb);
-        assert!(a.total_food() > 0);
-        assert!(a.cells().iter().any(|c| c.food > 0 && c.quality >= 0.4));
+        assert!(a.total_food() > 0.0);
+        assert!(a.cells().iter().any(|c| c.has_food() && c.molarity >= 0.4));
     }
 
     #[test]
@@ -667,6 +863,43 @@ mod tests {
             world.level(p, Pheromone::Trail),
             world.channel(Pheromone::Trail).cap
         );
+    }
+
+    #[test]
+    fn evaporation_factor_scales_decay() {
+        let cfg = WorldConfig {
+            tick_s: 60.0,
+            ..small_config()
+        };
+        let mut warm = World::new(cfg.clone(), &mut Rng::seed_from_u64(1));
+        let mut cool = World::new(cfg, &mut Rng::seed_from_u64(1));
+        warm.set_evaporation_factor(2.0);
+        assert_eq!(warm.evaporation_factor(), 2.0);
+        let p = Position::new(3, 3);
+        warm.deposit(p, Pheromone::Trail, 10.0);
+        cool.deposit(p, Pheromone::Trail, 10.0);
+        warm.step_pheromones();
+        cool.step_pheromones();
+        let r = cool.channel(Pheromone::Trail).retention_per_tick(60.0);
+        assert!((warm.total_pheromone(Pheromone::Trail) - 10.0 * r * r).abs() < 1e-9);
+        warm.set_evaporation_factor(1.0);
+        assert_eq!(warm.evaporation_factor(), 1.0);
+    }
+
+    #[test]
+    fn sampling_interpolates_between_cells() {
+        let mut world = World::new(small_config(), &mut Rng::seed_from_u64(1));
+        world.deposit(Position::new(3, 3), Pheromone::Trail, 8.0);
+        let centre = Point::center_of(Position::new(3, 3));
+        assert!((world.sample(centre, Pheromone::Trail) - 8.0).abs() < 1e-12);
+        let half = Point::new(4.0, 3.5);
+        assert!((world.sample(half, Pheromone::Trail) - 4.0).abs() < 1e-12);
+        let far = Point::center_of(Position::new(5, 5));
+        assert_eq!(world.sample(far, Pheromone::Trail), 0.0);
+        // Walls contribute nothing and points off the grid are safe.
+        world.deposit(Position::new(8, 4), Pheromone::Trail, 8.0);
+        assert!((world.sample(Point::new(9.0, 4.5), Pheromone::Trail) - 4.0).abs() < 1e-12);
+        assert_eq!(world.sample(Point::new(-3.0, -3.0), Pheromone::Trail), 0.0);
     }
 
     #[test]
@@ -735,5 +968,6 @@ mod tests {
         let rect = Rect::new(Position::new(0, 0), Position::new(2, 2));
         world.deposit(Position::new(1, 1), Pheromone::Trail, 3.0);
         assert!((world.pheromone_in(&rect, Pheromone::Trail) - 3.0).abs() < 1e-12);
+        assert!((world.food_in(&rect) - 45.0).abs() < 1e-9);
     }
 }

@@ -76,13 +76,13 @@ fn main() {
         let o = run_two_sources_once(12, 1.0, 0.1, Species::lasius_niger(), ants, seconds, seed);
         fractions.push(o.fraction_a);
         println!(
-            "   seed {seed:>2}: rich {:>4} poor {:>4} → share from rich {:.2}",
-            o.loads_a, o.loads_b, o.fraction_a
+            "   seed {seed:>2}: rich {:>6.1} µl poor {:>6.1} µl → share from rich {:.2} ({} loads)",
+            o.volume_a, o.volume_b, o.fraction_a, o.delivered
         );
     }
     let s = summarize(&fractions);
     println!(
-        "share of loads from the richer source {:.2} ± {:.2}; majority rich in {:.0}% of runs",
+        "share of solution taken from the richer source {:.2} ± {:.2}; majority rich in {:.0}% of runs",
         s.mean,
         s.std,
         100.0 * s.majority

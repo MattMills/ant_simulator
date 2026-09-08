@@ -2,22 +2,25 @@
 //! their movement.
 //!
 //! Each tick every living ant acts according to its activity. Inside the
-//! nest it rests, nurses brood, or unloads by trophallaxis, and decides
-//! whether to leave by a response threshold on the colony's hunger and
-//! excitation. Outside, it walks by scoring the eight neighbouring cells
-//! through the effective policy of its category, laying that ring out as a
-//! landscape, deforming it with the entropy budget, and selecting a
-//! direction (a global draw or a crawling sucker). It lays pheromone, keeps
-//! a path-integration home vector, feeds at food, returns, searches when
-//! its estimate runs out, and may starve or be taken by a predator. The
-//! nest consumes food, the queen lays eggs when fed, brood develops into
-//! workers, and excitation from returning foragers decays.
+//! nest it rests, nurses larvae, or unloads by trophallaxis, and decides
+//! whether to leave by a response threshold on the colony's hunger and its
+//! own excitation from contacts with successful foragers. Outside, it walks
+//! continuously: it scores sixteen candidate headings through the effective
+//! policy of its category, lays that ring out as a landscape, deforms it
+//! with the entropy budget, and selects a heading (a global draw or a
+//! crawling sucker). It lays pheromone per centimetre walked, keeps a
+//! path-integration home vector and a route memory of familiar places,
+//! drinks at food at a viscosity-limited rate, returns, searches when its
+//! estimate runs out, and may starve or be taken by a predator. The nest
+//! consumes sugar, the queen lays eggs when fed, brood passes through egg,
+//! larval and pupal stages, and temperature scales walking, evaporation,
+//! development and metabolism.
 
 use crate::ant::{observe, Activity, Ant, AntId, Mode, SearchTarget, Site, Traits, FEATURES};
 use crate::entropy::{entropy, Tempering};
-use crate::geometry::{Direction, Position};
+use crate::geometry::{angle_of, Point, Position};
 use crate::hierarchy::{EffectivePolicy, Hierarchy, HierarchySpec, NodeId};
-use crate::landscape::{ring_index, world_direction, EntropyLedger, Landscape, Sucker, RING};
+use crate::landscape::{ring_heading, turn_magnitude, EntropyLedger, Landscape, Sucker, RING};
 use crate::pheromone::Pheromone;
 use crate::rng::Rng;
 use crate::species::Species;
@@ -27,9 +30,9 @@ use crate::world::{World, WorldConfig};
 /// How events translate into the scalar reward learners optimise.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RewardSpec {
-    /// Reward per crop load delivered into the nest.
-    pub food_delivered: f64,
-    /// Reward per crop load collected at a source.
+    /// Reward per milligram of sugar delivered into the nest.
+    pub sugar_mg: f64,
+    /// Reward per feeding visit at a source.
     pub food_picked: f64,
     /// Reward (normally negative) per dead worker.
     pub death: f64,
@@ -40,7 +43,7 @@ pub struct RewardSpec {
 impl Default for RewardSpec {
     fn default() -> Self {
         RewardSpec {
-            food_delivered: 1.0,
+            sugar_mg: 5.0,
             food_picked: 0.1,
             death: -0.5,
             birth: 0.0,
@@ -48,7 +51,7 @@ impl Default for RewardSpec {
     }
 }
 
-/// How a direction is drawn from the deformed landscape.
+/// How a heading is drawn from the deformed landscape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     /// A global draw from the tempered distribution.
@@ -83,7 +86,7 @@ pub struct GeometryConfig {
 impl Default for GeometryConfig {
     fn default() -> Self {
         GeometryConfig {
-            smooth_max: 2.0,
+            smooth_max: 3.0,
             rough_modes: 3,
             max_reach: 64,
             ledger: true,
@@ -92,14 +95,50 @@ impl Default for GeometryConfig {
     }
 }
 
+/// Ambient conditions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Environment {
+    /// Mean air temperature, °C.
+    pub temperature_c: f64,
+    /// Half the day–night temperature swing, °C (0 for constant weather).
+    pub diurnal_amplitude_c: f64,
+    /// Length of a day, seconds.
+    pub day_length_s: f64,
+    /// Time of the daily minimum, seconds after the start.
+    pub coldest_at_s: f64,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Environment {
+            temperature_c: Species::REFERENCE_C,
+            diurnal_amplitude_c: 0.0,
+            day_length_s: 24.0 * 3600.0,
+            coldest_at_s: 0.0,
+        }
+    }
+}
+
+impl Environment {
+    /// Temperature at a simulated time.
+    pub fn temperature(&self, time_s: f64) -> f64 {
+        if self.diurnal_amplitude_c == 0.0 {
+            return self.temperature_c;
+        }
+        let phase =
+            std::f64::consts::TAU * (time_s - self.coldest_at_s) / self.day_length_s.max(1e-9);
+        self.temperature_c - self.diurnal_amplitude_c * phase.cos()
+    }
+}
+
 /// Nest and colony-level parameters.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NestConfig {
-    /// Food store capacity per worker, in crop loads.
-    pub store_capacity_per_ant: f64,
+    /// Sugar store capacity per worker, milligrams.
+    pub store_capacity_mg_per_ant: f64,
     /// Initial fill of the store as a fraction of capacity.
     pub initial_satiation: f64,
-    /// Initial brood items per worker.
+    /// Initial brood items per worker, spread over the three stages.
     pub initial_brood_per_ant: f64,
     /// Maximum brood items per worker (the queen stops laying beyond it).
     pub max_brood_per_ant: f64,
@@ -119,7 +158,7 @@ pub struct NestConfig {
 impl Default for NestConfig {
     fn default() -> Self {
         NestConfig {
-            store_capacity_per_ant: 2.0,
+            store_capacity_mg_per_ant: 0.4,
             initial_satiation: 0.3,
             initial_brood_per_ant: 0.5,
             max_brood_per_ant: 1.0,
@@ -143,6 +182,8 @@ pub struct SimConfig {
     pub instinct: BehavioralSurface,
     /// Species profile.
     pub species: Species,
+    /// Ambient conditions.
+    pub environment: Environment,
     /// Initial number of workers.
     pub ants: usize,
     /// Nest parameters.
@@ -151,7 +192,7 @@ pub struct SimConfig {
     pub reward: RewardSpec,
     /// Whether to accumulate policy-gradient score sums per node.
     pub trace: bool,
-    /// How directions are selected from the landscape.
+    /// How headings are selected from the landscape.
     pub selection: Selection,
     /// Geometric channel parameters.
     pub geometry: GeometryConfig,
@@ -171,11 +212,18 @@ impl SimConfig {
     /// A default configuration for a species, with that species' instinct
     /// at the root.
     pub fn for_species(species: Species) -> Self {
+        // Hold the world at the species' reference temperature so that a
+        // thermophile is not asked to forage in a temperate room.
+        let environment = Environment {
+            temperature_c: species.speed_t_ref_c,
+            ..Environment::default()
+        };
         SimConfig {
             world: WorldConfig::default(),
             hierarchy: HierarchySpec::default(),
             instinct: species.instinct(),
             species,
+            environment,
             ants: 60,
             nest: NestConfig::default(),
             reward: RewardSpec::default(),
@@ -188,30 +236,48 @@ impl SimConfig {
     }
 }
 
-/// One brood item (egg, larva, or pupa).
+/// Developmental stage of a brood item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroodStage {
+    /// An egg: needs no food.
+    Egg,
+    /// A larva: must be fed by nurses to pupate; starves if neglected.
+    Larva,
+    /// A pupa: needs no food; emerges as a worker.
+    Pupa,
+}
+
+/// One brood item.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BroodItem {
-    /// Ticks since it was laid.
-    pub age: u64,
-    /// Food received so far.
-    pub fed: f64,
+    /// Current stage.
+    pub stage: BroodStage,
+    /// Developmental time accumulated in the current stage, seconds at the
+    /// reference temperature.
+    pub stage_age_s: f64,
+    /// Sugar received as a larva, milligrams.
+    pub fed_mg: f64,
+    /// Seconds since a nurse last fed it.
+    pub unfed_s: f64,
 }
 
 /// The nest interior.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nest {
-    /// Food in store, in crop loads.
-    pub store: f64,
-    /// Store capacity.
-    pub capacity: f64,
+    /// Sugar in store, milligrams.
+    pub store_mg: f64,
+    /// Store capacity, milligrams.
+    pub capacity_mg: f64,
     /// Developing brood.
     pub brood: Vec<BroodItem>,
-    /// Recruitment excitation from recently returned foragers.
+    /// Mean recruitment excitation of the workers inside.
     pub excitation: f64,
     /// Eggs laid so far.
     pub eggs_laid: u64,
     /// Workers that emerged so far.
     pub emerged: u64,
+    /// Larvae that starved so far.
+    pub larvae_starved: u64,
     /// Tick of the last egg.
     pub last_egg_tick: u64,
 }
@@ -219,10 +285,10 @@ pub struct Nest {
 impl Nest {
     /// Fill of the store, 0 (empty) to 1 (full).
     pub fn satiation(&self) -> f64 {
-        if self.capacity <= 0.0 {
+        if self.capacity_mg <= 0.0 {
             0.0
         } else {
-            (self.store / self.capacity).clamp(0.0, 1.0)
+            (self.store_mg / self.capacity_mg).clamp(0.0, 1.0)
         }
     }
 
@@ -230,52 +296,89 @@ impl Nest {
     pub fn hunger(&self) -> f64 {
         1.0 - self.satiation()
     }
+
+    /// Number of brood items in a stage.
+    pub fn count(&self, stage: BroodStage) -> usize {
+        self.brood.iter().filter(|b| b.stage == stage).count()
+    }
+
+    /// Number of larvae.
+    pub fn larvae(&self) -> usize {
+        self.count(BroodStage::Larva)
+    }
 }
 
 /// Geometry of the paths ants walked, plus the entropy ledger.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PathStats {
-    /// Moves made.
+    /// Steps made.
     pub moves: u64,
-    /// Moves by ring position relative to the previous heading
-    /// (0 straight, 4 reverse; see [`crate::landscape::TURN_LABELS`]).
+    /// Path length walked, cells.
+    pub length: f64,
+    /// Steps by ring position relative to the previous heading
+    /// (0 straight, `RING/2` reverse; see [`crate::landscape::turn_label`]).
     pub turns: [u64; RING],
-    /// Moves onto a cell the ant had visited recently.
+    /// Entries into a cell the ant had visited recently.
     pub revisits: u64,
+    /// Cells entered.
+    pub cell_entries: u64,
     /// Completed food-to-nest trips.
     pub trips: u64,
-    /// Steps taken on those trips.
-    pub trip_steps: u64,
-    /// Straight-line (Chebyshev) distance those trips needed.
-    pub trip_direct: u64,
+    /// Path length walked on those trips, cells.
+    pub trip_length: f64,
+    /// Straight-line distance those trips needed, cells.
+    pub trip_direct: f64,
     /// Where the decision entropy came from.
     pub ledger: EntropyLedger,
 }
 
+impl Default for PathStats {
+    fn default() -> Self {
+        PathStats {
+            moves: 0,
+            length: 0.0,
+            turns: [0; RING],
+            revisits: 0,
+            cell_entries: 0,
+            trips: 0,
+            trip_length: 0.0,
+            trip_direct: 0.0,
+            ledger: EntropyLedger::default(),
+        }
+    }
+}
+
 impl PathStats {
-    fn record_move(&mut self, ring: usize, revisit: bool) {
+    fn record_move(&mut self, ring: usize, length: f64) {
         self.moves += 1;
+        self.length += length;
         self.turns[ring] += 1;
+    }
+
+    fn record_entry(&mut self, revisit: bool) {
+        self.cell_entries += 1;
         if revisit {
             self.revisits += 1;
         }
     }
 
-    fn record_trip(&mut self, steps: u64, direct: u64) {
+    fn record_trip(&mut self, length: f64, direct: f64) {
         self.trips += 1;
-        self.trip_steps += steps;
+        self.trip_length += length;
         self.trip_direct += direct;
     }
 
     /// Add another record's counts.
     pub fn merge(&mut self, other: &PathStats) {
         self.moves += other.moves;
+        self.length += other.length;
         for (a, b) in self.turns.iter_mut().zip(&other.turns) {
             *a += b;
         }
         self.revisits += other.revisits;
+        self.cell_entries += other.cell_entries;
         self.trips += other.trips;
-        self.trip_steps += other.trip_steps;
+        self.trip_length += other.trip_length;
         self.trip_direct += other.trip_direct;
         self.ledger.merge(&other.ledger);
     }
@@ -294,7 +397,7 @@ impl PathStats {
         entropy(&probs)
     }
 
-    /// Fraction of moves that kept the heading.
+    /// Fraction of steps that kept the heading (within half a ring step).
     pub fn straight_rate(&self) -> f64 {
         if self.moves == 0 {
             0.0
@@ -303,7 +406,16 @@ impl PathStats {
         }
     }
 
-    /// Fraction of moves that reversed the heading.
+    /// Fraction of steps that turned by 90° or more.
+    pub fn sharp_turn_rate(&self) -> f64 {
+        if self.moves == 0 {
+            return 0.0;
+        }
+        let sharp: u64 = (RING / 4..=3 * RING / 4).map(|k| self.turns[k]).sum();
+        sharp as f64 / self.moves as f64
+    }
+
+    /// Fraction of steps that reversed the heading.
     pub fn reversal_rate(&self) -> f64 {
         if self.moves == 0 {
             0.0
@@ -312,22 +424,22 @@ impl PathStats {
         }
     }
 
-    /// Fraction of moves onto a recently visited cell.
+    /// Fraction of cell entries into a recently visited cell.
     pub fn revisit_rate(&self) -> f64 {
-        if self.moves == 0 {
+        if self.cell_entries == 0 {
             0.0
         } else {
-            self.revisits as f64 / self.moves as f64
+            self.revisits as f64 / self.cell_entries as f64
         }
     }
 
-    /// Straight-line distance divided by steps taken, averaged over trips
+    /// Straight-line distance divided by path length, averaged over trips
     /// (1 is a perfectly direct return; 0 if there were no trips).
     pub fn trip_efficiency(&self) -> f64 {
-        if self.trip_steps == 0 {
+        if self.trip_length <= 0.0 {
             0.0
         } else {
-            self.trip_direct as f64 / self.trip_steps as f64
+            (self.trip_direct / self.trip_length).min(1.0)
         }
     }
 }
@@ -339,6 +451,8 @@ pub struct Snapshot {
     pub tick: u64,
     /// Simulated seconds.
     pub time_s: f64,
+    /// Air temperature, °C.
+    pub temperature_c: f64,
     /// Living workers.
     pub alive: usize,
     /// Workers outside the nest.
@@ -347,13 +461,15 @@ pub struct Snapshot {
     pub nursing: usize,
     /// Workers resting.
     pub resting: usize,
-    /// Food in store.
-    pub store: f64,
+    /// Sugar in store, milligrams.
+    pub store_mg: f64,
     /// Store fill.
     pub satiation: f64,
-    /// Recruitment excitation.
+    /// Mean recruitment excitation inside.
     pub excitation: f64,
-    /// Crop loads delivered so far.
+    /// Eggs, larvae and pupae.
+    pub brood: (usize, usize, usize),
+    /// Loads delivered so far.
     pub delivered: u64,
     /// Total recruitment trail on the ground.
     pub trail_total: f64,
@@ -368,10 +484,14 @@ pub struct Stats {
     pub ticks: u64,
     /// Simulated seconds since the last reset.
     pub time_s: f64,
-    /// Crop loads delivered into the store.
+    /// Loads delivered into the nest.
     pub food_delivered: u64,
-    /// Crop loads collected at sources.
+    /// Sugar delivered, milligrams.
+    pub sugar_delivered_mg: f64,
+    /// Feeding visits at sources.
     pub food_picked: u64,
+    /// Solution drunk at sources, microlitres.
+    pub food_collected_ul: f64,
     /// Outbound trips abandoned without food.
     pub failed_trips: u64,
     /// Workers that died.
@@ -384,13 +504,15 @@ pub struct Stats {
     pub eggs: u64,
     /// Workers that emerged.
     pub births: u64,
+    /// Larvae that starved.
+    pub larvae_starved: u64,
     /// Total reward.
     pub reward: f64,
     /// Number of movement decisions made.
     pub decisions: u64,
     /// Sum of the entropies met by tempering (nats).
     pub entropy_sum: f64,
-    /// Sum of entropies of the distributions directions were actually drawn
+    /// Sum of entropies of the distributions headings were actually drawn
     /// from (equal to `entropy_sum` under [`Selection::Softmax`]).
     pub selected_entropy_sum: f64,
     /// Ant-ticks spent in each activity, indexed by [`Activity::index`].
@@ -407,8 +529,8 @@ pub struct Stats {
     pub alive: usize,
     /// Workers outside at the end of the last tick.
     pub outside: usize,
-    /// Food in store at the end of the last tick.
-    pub food_store: f64,
+    /// Sugar in store at the end of the last tick, milligrams.
+    pub store_mg: f64,
     /// Periodic snapshots.
     pub log: Vec<Snapshot>,
 }
@@ -432,7 +554,7 @@ impl Stats {
         }
     }
 
-    /// Mean entropy of the distributions directions were drawn from.
+    /// Mean entropy of the distributions headings were drawn from.
     pub fn mean_selected_entropy(&self) -> f64 {
         if self.decisions == 0 {
             0.0
@@ -491,12 +613,12 @@ pub struct SurfaceRow {
     /// Tick of the decision.
     pub tick: u64,
     /// Where the ant stood.
-    pub position: Position,
-    /// Its heading (ring index 0 in world terms).
-    pub heading: Direction,
+    pub position: Point,
+    /// Its heading, radians.
+    pub heading: f64,
     /// Whether it carried food.
     pub carrying: bool,
-    /// Enterable ring positions.
+    /// Takeable ring positions.
     pub valid: [bool; RING],
     /// The deterministic information: scores from the effective surface.
     pub base: [f64; RING],
@@ -504,7 +626,7 @@ pub struct SurfaceRow {
     pub deformed: [f64; RING],
     /// The tempered distribution.
     pub probs: [f64; RING],
-    /// The distribution the direction was actually drawn from.
+    /// The distribution the heading was actually drawn from.
     pub selected: [f64; RING],
     /// The chosen ring position.
     pub chosen: usize,
@@ -543,13 +665,26 @@ pub struct Simulation {
     next_leaf: usize,
     tick: u64,
     tick_s: f64,
+    /// Persistence length of the heading in cells.
+    persistence_cells: f64,
     decision_prob: f64,
     hazard_per_tick: f64,
     excitation_retention: f64,
     log_every_ticks: u64,
+    temperature_c: f64,
+    speed_factor: f64,
+    activity_factor: f64,
+    metabolism_factor: f64,
+    development_factor: f64,
 }
 
 impl Simulation {
+    /// Smallest step an ant takes; movement credit accumulates below it.
+    const MIN_STEP: f64 = 0.25;
+
+    /// Upper bound on steps per tick, for very fast species or large ticks.
+    const MAX_STEPS_PER_TICK: usize = 8;
+
     /// Build a colony from a config, with the hierarchy the config describes.
     pub fn new(config: SimConfig, seed: u64) -> Self {
         let hierarchy = Hierarchy::from_spec(&config.hierarchy, config.instinct.clone());
@@ -567,23 +702,26 @@ impl Simulation {
         }
         let world = World::new(world_config, &mut rng);
         let tick_s = world.tick_s();
+        let cell_cm = world.cell_cm();
         let nodes = hierarchy.len();
         let leaf_paths = hierarchy
             .leaves()
             .iter()
             .map(|&l| hierarchy.path(l).to_vec())
             .collect();
-        let capacity = config.nest.store_capacity_per_ant * config.ants.max(1) as f64;
+        let capacity = config.nest.store_capacity_mg_per_ant * config.ants.max(1) as f64;
         let nest = Nest {
-            store: capacity * config.nest.initial_satiation.clamp(0.0, 1.0),
-            capacity,
+            store_mg: capacity * config.nest.initial_satiation.clamp(0.0, 1.0),
+            capacity_mg: capacity,
             brood: Vec::new(),
             excitation: 0.0,
             eggs_laid: 0,
             emerged: 0,
+            larvae_starved: 0,
             last_egg_tick: 0,
         };
         let nest_cells = world.nest_cells();
+        let temperature_c = config.environment.temperature(0.0);
         let mut sim = Simulation {
             policies: hierarchy.compile(),
             leaf_paths,
@@ -602,6 +740,7 @@ impl Simulation {
             next_leaf: 0,
             tick: 0,
             tick_s,
+            persistence_cells: species.heading_persistence_cm / cell_cm.max(1e-9),
             decision_prob: (tick_s / species.decision_interval_s.max(1e-9)).min(1.0),
             hazard_per_tick: 1.0 - (-species.forager_hazard_per_s * tick_s).exp(),
             excitation_retention: 0.5f64.powf(tick_s / species.excitation_half_life_s.max(1e-9)),
@@ -610,9 +749,16 @@ impl Simulation {
             } else {
                 0
             },
+            temperature_c,
+            speed_factor: species.speed_factor(temperature_c),
+            activity_factor: species.activity_factor(temperature_c),
+            metabolism_factor: species.metabolism_factor(temperature_c),
+            development_factor: species.development_factor(temperature_c),
             species,
             config,
         };
+        sim.world
+            .set_evaporation_factor(sim.species.evaporation_factor(temperature_c));
         for _ in 0..sim.config.ants {
             let age_s = sim
                 .rng
@@ -622,19 +768,43 @@ impl Simulation {
         }
         let brood_items =
             (sim.config.nest.initial_brood_per_ant * sim.config.ants as f64).round() as usize;
-        let dev_ticks = sim.development_ticks();
         for _ in 0..brood_items {
-            let age = sim.rng.below(dev_ticks.max(1) as usize) as u64;
-            let fed = sim.species.brood_food * age as f64 / dev_ticks.max(1) as f64;
-            sim.nest.brood.push(BroodItem { age, fed });
+            let item = sim.random_brood_item();
+            sim.nest.brood.push(item);
         }
         sim.stats.alive = sim.alive;
-        sim.stats.food_store = sim.nest.store;
+        sim.stats.store_mg = sim.nest.store_mg;
         sim
     }
 
-    fn development_ticks(&self) -> u64 {
-        (self.species.development_s / self.tick_s).round().max(1.0) as u64
+    /// A brood item at a uniformly random point of its development.
+    fn random_brood_item(&mut self) -> BroodItem {
+        let s = &self.species;
+        let total = s.egg_s + s.larva_s + s.pupa_s;
+        let t = self.rng.range(0.0, total.max(1e-9));
+        if t < s.egg_s {
+            BroodItem {
+                stage: BroodStage::Egg,
+                stage_age_s: t,
+                fed_mg: 0.0,
+                unfed_s: 0.0,
+            }
+        } else if t < s.egg_s + s.larva_s {
+            let age = t - s.egg_s;
+            BroodItem {
+                stage: BroodStage::Larva,
+                stage_age_s: age,
+                fed_mg: s.larva_food_mg * age / s.larva_s.max(1e-9),
+                unfed_s: 0.0,
+            }
+        } else {
+            BroodItem {
+                stage: BroodStage::Pupa,
+                stage_age_s: t - s.egg_s - s.larva_s,
+                fed_mg: s.larva_food_mg,
+                unfed_s: 0.0,
+            }
+        }
     }
 
     fn seconds_to_ticks(&self, seconds: f64) -> u32 {
@@ -643,7 +813,7 @@ impl Simulation {
 
     fn spawn_ant(&mut self) -> usize {
         let id = self.ants.len();
-        let heading = Direction::from_index(self.rng.below(Direction::COUNT));
+        let heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
         let leaf = self.next_leaf;
         self.next_leaf = (self.next_leaf + 1) % self.leaf_paths.len();
         let traits = Traits::draw(
@@ -700,6 +870,16 @@ impl Simulation {
         &mut self.nest
     }
 
+    /// Ambient conditions.
+    pub fn environment(&self) -> &Environment {
+        &self.config.environment
+    }
+
+    /// Current air temperature, °C.
+    pub fn temperature(&self) -> f64 {
+        self.temperature_c
+    }
+
     /// The control hierarchy.
     pub fn hierarchy(&self) -> &Hierarchy {
         &self.hierarchy
@@ -750,6 +930,12 @@ impl Simulation {
         &self.surface
     }
 
+    /// Choose which ant's path surfaces are recorded from now on (`None`
+    /// stops recording); rows already recorded are kept.
+    pub fn set_record_surface(&mut self, ant: Option<AntId>) {
+        self.config.record_surface = ant;
+    }
+
     /// Forget the recorded path surface.
     pub fn clear_surface_trace(&mut self) {
         self.surface.clear();
@@ -761,7 +947,7 @@ impl Simulation {
         self.stats = Stats::new(nodes);
         self.stats.alive = self.alive;
         self.stats.outside = self.outside;
-        self.stats.food_store = self.nest.store;
+        self.stats.store_mg = self.nest.store_mg;
         self.trace = Trace::new(nodes);
     }
 
@@ -834,6 +1020,7 @@ impl Simulation {
         if self.dirty {
             self.recompile();
         }
+        self.update_environment();
         for i in 0..self.ants.len() {
             if self.ants[i].alive {
                 self.step_ant(i);
@@ -846,7 +1033,7 @@ impl Simulation {
         self.stats.time_s += self.tick_s;
         self.stats.alive = self.alive;
         self.stats.outside = self.outside;
-        self.stats.food_store = self.nest.store;
+        self.stats.store_mg = self.nest.store_mg;
         if self.log_every_ticks > 0 && self.tick.is_multiple_of(self.log_every_ticks) {
             self.snapshot();
         }
@@ -866,6 +1053,20 @@ impl Simulation {
         self.run(steps)
     }
 
+    fn update_environment(&mut self) {
+        let t = self.config.environment.temperature(self.time_s());
+        if (t - self.temperature_c).abs() < 1e-9 && self.tick > 0 {
+            return;
+        }
+        self.temperature_c = t;
+        self.speed_factor = self.species.speed_factor(t);
+        self.activity_factor = self.species.activity_factor(t);
+        self.metabolism_factor = self.species.metabolism_factor(t);
+        self.development_factor = self.species.development_factor(t);
+        self.world
+            .set_evaporation_factor(self.species.evaporation_factor(t));
+    }
+
     fn snapshot(&mut self) {
         let mut nursing = 0;
         let mut resting = 0;
@@ -879,13 +1080,19 @@ impl Simulation {
         self.stats.log.push(Snapshot {
             tick: self.tick,
             time_s: self.time_s(),
+            temperature_c: self.temperature_c,
             alive: self.alive,
             outside: self.outside,
             nursing,
             resting,
-            store: self.nest.store,
+            store_mg: self.nest.store_mg,
             satiation: self.nest.satiation(),
             excitation: self.nest.excitation,
+            brood: (
+                self.nest.count(BroodStage::Egg),
+                self.nest.count(BroodStage::Larva),
+                self.nest.count(BroodStage::Pupa),
+            ),
             delivered: self.stats.food_delivered,
             trail_total: self.world.total_pheromone(Pheromone::Trail),
             counters: self.world.counters().iter().map(|c| c.crossings).collect(),
@@ -900,6 +1107,7 @@ impl Simulation {
         let activity = self.ants[i].activity;
         self.stats.activity_ticks[activity.index()] += 1;
         self.ants[i].age += 1;
+        self.ants[i].excitement *= self.excitation_retention;
         self.reinforce(i, activity);
         match activity {
             Activity::Resting => self.rest(i),
@@ -952,7 +1160,7 @@ impl Simulation {
 
     fn rest(&mut self, i: usize) {
         let hunger = self.nest.hunger();
-        let (site_bonus, threshold, nursing_threshold) = {
+        let (site_bonus, threshold, nursing_threshold, excitement) = {
             let a = &self.ants[i];
             let age_s = a.age as f64 * self.tick_s;
             (
@@ -962,15 +1170,21 @@ impl Simulation {
                 self.species
                     .threshold_at_age(a.traits.foraging_threshold, age_s),
                 a.traits.nursing_threshold,
+                a.excitement,
             )
         };
-        let stimulus = self.species.hunger_gain * hunger + self.nest.excitation + site_bonus;
-        let p_forage = self.species.response(stimulus, threshold) * self.decision_prob;
-        let demand = if self.nest.brood.is_empty() {
+        // A known source is a reason to go again only while the colony
+        // can take the food: satiated nestmates refuse to unload foragers,
+        // which stops re-foraging (Mailleux, Detrain & Deneubourg 2006).
+        let stimulus = self.species.hunger_gain * hunger + excitement + site_bonus * hunger;
+        let p_forage =
+            self.species.response(stimulus, threshold) * self.decision_prob * self.activity_factor;
+        let larvae = self.nest.larvae() as f64;
+        let demand = if larvae <= 0.0 {
             0.0
         } else {
             let nurses = self.nurses_now() as f64;
-            (self.nest.brood.len() as f64 / self.species.brood_per_nurse.max(1e-9)) / (nurses + 1.0)
+            (larvae / self.species.brood_per_nurse.max(1e-9)) / (nurses + 1.0)
         };
         let p_nurse = self.species.response(demand, nursing_threshold) * self.decision_prob;
         let u = self.rng.next_f64();
@@ -986,19 +1200,22 @@ impl Simulation {
 
     fn depart(&mut self, i: usize) {
         let exit = self.nest_cells[self.rng.below(self.nest_cells.len().max(1))];
-        let heading = Direction::from_index(self.rng.below(Direction::COUNT));
+        let heading = self.rng.range(-std::f64::consts::PI, std::f64::consts::PI);
+        let jitter = (self.rng.range(-0.4, 0.4), self.rng.range(-0.4, 0.4));
         let outbound_laying = self.species.outbound_laying;
+        let exploratory_laying = self.species.exploratory_laying;
         let a = &mut self.ants[i];
         a.activity = Activity::Outbound;
-        a.position = exit;
+        let c = Point::center_of(exit);
+        a.position = Point::new(c.x + jitter.0, c.y + jitter.1);
         a.heading = heading;
         a.reset_home_vector();
         a.clear_memory();
         a.steps_since_nest = 0;
         a.search_steps = 0;
         a.move_credit = 0.0;
-        a.laying = if outbound_laying && a.site.is_some() {
-            a.lay_strength = 0.5;
+        a.laying = if (outbound_laying && a.site.is_some()) || exploratory_laying {
+            a.lay_strength = if a.site.is_some() { 0.5 } else { 0.25 };
             Some(Pheromone::Trail)
         } else {
             None
@@ -1010,24 +1227,32 @@ impl Simulation {
     }
 
     fn nurse(&mut self, i: usize) {
-        let rate = self.species.nursing_rate * self.tick_s;
-        let need_cap = self.species.brood_food;
-        let available = rate.min(self.nest.store);
+        let rate = self.species.nursing_rate_mg_s * self.tick_s;
+        let need_cap = self.species.larva_food_mg;
+        let available = rate.min(self.nest.store_mg);
         if available > 0.0 {
-            if let Some(hungriest) = self.nest.brood.iter_mut().min_by(|a, b| {
-                a.fed
-                    .partial_cmp(&b.fed)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
-                let amount = available.min((need_cap - hungriest.fed).max(0.0));
-                hungriest.fed += amount;
-                self.nest.store -= amount;
+            if let Some(hungriest) = self
+                .nest
+                .brood
+                .iter_mut()
+                .filter(|b| b.stage == BroodStage::Larva)
+                .min_by(|a, b| {
+                    a.fed_mg
+                        .partial_cmp(&b.fed_mg)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
+                let amount = available.min((need_cap - hungriest.fed_mg).max(0.0));
+                hungriest.fed_mg += amount;
+                hungriest.unfed_s = 0.0;
+                self.nest.store_mg -= amount;
             }
         }
+        let no_larvae = self.nest.larvae() == 0;
         let a = &mut self.ants[i];
         a.time_nursing += 1;
         a.timer = a.timer.saturating_sub(1);
-        if a.timer == 0 || self.nest.brood.is_empty() {
+        if a.timer == 0 || no_larvae {
             a.activity = Activity::Resting;
         }
     }
@@ -1038,9 +1263,10 @@ impl Simulation {
         if a.timer > 0 {
             return;
         }
-        let load = a.crop;
+        let load_ul = a.crop_ul;
+        let molarity = a.load_molarity;
         let quality = a.load_quality;
-        a.crop = 0.0;
+        a.crop_ul = 0.0;
         a.activity = Activity::Resting;
         // Poor sources are abandoned: the memory survives with a
         // quality-dependent probability.
@@ -1049,30 +1275,71 @@ impl Simulation {
             self.ants[i].site = None;
         }
         // The store gains the load's sugar content.
-        self.nest.store = (self.nest.store + load * quality).min(self.nest.capacity);
-        self.nest.excitation += self.species.excitation_per_return * quality;
+        let sugar = self.species.sugar_mg(load_ul, molarity);
+        self.nest.store_mg = (self.nest.store_mg + sugar).min(self.nest.capacity_mg);
+        self.stats.sugar_delivered_mg += sugar;
+        let leaf = self.ants[i].leaf;
+        let reward = self.config.reward.sugar_mg * sugar;
+        self.credit(leaf, reward, false);
+        // Recruitment by contact: the returning forager excites nestmates.
+        let inside: Vec<usize> = (0..self.ants.len())
+            .filter(|&j| {
+                j != i
+                    && self.ants[j].alive
+                    && matches!(self.ants[j].activity, Activity::Resting | Activity::Nursing)
+            })
+            .collect();
+        if !inside.is_empty() {
+            for _ in 0..self.species.contacts_per_return {
+                let j = inside[self.rng.below(inside.len())];
+                self.ants[j].excitement += self.species.excitation_per_contact * quality;
+            }
+        }
     }
 
     fn feed(&mut self, i: usize) {
-        let a = &mut self.ants[i];
-        a.timer = a.timer.saturating_sub(1);
-        if a.timer > 0 {
-            return;
+        let cell = self.ants[i].cell();
+        let (molarity, quality, crop, want_total) = {
+            let a = &self.ants[i];
+            let desired =
+                self.species.crop_capacity_ul * self.species.load_fraction(a.load_quality);
+            (a.load_molarity, a.load_quality, a.crop_ul, desired)
+        };
+        let rate = self.species.intake_rate(molarity) * self.tick_s;
+        let want = rate.min((want_total - crop).max(0.0));
+        let (taken, _) = if want > 0.0 {
+            self.world.take_food(cell, want)
+        } else {
+            (0.0, molarity)
+        };
+        self.ants[i].crop_ul += taken;
+        self.stats.food_collected_ul += taken;
+        let exhausted = taken < want - 1e-12;
+        let full = self.ants[i].crop_ul >= want_total - 1e-9;
+        if full || exhausted {
+            if self.ants[i].carrying() {
+                self.finish_feeding(i, quality);
+            } else {
+                self.give_up(i);
+            }
         }
-        let quality = a.load_quality;
-        let lay = self.species.lay_probability(quality) * a.traits.laying;
-        a.crop = self.species.crop_capacity * self.species.load_fraction(quality);
+    }
+
+    fn finish_feeding(&mut self, i: usize, quality: f64) {
+        let lay = self.species.lay_probability(quality) * self.ants[i].traits.laying;
+        let lays = self.rng.chance(lay.clamp(0.0, 1.0));
+        let a = &mut self.ants[i];
         a.steps_since_food = 0;
-        a.trip_moves = 0;
+        a.trip_length = 0.0;
         a.site = Some(Site {
             vector: a.home_vector,
             quality,
         });
-        a.heading = a.heading.opposite();
+        a.heading = crate::geometry::wrap_angle(a.heading + std::f64::consts::PI);
         a.activity = Activity::Inbound;
         a.search_steps = 0;
         // Marks per trip also rise with concentration (Beckers et al. 1993).
-        a.laying = if self.rng.chance(lay.clamp(0.0, 1.0)) {
+        a.laying = if lays {
             a.lay_strength = 0.25 + 0.75 * quality;
             Some(Pheromone::Trail)
         } else {
@@ -1087,7 +1354,7 @@ impl Simulation {
         a.site = None;
         a.activity = Activity::Inbound;
         a.search_steps = 0;
-        a.heading = a.heading.opposite();
+        a.heading = crate::geometry::wrap_angle(a.heading + std::f64::consts::PI);
         a.laying = if uses_no_entry {
             a.lay_strength = 1.0;
             Some(Pheromone::NoEntry)
@@ -1101,58 +1368,56 @@ impl Simulation {
         let satiation = self.nest.satiation();
         let unloading = self.seconds_to_ticks(self.species.unloading_time(satiation));
         let nest = self.world.nest();
-        let pos = self.ants[i].position;
-        if let Some(c) = self.world.cell_mut(pos) {
+        let cell = self.ants[i].cell();
+        if let Some(c) = self.world.cell_mut(cell) {
             c.occupancy = c.occupancy.saturating_sub(1);
         }
         self.outside = self.outside.saturating_sub(1);
         let leaf = self.ants[i].leaf;
+        let nest_radius = self.world.nest_radius().max(0) as f64;
         let trip = {
             let a = &mut self.ants[i];
-            a.position = nest;
+            a.position = Point::center_of(nest);
             a.reset_home_vector();
             a.steps_since_nest = 0;
             a.laying = None;
             a.search_steps = 0;
-            if a.crop > 0.0 {
+            if a.carrying() {
                 a.activity = Activity::Unloading;
                 a.timer = unloading;
                 a.deliveries += 1;
-                let moves = a.trip_moves as u64;
+                let length = a.trip_length;
                 let direct = a
                     .pickup
                     .take()
-                    .map(|p| (p.chebyshev(nest) - self.world.nest_radius().max(0)).max(0))
-                    .unwrap_or(0) as u64;
-                Some((moves, direct))
+                    .map(|p| (p.distance(Point::center_of(nest)) - nest_radius).max(0.0))
+                    .unwrap_or(0.0);
+                Some((length, direct))
             } else {
                 a.activity = Activity::Resting;
                 None
             }
         };
-        if let Some((moves, direct)) = trip {
-            self.stats.path.record_trip(moves, direct);
+        if let Some((length, direct)) = trip {
+            self.stats.path.record_trip(length, direct);
             for &node in &self.leaf_paths[leaf] {
-                self.stats.path_by_node[node].record_trip(moves, direct);
+                self.stats.path_by_node[node].record_trip(length, direct);
             }
             self.stats.food_delivered += 1;
-            let reward = self.config.reward.food_delivered;
-            self.credit(leaf, reward, true);
+            for &node in &self.leaf_paths[leaf] {
+                self.stats.delivered_by_node[node] += 1;
+            }
         }
     }
 
-    /// Upper bound on moves per tick, for large ticks or fast species.
-    const MAX_MOVES_PER_TICK: usize = 6;
-
     fn walk(&mut self, i: usize) {
-        // Speed: cells per tick, faster on a strong trail, slower when
-        // loaded. Fractional speeds accumulate credit; speeds above one
-        // cell per tick yield several moves per tick.
+        // Speed: cells per tick at the current temperature, faster on a
+        // strong trail, slower when loaded.
         let speed = {
             let a = &self.ants[i];
-            let trail = self.world.level(a.position, Pheromone::Trail);
+            let trail = self.world.level(a.cell(), Pheromone::Trail);
             let k = self.world.channel(Pheromone::Trail).k;
-            let mut speed = a.traits.speed;
+            let mut speed = a.traits.speed * self.speed_factor;
             if a.carrying() {
                 speed *= self.species.loaded_speed_factor;
             }
@@ -1161,92 +1426,161 @@ impl Simulation {
             }
             speed
         };
-        let cap = speed.max(1.0) + 1.0;
-        self.ants[i].move_credit = (self.ants[i].move_credit + speed).min(cap);
-        let mut moves = 0;
-        while self.ants[i].move_credit >= 1.0 && moves < Self::MAX_MOVES_PER_TICK {
-            self.ants[i].move_credit -= 1.0;
-            moves += 1;
-            let mode = match (self.ants[i].activity, self.ants[i].search_target) {
-                (Activity::Inbound, _) | (Activity::Searching, SearchTarget::Nest) => Mode::Inbound,
-                _ => Mode::Outbound,
-            };
-            if let Some(dir) = self.decide(i, mode) {
-                self.move_ant(i, dir);
-            }
-            if self.check_transitions(i) {
-                return;
+        self.ants[i].move_credit += speed;
+        let total = self.ants[i].move_credit;
+        if total >= Self::MIN_STEP {
+            let n = (total.ceil() as usize).clamp(1, Self::MAX_STEPS_PER_TICK);
+            let step = total / n as f64;
+            self.ants[i].move_credit = 0.0;
+            for _ in 0..n {
+                let mode = match (self.ants[i].activity, self.ants[i].search_target) {
+                    (Activity::Inbound, _) | (Activity::Searching, SearchTarget::Nest) => {
+                        Mode::Inbound
+                    }
+                    _ => Mode::Outbound,
+                };
+                if let Some(ring) = self.decide(i, mode, step) {
+                    self.move_ant(i, ring, step);
+                }
+                if self.check_transitions(i) {
+                    return;
+                }
             }
         }
         self.tick_timers(i);
     }
 
-    fn move_ant(&mut self, i: usize, dir: Direction) {
+    fn move_ant(&mut self, i: usize, ring: usize, step: f64) {
         let leaf = self.ants[i].leaf;
-        let from = self.ants[i].position;
-        let to = from.step(dir);
-        let ring = ring_index(dir, self.ants[i].heading);
-        let revisit = self.ants[i].recently_visited(to);
-        self.stats.path.record_move(ring, revisit);
+        let (from, heading) = {
+            let a = &self.ants[i];
+            (a.position, ring_heading(ring, a.heading))
+        };
+        let to = from.advanced(heading, step);
+        let from_cell = from.cell();
+        let to_cell = to.cell();
+        self.stats.path.record_move(ring, step);
         for &node in &self.leaf_paths[leaf] {
-            self.stats.path_by_node[node].record_move(ring, revisit);
+            self.stats.path_by_node[node].record_move(ring, step);
         }
-        if let Some(c) = self.world.cell_mut(from) {
-            c.occupancy = c.occupancy.saturating_sub(1);
+        let entered = to_cell != from_cell;
+        if entered {
+            let revisit = self.ants[i].recently_visited(to_cell);
+            self.stats.path.record_entry(revisit);
+            for &node in &self.leaf_paths[leaf] {
+                self.stats.path_by_node[node].record_entry(revisit);
+            }
+            if let Some(c) = self.world.cell_mut(from_cell) {
+                c.occupancy = c.occupancy.saturating_sub(1);
+            }
+            if let Some(c) = self.world.cell_mut(to_cell) {
+                c.occupancy = c.occupancy.saturating_add(1);
+            }
+            self.world.record_crossing(to_cell);
         }
-        if let Some(c) = self.world.cell_mut(to) {
-            c.occupancy = c.occupancy.saturating_add(1);
-        }
-        self.world.record_crossing(to);
         let species = &self.species;
-        let (laying, strength, territory, home) = {
+        let persistence = self.persistence_cells;
+        let (laying, strength, home, activity) = {
             let a = &mut self.ants[i];
             a.position = to;
-            a.heading = dir;
-            a.remember(from);
-            a.trip_moves = a.trip_moves.saturating_add(1);
-            a.integrate(dir, species, &mut self.rng);
+            // The direction of travel: a running mean of recent steps for
+            // moderate turns, an outright reorientation for sharper ones.
+            a.heading = if turn_magnitude(ring) > RING / 4 {
+                heading
+            } else {
+                let alpha = (step / persistence.max(1e-9)).min(1.0);
+                let (s0, c0) = a.heading.sin_cos();
+                let (s1, c1) = heading.sin_cos();
+                crate::geometry::angle_of(
+                    (1.0 - alpha) * c0 + alpha * c1,
+                    (1.0 - alpha) * s0 + alpha * s1,
+                )
+            };
+            if entered {
+                a.remember(from_cell);
+            }
+            a.trip_length += step;
+            let (dx, dy) = from.to(to);
+            a.integrate(dx, dy, species, &mut self.rng);
             let home = species.uses_home_pheromone && a.activity == Activity::Outbound;
-            (a.laying, a.lay_strength, species.territory_deposit, home)
+            (a.laying, a.lay_strength, home, a.activity)
         };
         match laying {
-            Some(Pheromone::Trail) => {
-                self.world
-                    .deposit(to, Pheromone::Trail, species.trail_deposit * strength)
-            }
-            Some(Pheromone::NoEntry) => {
-                self.world
-                    .deposit(to, Pheromone::NoEntry, species.no_entry_deposit * strength)
-            }
-            Some(kind) => self.world.deposit(to, kind, strength),
+            Some(Pheromone::Trail) => self.world.deposit(
+                to_cell,
+                Pheromone::Trail,
+                species.trail_deposit * strength * step,
+            ),
+            Some(Pheromone::NoEntry) => self.world.deposit(
+                to_cell,
+                Pheromone::NoEntry,
+                species.no_entry_deposit * strength * step,
+            ),
+            Some(kind) => self.world.deposit(to_cell, kind, strength * step),
             None => {}
         }
         if home {
             self.world
-                .deposit(to, Pheromone::Home, species.trail_deposit);
+                .deposit(to_cell, Pheromone::Home, species.trail_deposit * step);
         }
-        if territory > 0.0 {
-            self.world.deposit(to, Pheromone::Territory, territory);
+        if species.territory_deposit > 0.0 {
+            self.world.deposit(
+                to_cell,
+                Pheromone::Territory,
+                species.territory_deposit * step,
+            );
+        }
+        // Route memory: learn local vectors at places passed with a working
+        // estimate; recognise familiar places to recalibrate.
+        if entered {
+            let capacity = species.route_capacity;
+            let rate = species.route_learning_rate;
+            let correction = species.route_pi_correction;
+            let a = &mut self.ants[i];
+            match activity {
+                Activity::Inbound if !a.lost => {
+                    let home_vec = (-a.home_vector.0, -a.home_vector.1);
+                    a.learn_route_home(to_cell, home_vec, rate, capacity);
+                }
+                Activity::Outbound if !a.lost => {
+                    if let Some(dir) = a.site_direction() {
+                        a.learn_route_out(to_cell, dir, rate, capacity);
+                    }
+                }
+                Activity::Searching | Activity::Inbound => {
+                    // Recognising a familiar place corrects the home vector;
+                    // an ant that had lost the nest resumes its way home.
+                    let recognised = a.recalibrate(to_cell, correction);
+                    if recognised
+                        && a.activity == Activity::Searching
+                        && a.search_target == SearchTarget::Nest
+                    {
+                        a.activity = Activity::Inbound;
+                        a.search_steps = 0;
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
-    /// React to the cell just entered. Returns `true` when the ant stopped
+    /// React to the current position. Returns `true` when the ant stopped
     /// walking (it started feeding or entered the nest).
     fn check_transitions(&mut self, i: usize) -> bool {
-        let pos = self.ants[i].position;
-        let on_nest = self.world.is_nest(pos);
+        let cell = self.ants[i].cell();
+        let on_nest = self.world.is_nest(cell);
         let food_here = self
             .world
-            .cell(pos)
-            .map(|c| (c.food, c.quality))
-            .unwrap_or((0, 0.0));
+            .cell(cell)
+            .map(|c| (c.has_food(), c.molarity))
+            .unwrap_or((false, 0.0));
         let arrival = self.species.arrival_radius;
         let activity = self.ants[i].activity;
         let target = self.ants[i].search_target;
         match (activity, target) {
             (Activity::Outbound, _) | (Activity::Searching, SearchTarget::Food) => {
-                if food_here.0 > 0 && !self.ants[i].carrying() {
-                    self.start_feeding(i, pos, food_here.1 as f64);
+                if food_here.0 && !self.ants[i].carrying() {
+                    self.start_feeding(i, food_here.1);
                     return true;
                 }
                 let a = &mut self.ants[i];
@@ -1268,6 +1602,7 @@ impl Simulation {
                 }
                 let a = &mut self.ants[i];
                 if activity == Activity::Inbound
+                    && !a.lost
                     && a.believed_distance_home() < arrival
                     && a.believed_distance_home() > 0.0
                 {
@@ -1309,10 +1644,11 @@ impl Simulation {
                 let a = &mut self.ants[i];
                 a.search_steps += 1;
                 if a.search_steps > search_ticks {
-                    // Lost: path integration has failed; rely on the
-                    // home-range marking and the trail from here on.
+                    // Lost: path integration has failed; rely on familiar
+                    // places, the home-range marking and the trail from
+                    // here on.
                     a.activity = Activity::Inbound;
-                    a.reset_home_vector();
+                    a.lost = true;
                     a.search_steps = 0;
                 }
             }
@@ -1320,18 +1656,17 @@ impl Simulation {
         }
     }
 
-    fn start_feeding(&mut self, i: usize, pos: Position, quality: f64) {
-        if let Some(c) = self.world.cell_mut(pos) {
-            c.food = c.food.saturating_sub(1);
-        }
-        let ticks = self.seconds_to_ticks(self.species.feeding_time(quality));
+    fn start_feeding(&mut self, i: usize, molarity: f64) {
+        let quality = self.species.quality(molarity);
         let leaf = self.ants[i].leaf;
         let a = &mut self.ants[i];
         a.activity = Activity::Feeding;
-        a.timer = ticks;
+        a.load_molarity = molarity;
         a.load_quality = quality;
-        a.pickup = Some(pos);
+        a.pickup = Some(a.position);
         a.laying = None;
+        a.steps_since_food = 0;
+        a.trip_length = 0.0;
         self.stats.food_picked += 1;
         let reward = self.config.reward.food_picked;
         self.credit(leaf, reward, false);
@@ -1341,7 +1676,7 @@ impl Simulation {
         let mortality = self.config.nest.mortality;
         let starvation = self.species.starvation_s;
         let tick_s = self.tick_s;
-        let store_has_food = self.nest.store > 0.0;
+        let store_has_food = self.nest.store_mg > 0.0;
         let hazard = self.hazard_per_tick;
         let inside = self.ants[i].is_inside();
         if inside {
@@ -1370,16 +1705,16 @@ impl Simulation {
     fn die(&mut self, i: usize, cause: Cause) {
         let leaf = self.ants[i].leaf;
         let outside = !self.ants[i].is_inside();
-        let pos = self.ants[i].position;
+        let cell = self.ants[i].cell();
         self.ants[i].alive = false;
         if outside {
-            if let Some(c) = self.world.cell_mut(pos) {
+            if let Some(c) = self.world.cell_mut(cell) {
                 c.occupancy = c.occupancy.saturating_sub(1);
             }
             self.outside = self.outside.saturating_sub(1);
             if cause == Cause::Predation {
                 self.world
-                    .deposit(pos, Pheromone::Alarm, self.species.alarm_release);
+                    .deposit(cell, Pheromone::Alarm, self.species.alarm_release);
             }
         }
         self.alive = self.alive.saturating_sub(1);
@@ -1408,23 +1743,67 @@ impl Simulation {
 
     fn nest_step(&mut self) {
         let inside = self.inside_count() as f64;
-        let consumption = inside * self.species.consumption_per_ant_per_s * self.tick_s;
-        self.nest.store = (self.nest.store - consumption).max(0.0);
-        self.nest.excitation *= self.excitation_retention;
+        let consumption = inside
+            * self.species.consumption_mg_per_ant_per_s
+            * self.metabolism_factor
+            * self.tick_s;
+        self.nest.store_mg = (self.nest.store_mg - consumption).max(0.0);
 
-        // Development and emergence.
-        let dev_ticks = self.development_ticks();
-        let brood_food = self.species.brood_food;
+        // Mean excitation of the workers inside, for reporting.
+        let (sum, n) = self
+            .ants
+            .iter()
+            .filter(|a| a.alive && a.is_inside())
+            .fold((0.0, 0usize), |(s, n), a| (s + a.excitement, n + 1));
+        self.nest.excitation = if n == 0 { 0.0 } else { sum / n as f64 };
+
+        // Development, larval starvation, and emergence.
+        let dev = self.development_factor * self.tick_s;
+        let s = &self.species;
+        let (egg_s, larva_s, pupa_s, larva_food, larva_starvation) = (
+            s.egg_s,
+            s.larva_s,
+            s.pupa_s,
+            s.larva_food_mg,
+            s.larva_starvation_s,
+        );
+        let tick_s = self.tick_s;
         let mut emerging = 0usize;
+        let mut starved = 0u64;
         self.nest.brood.retain_mut(|b| {
-            b.age += 1;
-            if b.age >= dev_ticks && b.fed >= brood_food {
-                emerging += 1;
-                false
-            } else {
-                true
+            b.stage_age_s += dev;
+            match b.stage {
+                BroodStage::Egg => {
+                    if b.stage_age_s >= egg_s {
+                        b.stage = BroodStage::Larva;
+                        b.stage_age_s = 0.0;
+                    }
+                    true
+                }
+                BroodStage::Larva => {
+                    b.unfed_s += tick_s;
+                    if b.unfed_s > larva_starvation {
+                        starved += 1;
+                        return false;
+                    }
+                    if b.stage_age_s >= larva_s && b.fed_mg >= larva_food {
+                        b.stage = BroodStage::Pupa;
+                        b.stage_age_s = 0.0;
+                    }
+                    true
+                }
+                BroodStage::Pupa => {
+                    if b.stage_age_s >= pupa_s {
+                        emerging += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
             }
         });
+        self.nest.larvae_starved += starved;
+        self.stats.larvae_starved += starved;
         for _ in 0..emerging {
             if self.alive >= self.config.nest.max_ants {
                 break;
@@ -1446,7 +1825,12 @@ impl Simulation {
                 && self.nest.brood.len() < max_brood
                 && self.tick.saturating_sub(self.nest.last_egg_tick) >= interval
             {
-                self.nest.brood.push(BroodItem { age: 0, fed: 0.0 });
+                self.nest.brood.push(BroodItem {
+                    stage: BroodStage::Egg,
+                    stage_age_s: 0.0,
+                    fed_mg: 0.0,
+                    unfed_s: 0.0,
+                });
                 self.nest.eggs_laid += 1;
                 self.nest.last_egg_tick = self.tick;
                 self.stats.eggs += 1;
@@ -1458,7 +1842,7 @@ impl Simulation {
     // Movement decision
     // ---------------------------------------------------------------
 
-    fn decide(&mut self, i: usize, mode: Mode) -> Option<Direction> {
+    fn decide(&mut self, i: usize, mode: Mode, step: f64) -> Option<usize> {
         let (heading, leaf, id, position, carrying, searching) = {
             let a = &self.ants[i];
             (
@@ -1470,10 +1854,10 @@ impl Simulation {
                 a.activity == Activity::Searching,
             )
         };
-        let obs = observe(&self.ants[i], &self.world, &self.species, mode);
+        let obs = observe(&self.ants[i], &self.world, &self.species, mode, step);
         let policy = self.policies[leaf].clone();
 
-        // The deterministic information of the path: scores per direction.
+        // The deterministic information of the path: scores per heading.
         let mut scores = [f64::NEG_INFINITY; RING];
         let mut any = false;
         for ((score, valid), features) in scores.iter_mut().zip(&obs.valid).zip(&obs.features) {
@@ -1485,7 +1869,7 @@ impl Simulation {
         if !any {
             return None;
         }
-        let base = Landscape::from_world(&scores, &obs.valid, heading);
+        let base = Landscape::new(scores, obs.valid);
 
         // Geometric deformation with the entropy budget.
         let tempering = if searching {
@@ -1510,7 +1894,7 @@ impl Simulation {
         let tempered = deformed.temper_with(tempering);
 
         // Selection.
-        let start = base.nearest_valid(0).expect("at least one valid direction");
+        let start = base.nearest_valid(0).expect("at least one valid heading");
         let recording = self.config.record_surface == Some(id);
         let keep = self.config.geometry.ledger || recording;
         let (chosen, walk, selected) = match self.config.selection {
@@ -1586,16 +1970,14 @@ impl Simulation {
         }
         if self.config.trace {
             let mut score = [0.0; FEATURES];
-            for (d, dir) in Direction::ALL.iter().enumerate() {
-                let p = tempered.probs[ring_index(*dir, heading)];
-                if p > 0.0 {
-                    for (s, f) in score.iter_mut().zip(&obs.features[d]) {
+            for (p, features) in tempered.probs.iter().zip(&obs.features) {
+                if *p > 0.0 {
+                    for (s, f) in score.iter_mut().zip(features) {
                         *s -= p * f;
                     }
                 }
             }
-            let chosen_world = world_direction(chosen, heading).index();
-            for (s, f) in score.iter_mut().zip(&obs.features[chosen_world]) {
+            for (s, f) in score.iter_mut().zip(&obs.features[chosen]) {
                 *s = (*s + f) / tempered.temperature;
             }
             for &node in &self.leaf_paths[leaf] {
@@ -1627,8 +2009,13 @@ impl Simulation {
                 self.surface.drain(..excess);
             }
         }
-        Some(world_direction(chosen, heading))
+        Some(chosen)
     }
+}
+
+/// Heading angle of a vector, for callers that want to face something.
+pub fn heading_towards(dx: f64, dy: f64) -> f64 {
+    angle_of(dx, dy)
 }
 
 #[cfg(test)]
@@ -1663,7 +2050,7 @@ mod tests {
     }
 
     /// A fed colony with life history compressed enough for brood to
-    /// emerge and eggs to be laid within a short run.
+    /// develop, pupate and emerge, and eggs to be laid, within a short run.
     fn life_history() -> SimConfig {
         let species = Species::lasius_niger().compressed(600.0);
         let mut cfg = SimConfig::for_species(species);
@@ -1687,7 +2074,8 @@ mod tests {
         let s = sim.stats();
         assert!(s.food_picked > 0, "ants should find food: {s:?}");
         assert!(s.food_delivered > 0, "ants should bring food home: {s:?}");
-        assert!(sim.nest().store > 0.0);
+        assert!(s.sugar_delivered_mg > 0.0 && s.food_collected_ul > 0.0);
+        assert!(sim.nest().store_mg > 0.0);
         assert_eq!(s.path.trips, s.food_delivered);
         assert!(s.path.trip_efficiency() > 0.0 && s.path.trip_efficiency() <= 1.0);
         let total: u64 = sim
@@ -1699,9 +2087,14 @@ mod tests {
         assert_eq!(total, s.food_delivered);
         assert_eq!(s.delivered_by_node[0], s.food_delivered);
         assert_eq!(s.path.moves, s.path.turns.iter().sum::<u64>());
+        assert!(s.path.length > 0.0);
         assert!(s.mean_entropy() > 0.0);
         assert!(!s.log.is_empty());
         assert!(s.log.last().unwrap().delivered == s.food_delivered);
+        assert!(
+            sim.living().any(|a| a.familiar_places() > 0),
+            "routes are learned"
+        );
     }
 
     #[test]
@@ -1739,14 +2132,16 @@ mod tests {
         chaotic.run(400);
         let h_low = ordered.stats().mean_entropy();
         let h_high = chaotic.stats().mean_entropy();
-        assert!(h_low < 0.35, "low dial → low entropy, got {h_low}");
-        assert!(h_high > 1.7, "high dial → near-uniform, got {h_high}");
-        // The fixed-temperature default lands in between and reports the
-        // entropy the choice function happens to have.
+        let max = (RING as f64).ln();
+        assert!(h_low < 0.15 * max, "low dial → low entropy, got {h_low}");
+        assert!(
+            h_high > 0.85 * max,
+            "high dial → near-uniform, got {h_high}"
+        );
         let mut natural = Simulation::new(hungry_fast(), 3);
         natural.run(400);
         let h = natural.stats().mean_entropy();
-        assert!(h > 0.2 && h < 1.9, "{h}");
+        assert!(h > 0.1 * max && h < 0.95 * max, "{h}");
     }
 
     #[test]
@@ -1785,16 +2180,41 @@ mod tests {
     }
 
     #[test]
-    fn mortality_and_emergence() {
+    fn brood_develops_through_stages_and_emerges() {
         let mut sim = Simulation::new(life_history(), 4);
-        sim.run(1500);
+        let initial = sim.nest().brood.len();
+        assert!(initial > 0);
+        let stages_at_start = (
+            sim.nest().count(BroodStage::Egg),
+            sim.nest().count(BroodStage::Larva),
+            sim.nest().count(BroodStage::Pupa),
+        );
+        assert!(stages_at_start.0 + stages_at_start.1 + stages_at_start.2 == initial);
+        sim.run(2400);
         let s = sim.stats();
-        assert!(s.births > 0, "brood should emerge: {s:?}");
-        assert!(s.eggs > 0, "the queen should lay: {s:?}");
+        assert!(s.births > 0, "pupae should emerge: {:?}", sim.nest());
+        assert!(s.eggs > 0, "the queen should lay: {:?}", sim.nest());
+        assert!(
+            s.activity_ticks[Activity::Nursing.index()] > 0,
+            "larvae get nursed"
+        );
         assert_eq!(sim.alive(), sim.living().count());
         let occupancy: u32 = sim.world().cells().iter().map(|c| c.occupancy as u32).sum();
         assert_eq!(occupancy as usize, sim.outside());
         assert!(s.deaths_predation + s.deaths_starvation == s.deaths);
+    }
+
+    #[test]
+    fn unfed_larvae_starve() {
+        let mut cfg = life_history();
+        cfg.nest.initial_satiation = 0.0;
+        cfg.world.random_food = None;
+        cfg.species.larva_starvation_s = 200.0;
+        let mut sim = Simulation::new(cfg, 4);
+        let larvae = sim.nest().larvae();
+        assert!(larvae > 0);
+        sim.run(600);
+        assert!(sim.stats().larvae_starved > 0, "{:?}", sim.nest());
     }
 
     #[test]
@@ -1805,6 +2225,53 @@ mod tests {
         sim.run(800);
         assert_eq!(sim.stats().deaths, 0);
         assert_eq!(sim.alive(), 40);
+    }
+
+    #[test]
+    fn temperature_changes_speed_and_activity() {
+        let mut warm_cfg = hungry_fast();
+        warm_cfg.environment.temperature_c = 30.0;
+        let mut warm = Simulation::new(warm_cfg, 5);
+        warm.run(600);
+        let mut cold_cfg = hungry_fast();
+        cold_cfg.environment.temperature_c = 12.0;
+        let mut cold = Simulation::new(cold_cfg, 5);
+        cold.run(600);
+        assert!(warm.stats().path.length > 1.5 * cold.stats().path.length);
+        let mut frozen_cfg = hungry_fast();
+        frozen_cfg.environment.temperature_c = 4.0;
+        let mut frozen = Simulation::new(frozen_cfg, 5);
+        frozen.run(300);
+        assert_eq!(
+            frozen.stats().foraging_fraction(),
+            0.0,
+            "too cold to forage"
+        );
+        assert!(warm.world().evaporation_factor() > 1.5);
+        assert!(cold.world().evaporation_factor() < 0.6);
+    }
+
+    #[test]
+    fn diurnal_cycle_moves_the_temperature() {
+        let env = Environment {
+            temperature_c: 20.0,
+            diurnal_amplitude_c: 8.0,
+            day_length_s: 100.0,
+            coldest_at_s: 0.0,
+        };
+        assert!((env.temperature(0.0) - 12.0).abs() < 1e-9);
+        assert!((env.temperature(50.0) - 28.0).abs() < 1e-9);
+        let mut cfg = hungry_fast();
+        cfg.environment = env.clone();
+        let mut sim = Simulation::new(cfg, 6);
+        sim.run(100);
+        let temps: Vec<f64> = sim.stats().log.iter().map(|s| s.temperature_c).collect();
+        assert!(!temps.is_empty());
+        // The temperature in force during a tick is the one at its start.
+        let expected = env.temperature(sim.time_s() - sim.tick_s());
+        assert!((sim.temperature() - expected).abs() < 1e-9);
+        sim.step();
+        assert!((sim.temperature() - 12.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1890,7 +2357,7 @@ mod tests {
         sim.run(600);
         let rows = sim.surface_trace();
         assert_eq!(rows.len(), 10);
-        assert!(rows.windows(2).all(|w| w[0].tick < w[1].tick));
+        assert!(rows.windows(2).all(|w| w[0].tick <= w[1].tick));
         for row in rows {
             assert!(row.valid[row.chosen]);
             assert_eq!(row.walk.len(), 5);
@@ -1913,5 +2380,18 @@ mod tests {
         assert!(s.activity_ticks[Activity::Nursing.index()] > 0);
         assert!(s.foraging_fraction() > 0.0);
         assert!(dol > 0.3, "workers should specialise: {dol}");
+    }
+
+    #[test]
+    fn contacts_excite_nestmates() {
+        let mut sim = Simulation::new(hungry_fast(), 14);
+        sim.run(900);
+        assert!(sim.stats().food_delivered > 0);
+        let excited = sim.living().filter(|a| a.excitement > 0.0).count();
+        assert!(
+            excited > 0,
+            "returning foragers should have excited nestmates"
+        );
+        assert!(sim.stats().log.iter().any(|s| s.excitation > 0.0));
     }
 }

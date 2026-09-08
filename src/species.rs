@@ -1,9 +1,10 @@
 //! Species profiles: literature-based parameters for the biological model.
 //!
-//! Every quantity is in physical units (seconds, centimetres, pheromone
-//! "marks") and is converted to grid and tick units by the simulation. The
-//! defaults are order-of-magnitude values from the cited studies; where the
-//! literature gives ranges, a representative value is used and noted.
+//! Every quantity is in physical units (seconds, centimetres, microlitres,
+//! moles per litre, milligrams, pheromone "marks", degrees Celsius) and is
+//! converted to grid and tick units by the simulation. The defaults are
+//! order-of-magnitude values from the cited studies; where the literature
+//! gives ranges, a representative value is used and noted.
 //!
 //! Profiles:
 //!
@@ -16,15 +17,20 @@
 //! * [`Species::pharaoh`] (*Monomorium pharaonis*): adds the repellent
 //!   "no entry" marking.
 //! * [`Species::cataglyphis`] (desert ant): no trail pheromone at all;
-//!   solitary foraging by path integration and systematic search.
+//!   solitary foraging by path integration, route memory and systematic
+//!   search.
 
 use crate::ant::{
     BASE_FEATURES, FEATURES, F_ALARM, F_CROWD, F_FOOD, F_HEADING, F_HOME, F_HOME_VECTOR, F_NEST,
-    F_NO_ENTRY, F_RECENT, F_SITE, F_TERRITORY, F_TRAIL,
+    F_NO_ENTRY, F_RECENT, F_ROUTE, F_SITE, F_TERRITORY, F_TRAIL, F_WALL,
 };
 use crate::entropy::EntropyControl;
 use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
 use crate::surface::{BehavioralSurface, Deformation};
+
+/// Milligrams of sucrose per microlitre of a one-molar solution
+/// (342 g/mol).
+pub const SUGAR_MG_PER_UL_PER_MOLAR: f64 = 0.342;
 
 /// Parameters of one species.
 #[derive(Clone, Debug, PartialEq)]
@@ -33,23 +39,39 @@ pub struct Species {
     pub name: String,
 
     // ---- locomotion ----
-    /// Walking speed of an unloaded forager, cm/s.
+    /// Walking speed of an unloaded forager at the reference temperature,
+    /// cm/s.
     pub speed_cm_s: f64,
     /// Speed multiplier when carrying a full crop.
     pub loaded_speed_factor: f64,
     /// Speed multiplier on a strong trail (ants on established trails walk
     /// straighter and faster).
     pub trail_speed_factor: f64,
+    /// Temperature below which walking stops, °C (speed rises linearly from
+    /// here to the reference temperature: Hurlbert, Ballantyne & Powell
+    /// 2008, *Ecol. Entomol.* 33:144).
+    pub speed_t_min_c: f64,
+    /// Reference temperature at which `speed_cm_s` applies, °C.
+    pub speed_t_ref_c: f64,
 
     // ---- recruitment trail ----
-    /// Kinetics of the recruitment trail.
+    /// Kinetics of the recruitment trail at the reference temperature.
     pub trail: PheromoneParams,
     /// Deneubourg's choice exponent `n`.
     pub choice_exponent: f64,
-    /// Marks deposited per cell crossed while laying.
+    /// Marks deposited per cell length walked while laying at unit strength.
     pub trail_deposit: f64,
     /// Whether ants also lay trail on the way out to a known source.
     pub outbound_laying: bool,
+    /// Whether naive ants lay (weakly) while exploring, as Argentine ants
+    /// do (Aron, Pasteels & Deneubourg 1989, *Biol. Behav.* 14:207).
+    pub exploratory_laying: bool,
+    /// Trail weight on the way home as a fraction of the choice exponent:
+    /// mass recruiters read the trail in both directions, ants that
+    /// navigate home by path integration and route memory read it less
+    /// (Grüter, Czaczkes & Ratnieks 2011, *Behav. Ecol. Sociobiol.*
+    /// 65:141: private information overrides the trail in *Lasius niger*).
+    pub inbound_trail_factor: f64,
     /// Food quality (0..1) at which the probability of laying trail on the
     /// way home is half its maximum.
     pub lay_quality_half: f64,
@@ -62,10 +84,14 @@ pub struct Species {
     /// sources: Mailleux, Deneubourg & Detrain 2000, *Anim. Behav.* 59:1061;
     /// Detrain & Deneubourg 2008, *Adv. Insect Physiol.* 35:123).
     pub fidelity_quality_half: f64,
-    /// Fraction of the crop filled at a source of zero quality; the load
-    /// rises linearly to a full crop at quality one (crop load increases
-    /// with concentration: Josens, Farina & Roces 1998).
+    /// Fraction of the crop a forager fills at food of zero quality; the
+    /// desired load rises linearly to a full crop at quality one (crop load
+    /// increases with concentration: Josens, Farina & Roces 1998, *J. Insect
+    /// Physiol.* 44:579).
     pub min_load_fraction: f64,
+    /// Q10 of pheromone evaporation: the decay rate multiplies by this per
+    /// 10 °C above the reference temperature.
+    pub q10_evaporation: f64,
 
     // ---- other channels ----
     /// Outbound "home" trail kinetics (inert unless `uses_home_pheromone`).
@@ -74,13 +100,13 @@ pub struct Species {
     pub uses_home_pheromone: bool,
     /// Home-range marking kinetics.
     pub territory: PheromoneParams,
-    /// Home-range marks deposited per cell by every worker.
+    /// Home-range marks deposited per cell length by every worker.
     pub territory_deposit: f64,
     /// Repellent "no entry" kinetics.
     pub no_entry: PheromoneParams,
     /// Whether unsuccessful returning foragers lay "no entry" marking.
     pub uses_no_entry: bool,
-    /// No-entry marks deposited per cell.
+    /// No-entry marks deposited per cell length.
     pub no_entry_deposit: f64,
     /// Alarm pheromone kinetics.
     pub alarm: PheromoneParams,
@@ -88,13 +114,18 @@ pub struct Species {
     pub alarm_release: f64,
 
     // ---- sensing ----
-    /// Cells ahead an antenna sweep integrates (1 or 2).
+    /// Cells ahead an antennal sweep integrates (1 or 2).
     pub sense_range: usize,
 
     // ---- navigation ----
-    /// Standard deviation of the heading error per step, degrees.
+    /// Persistence length of the direction of travel, cm: the heading an
+    /// ant turns relative to is a running mean of its recent steps over
+    /// this distance, so the wobble inside a corridor does not decide the
+    /// next fork; turns of more than a right angle reorient it outright.
+    pub heading_persistence_cm: f64,
+    /// Standard deviation of the heading error per cell walked, degrees.
     pub pi_heading_noise_deg: f64,
-    /// Standard deviation of the relative odometric error per step.
+    /// Standard deviation of the relative odometric error per cell walked.
     pub pi_distance_noise: f64,
     /// Distance (cells) from a remembered location at which the ant
     /// considers itself arrived and starts searching.
@@ -105,12 +136,32 @@ pub struct Species {
     pub give_up_time_s: f64,
     /// Temperature multiplier applied while searching.
     pub search_temperature_factor: f64,
+    /// Number of familiar places a worker can remember local vectors for
+    /// (route memory: Collett & Collett 2002, *Nat. Rev. Neurosci.* 3:542;
+    /// Mangan & Webb 2012, *Behav. Ecol.* 23:944).
+    pub route_capacity: usize,
+    /// Weight of a remembered route against the other cues (1.5 lets a
+    /// well-learned route override a trail in *Lasius niger*: Grüter,
+    /// Czaczkes & Ratnieks 2011).
+    pub route_weight: f64,
+    /// Rate at which a remembered local vector moves towards the current
+    /// path-integration estimate on each visit.
+    pub route_learning_rate: f64,
+    /// Fraction by which the path-integration estimate is pulled towards a
+    /// well-known local vector on recognising a place.
+    pub route_pi_correction: f64,
 
     // ---- feeding ----
-    /// Crop capacity in food units (one unit is one full crop load).
-    pub crop_capacity: f64,
-    /// Time to fill the crop, seconds: `base + slope × quality`.
-    pub feeding_time_s: (f64, f64),
+    /// Molarity that counts as quality one for the behavioural responses.
+    pub reference_molarity: f64,
+    /// Crop capacity, microlitres (Lasius niger imbibes a fraction of a
+    /// microlitre: Mailleux et al. 2000).
+    pub crop_capacity_ul: f64,
+    /// Intake rate of a dilute solution, µl/s.
+    pub intake_max_ul_s: f64,
+    /// Molarity at which the intake rate halves (viscosity: Josens et al.
+    /// 1998).
+    pub intake_half_molarity: f64,
     /// Time to unload by trophallaxis in a hungry nest, seconds.
     pub unloading_time_s: f64,
     /// Extra unloading time per unit of colony satiation, as a factor.
@@ -140,8 +191,8 @@ pub struct Species {
     pub nursing_threshold_median: f64,
     /// Duration of one nursing bout, seconds.
     pub nursing_bout_s: f64,
-    /// Brood items one nurse can tend: the nursing stimulus is the brood
-    /// load per nurse already at work, so recruitment of nurses damps it.
+    /// Larvae one nurse can tend: the nursing stimulus is the larval load
+    /// per nurse already at work, so recruitment of nurses damps it.
     pub brood_per_nurse: f64,
     /// Foraging stimulus bonus for a worker remembering a source of unit
     /// quality (site fidelity).
@@ -155,65 +206,102 @@ pub struct Species {
     pub threshold_forgetting_s: f64,
     /// Bounds on a reinforced threshold as multiples of the species median.
     pub threshold_bounds: (f64, f64),
+    /// Below this temperature foraging stops, °C.
+    pub forage_min_c: f64,
+    /// Above this temperature foraging stops, °C.
+    pub forage_max_c: f64,
 
     // ---- colony ----
-    /// Excitation added to the nest per unit of quality of a returned load.
-    pub excitation_per_return: f64,
-    /// Half-life of that excitation, seconds.
+    /// Nestmates a returning forager contacts while unloading (recruitment
+    /// by contact: Greene & Gordon 2007, *Behav. Ecol.* 18:451).
+    pub contacts_per_return: usize,
+    /// Excitation a contact adds to a nestmate per unit of load quality.
+    pub excitation_per_contact: f64,
+    /// Half-life of a worker's excitation, seconds.
     pub excitation_half_life_s: f64,
     /// Foraging stimulus per unit of colony hunger.
     pub hunger_gain: f64,
-    /// Food units consumed per worker inside the nest per second.
-    pub consumption_per_ant_per_s: f64,
+    /// Sugar consumed per worker inside the nest per second at the
+    /// reference temperature, milligrams.
+    pub consumption_mg_per_ant_per_s: f64,
+    /// Q10 of metabolism.
+    pub q10_metabolism: f64,
     /// Interval between eggs laid by the queen when the colony is fed,
     /// seconds.
     pub egg_interval_s: f64,
-    /// Development time from egg to worker, seconds.
-    pub development_s: f64,
-    /// Food a brood item must receive to complete development.
-    pub brood_food: f64,
-    /// Food handed to brood per second of nursing.
-    pub nursing_rate: f64,
+    /// Egg stage duration at the reference temperature, seconds.
+    pub egg_s: f64,
+    /// Larval stage duration at the reference temperature, seconds.
+    pub larva_s: f64,
+    /// Pupal stage duration at the reference temperature, seconds.
+    pub pupa_s: f64,
+    /// Q10 of brood development (Kipyatkov & Lopatina 2015, *Adv. Insect
+    /// Physiol.* 48:129).
+    pub q10_development: f64,
+    /// Sugar a larva must receive to pupate, milligrams.
+    pub larva_food_mg: f64,
+    /// Time a larva survives without being fed, seconds.
+    pub larva_starvation_s: f64,
+    /// Sugar a nurse hands to larvae per second, milligrams.
+    pub nursing_rate_mg_s: f64,
 }
 
 fn lognormal_sigma_for_cv(cv: f64) -> f64 {
     (1.0 + cv * cv).ln().sqrt()
 }
 
+fn q10_factor(q10: f64, temperature_c: f64, reference_c: f64) -> f64 {
+    q10.max(1e-9).powf((temperature_c - reference_c) / 10.0)
+}
+
 impl Species {
+    /// Reference temperature of every rate constant, °C.
+    pub const REFERENCE_C: f64 = 22.0;
+
     /// *Lasius niger*, the black garden ant.
     ///
-    /// Speed ≈ 1.5 cm/s at room temperature (Hurlbert et al. 2008,
-    /// *Insectes Sociaux* 55:151 report 1–3 cm/s). Trail pheromone half-life
-    /// ≈ 47 min and trail laying rising with sucrose concentration
-    /// (Beckers, Deneubourg & Goss 1993, *J. Insect Behav.* 6:751). Choice
-    /// parameters `k = 20`, `n = 2` (Deneubourg et al. 1990). Crop filling
-    /// takes one to three minutes depending on concentration (Josens,
-    /// Farina & Roces 1998, *J. Insect Physiol.* 44:579, for *Camponotus*).
-    /// Colony hunger drives foraging (Mailleux, Deneubourg & Detrain 2003,
-    /// *Anim. Behav.* 66:1093). Task allocation by response thresholds
+    /// Speed ≈ 1.5 cm/s at room temperature (Hurlbert et al. 2008 report
+    /// 1–3 cm/s). Trail pheromone half-life ≈ 47 min and trail laying rising
+    /// with sucrose concentration (Beckers, Deneubourg & Goss 1993, *J.
+    /// Insect Behav.* 6:751). Choice parameters `k = 20`, `n = 2`
+    /// (Deneubourg et al. 1990). Crop loads of a fraction of a microlitre
+    /// (Mailleux et al. 2000), intake slowing with viscosity (Josens et al.
+    /// 1998). Colony hunger drives foraging (Mailleux, Deneubourg & Detrain
+    /// 2003, *Anim. Behav.* 66:1093). Task allocation by response thresholds
     /// (Bonabeau, Theraulaz & Deneubourg 1996, *Proc. R. Soc. B* 263:1565)
-    /// with age polyethism (Wilson 1976). Development egg→worker ≈ 45 days.
+    /// with age polyethism (Wilson 1976) and reinforcement (Theraulaz et al.
+    /// 1998). Egg, larval and pupal stages of roughly 10, 14 and 12 days at
+    /// 22 °C.
     pub fn lasius_niger() -> Self {
+        let day = 24.0 * 3600.0;
         Species {
             name: "Lasius niger".to_string(),
             speed_cm_s: 1.5,
             loaded_speed_factor: 0.8,
             trail_speed_factor: 1.15,
+            speed_t_min_c: 5.0,
+            speed_t_ref_c: Self::REFERENCE_C,
+            // A substrate deposit: it evaporates but hardly spreads sideways
+            // (its vapour active space is within antennal reach, which the
+            // patch-by-patch sensing covers), so lateral diffusion is a
+            // small leak rather than a transport term.
             trail: PheromoneParams {
                 half_life_s: 47.0 * 60.0,
-                diffusion_per_s: 0.002,
+                diffusion_per_s: 0.0002,
                 cap: 4000.0,
                 k: 20.0,
             },
             choice_exponent: 2.0,
             trail_deposit: 1.0,
             outbound_laying: false,
+            exploratory_laying: false,
+            inbound_trail_factor: 0.5,
             lay_quality_half: 0.3,
             lay_exponent: 2.0,
             lay_max_probability: 0.9,
             fidelity_quality_half: 0.15,
             min_load_fraction: 0.3,
+            q10_evaporation: 2.0,
             home: PheromoneParams::inert(),
             uses_home_pheromone: false,
             territory: PheromoneParams {
@@ -234,23 +322,30 @@ impl Species {
             },
             alarm_release: 60.0,
             sense_range: 2,
+            heading_persistence_cm: 5.0,
             pi_heading_noise_deg: 4.0,
             pi_distance_noise: 0.05,
             arrival_radius: 2.5,
             search_time_s: 90.0,
             give_up_time_s: 15.0 * 60.0,
             search_temperature_factor: 2.5,
-            crop_capacity: 1.0,
-            feeding_time_s: (45.0, 120.0),
+            route_capacity: 400,
+            route_weight: 1.5,
+            route_learning_rate: 0.3,
+            route_pi_correction: 0.3,
+            reference_molarity: 1.0,
+            crop_capacity_ul: 0.5,
+            intake_max_ul_s: 0.015,
+            intake_half_molarity: 0.7,
             unloading_time_s: 30.0,
             unloading_satiation_factor: 3.0,
-            forager_hazard_per_s: 1.0 / (24.0 * 3600.0),
+            forager_hazard_per_s: 1.0 / day,
             starvation_s: 8.0 * 3600.0,
             threshold_median: 0.5,
             threshold_spread: lognormal_sigma_for_cv(1.0),
             threshold_exponent: 2.0,
             decision_interval_s: 20.0,
-            maturation_s: 3.0 * 24.0 * 3600.0,
+            maturation_s: 3.0 * day,
             youth_threshold_factor: 4.0,
             nursing_threshold_median: 0.5,
             nursing_bout_s: 300.0,
@@ -259,14 +354,22 @@ impl Species {
             threshold_learning_s: 10.0 * 60.0,
             threshold_forgetting_s: 3600.0,
             threshold_bounds: (0.1, 10.0),
-            excitation_per_return: 0.15,
+            forage_min_c: 10.0,
+            forage_max_c: 42.0,
+            contacts_per_return: 5,
+            excitation_per_contact: 0.3,
             excitation_half_life_s: 120.0,
             hunger_gain: 1.0,
-            consumption_per_ant_per_s: 0.4 / 3600.0,
+            consumption_mg_per_ant_per_s: 0.05 / day,
+            q10_metabolism: 2.0,
             egg_interval_s: 3600.0,
-            development_s: 45.0 * 24.0 * 3600.0,
-            brood_food: 3.0,
-            nursing_rate: 0.5 / 60.0,
+            egg_s: 10.0 * day,
+            larva_s: 14.0 * day,
+            pupa_s: 12.0 * day,
+            q10_development: 2.5,
+            larva_food_mg: 0.8,
+            larva_starvation_s: 5.0 * day,
+            nursing_rate_mg_s: 0.5 / 3600.0,
         }
     }
 
@@ -280,13 +383,20 @@ impl Species {
         s.speed_cm_s = 2.0;
         s.trail = PheromoneParams {
             half_life_s: 20.0 * 60.0,
-            diffusion_per_s: 0.002,
+            diffusion_per_s: 0.0002,
             cap: 4000.0,
             k: 20.0,
         };
         s.outbound_laying = true;
+        s.exploratory_laying = true;
+        // A mass recruiter: orientation rests on the trail far more than on
+        // individual memory (Aron, Beckers, Deneubourg & Pasteels 1993,
+        // *Insectes Soc.* 40:369, comparing this species with L. niger).
+        s.route_weight = 0.5;
+        s.inbound_trail_factor = 1.0;
         s.lay_quality_half = 0.2;
         s.reforage_bonus = 1.2;
+        s.crop_capacity_ul = 0.3;
         s
     }
 
@@ -299,35 +409,44 @@ impl Species {
         s.speed_cm_s = 1.2;
         s.no_entry = PheromoneParams {
             half_life_s: 10.0 * 60.0,
-            diffusion_per_s: 0.002,
+            diffusion_per_s: 0.0002,
             cap: 200.0,
             k: 10.0,
         };
         s.uses_no_entry = true;
         s.no_entry_deposit = 1.0;
+        s.crop_capacity_ul = 0.2;
         s
     }
 
     /// *Cataglyphis*, the desert ant: no trail pheromone; solitary foragers
-    /// navigate by path integration and search systematically around the
-    /// fictive nest (Wehner & Srinivasan 1981, *J. Comp. Physiol.* 142:315;
-    /// Müller & Wehner 1988, *PNAS* 85:5287). Fast walkers, hot habitat,
-    /// high forager mortality.
+    /// navigate by path integration, route memory and systematic search
+    /// (Wehner & Srinivasan 1981, *J. Comp. Physiol.* 142:315; Müller &
+    /// Wehner 1988, *PNAS* 85:5287). Fast walkers of a hot habitat, high
+    /// forager mortality.
     pub fn cataglyphis() -> Self {
         let mut s = Species::lasius_niger();
         s.name = "Cataglyphis".to_string();
         s.speed_cm_s = 12.0;
+        s.speed_t_min_c = 15.0;
+        s.speed_t_ref_c = 35.0;
+        s.forage_min_c = 25.0;
+        s.forage_max_c = 55.0;
         s.trail = PheromoneParams::inert();
         s.trail_deposit = 0.0;
         s.lay_max_probability = 0.0;
         s.territory_deposit = 0.0;
         s.territory = PheromoneParams::inert();
+        s.heading_persistence_cm = 10.0;
         s.pi_heading_noise_deg = 3.0;
         s.pi_distance_noise = 0.04;
         s.search_time_s = 300.0;
         s.forager_hazard_per_s = 1.0 / (6.0 * 3600.0);
         s.reforage_bonus = 1.5;
         s.sense_range = 1;
+        s.crop_capacity_ul = 2.0;
+        s.route_capacity = 800;
+        s.route_weight = 2.0;
         s
     }
 
@@ -341,8 +460,11 @@ impl Species {
         let f = factor.max(1e-9);
         self.maturation_s /= f;
         self.egg_interval_s /= f;
-        self.development_s /= f;
-        self.nursing_rate *= f;
+        self.egg_s /= f;
+        self.larva_s /= f;
+        self.pupa_s /= f;
+        self.larva_starvation_s /= f;
+        self.nursing_rate_mg_s *= f;
         self
     }
 
@@ -362,6 +484,23 @@ impl Species {
             set[Pheromone::NoEntry.index()] = PheromoneParams::inert();
         }
         set
+    }
+
+    /// Food quality in `0..=1` of a solution: its molarity relative to the
+    /// reference, clamped.
+    pub fn quality(&self, molarity: f64) -> f64 {
+        (molarity / self.reference_molarity.max(1e-9)).clamp(0.0, 1.0)
+    }
+
+    /// Intake rate at a given molarity, µl/s: `max / (1 + (M / M½)²)`.
+    pub fn intake_rate(&self, molarity: f64) -> f64 {
+        let r = molarity.max(0.0) / self.intake_half_molarity.max(1e-9);
+        self.intake_max_ul_s / (1.0 + r * r)
+    }
+
+    /// Sugar content of a volume of solution, milligrams.
+    pub fn sugar_mg(&self, volume_ul: f64, molarity: f64) -> f64 {
+        volume_ul.max(0.0) * molarity.max(0.0) * SUGAR_MG_PER_UL_PER_MOLAR
     }
 
     /// Probability that a forager returning from food of `quality` (0..1)
@@ -388,15 +527,10 @@ impl Species {
         }
     }
 
-    /// Fraction of the crop filled at food of `quality`.
+    /// Fraction of the crop a forager wants to fill at food of `quality`.
     pub fn load_fraction(&self, quality: f64) -> f64 {
         let f = self.min_load_fraction.clamp(0.0, 1.0);
         f + (1.0 - f) * quality.clamp(0.0, 1.0)
-    }
-
-    /// Time to fill the crop at food of `quality`, seconds.
-    pub fn feeding_time(&self, quality: f64) -> f64 {
-        self.feeding_time_s.0 + self.feeding_time_s.1 * quality.clamp(0.0, 1.0)
     }
 
     /// Time to unload by trophallaxis when the colony's satiation is
@@ -425,11 +559,45 @@ impl Species {
         adult_threshold * (1.0 + (self.youth_threshold_factor - 1.0) * youth)
     }
 
+    /// Walking-speed multiplier at a temperature: linear from zero at
+    /// `speed_t_min_c` to one at the reference, continuing above it.
+    pub fn speed_factor(&self, temperature_c: f64) -> f64 {
+        let span = (self.speed_t_ref_c - self.speed_t_min_c).max(1e-9);
+        ((temperature_c - self.speed_t_min_c) / span).clamp(0.0, 2.5)
+    }
+
+    /// Multiplier on pheromone decay rates at a temperature.
+    pub fn evaporation_factor(&self, temperature_c: f64) -> f64 {
+        q10_factor(self.q10_evaporation, temperature_c, Self::REFERENCE_C)
+    }
+
+    /// Multiplier on brood development rate at a temperature.
+    pub fn development_factor(&self, temperature_c: f64) -> f64 {
+        q10_factor(self.q10_development, temperature_c, Self::REFERENCE_C)
+    }
+
+    /// Multiplier on metabolic consumption at a temperature.
+    pub fn metabolism_factor(&self, temperature_c: f64) -> f64 {
+        q10_factor(self.q10_metabolism, temperature_c, Self::REFERENCE_C)
+    }
+
+    /// Foraging activity window at a temperature: one well inside
+    /// `forage_min_c..forage_max_c`, fading smoothly to zero over two
+    /// degrees at each edge.
+    pub fn activity_factor(&self, temperature_c: f64) -> f64 {
+        let ramp = |x: f64| -> f64 {
+            let t = (x / 2.0).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        ramp(temperature_c - self.forage_min_c) * ramp(self.forage_max_c - temperature_c)
+    }
+
     /// The species' movement instinct as a behavioral surface at a fixed
     /// temperature of 1: outbound, follow the recruitment trail with
-    /// Deneubourg's exponent, head for a remembered site, avoid alarm and
-    /// no-entry marks, keep momentum; inbound, follow the path-integration
-    /// home vector, the nest, and (where laid) the outbound trail.
+    /// Deneubourg's exponent, head for a remembered site along a remembered
+    /// route, avoid alarm, no-entry marks and walls, keep momentum;
+    /// inbound, follow the path-integration home vector, the remembered
+    /// route, the nest, and (where laid) the outbound trail.
     pub fn instinct(&self) -> BehavioralSurface {
         let n = self.choice_exponent;
         let mut weights = [0.0; FEATURES];
@@ -444,10 +612,12 @@ impl Species {
         out[F_HEADING] = 1.0;
         out[F_HOME_VECTOR] = -0.3;
         out[F_SITE] = 2.0;
+        out[F_ROUTE] = self.route_weight;
         out[F_RECENT] = -0.5;
         out[F_CROWD] = -0.1;
+        out[F_WALL] = -1.0;
         let inb = &mut weights[BASE_FEATURES..];
-        inb[F_TRAIL] = 0.5 * n;
+        inb[F_TRAIL] = self.inbound_trail_factor * n;
         inb[F_HOME] = n;
         inb[F_TERRITORY] = 0.5;
         inb[F_NO_ENTRY] = 0.0;
@@ -457,8 +627,10 @@ impl Species {
         inb[F_HEADING] = 0.8;
         inb[F_HOME_VECTOR] = 3.0;
         inb[F_SITE] = 0.0;
+        inb[F_ROUTE] = self.route_weight;
         inb[F_RECENT] = -0.5;
         inb[F_CROWD] = -0.1;
+        inb[F_WALL] = -1.0;
         BehavioralSurface {
             weights,
             entropy: EntropyControl::fixed(1.0),
@@ -496,6 +668,10 @@ mod tests {
             assert!(s.response(0.0, 1.0) == 0.0);
             assert!(s.lay_probability(1.0) <= s.lay_max_probability + 1e-12);
             assert!(s.lay_probability(0.0) == 0.0);
+            assert!((s.speed_factor(s.speed_t_ref_c) - 1.0).abs() < 1e-12);
+            assert!(
+                (s.activity_factor(0.5 * (s.forage_min_c + s.forage_max_c)) - 1.0).abs() < 1e-12
+            );
         }
         assert!(!Species::cataglyphis().pheromones()[Pheromone::Trail.index()].is_active());
         assert!(Species::pharaoh().pheromones()[Pheromone::NoEntry.index()].is_active());
@@ -506,18 +682,39 @@ mod tests {
     }
 
     #[test]
-    fn quality_modulates_laying_and_feeding() {
+    fn quality_modulates_laying_feeding_and_loads() {
         let s = Species::lasius_niger();
         assert!(s.lay_probability(0.3) < s.lay_probability(1.0));
         assert!(
             (s.lay_probability(0.3) - 0.45).abs() < 1e-9,
             "half at the half quality"
         );
-        assert!(s.feeding_time(1.0) > s.feeding_time(0.1));
         assert!(s.unloading_time(1.0) > s.unloading_time(0.0));
         assert!(s.site_fidelity(1.0) > 0.95 && s.site_fidelity(0.1) < 0.4);
         assert!((s.site_fidelity(0.15) - 0.5).abs() < 1e-9);
         assert!((s.load_fraction(0.0) - 0.3).abs() < 1e-12 && s.load_fraction(1.0) == 1.0);
+        assert!(
+            s.intake_rate(0.1) > s.intake_rate(1.0),
+            "viscous solutions are drunk slowly"
+        );
+        assert!((s.intake_rate(0.7) - 0.5 * s.intake_max_ul_s).abs() < 1e-12);
+        assert!((s.sugar_mg(1.0, 1.0) - SUGAR_MG_PER_UL_PER_MOLAR).abs() < 1e-12);
+        assert_eq!(s.quality(2.0), 1.0);
+        assert!((s.quality(0.25) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn temperature_responses() {
+        let s = Species::lasius_niger();
+        assert_eq!(s.speed_factor(2.0), 0.0);
+        assert!((s.speed_factor(13.5) - 0.5).abs() < 1e-12);
+        assert!((s.evaporation_factor(32.0) - 2.0).abs() < 1e-12);
+        assert!((s.development_factor(12.0) - 1.0 / 2.5).abs() < 1e-12);
+        assert!((s.metabolism_factor(22.0) - 1.0).abs() < 1e-12);
+        assert_eq!(s.activity_factor(5.0), 0.0);
+        assert_eq!(s.activity_factor(45.0), 0.0);
+        assert!(s.activity_factor(11.0) > 0.0 && s.activity_factor(11.0) < 1.0);
+        assert_eq!(s.activity_factor(20.0), 1.0);
     }
 
     #[test]
@@ -535,9 +732,12 @@ mod tests {
         let c = s.clone().compressed(60.0);
         assert_eq!(c.trail.half_life_s, s.trail.half_life_s);
         assert_eq!(c.give_up_time_s, s.give_up_time_s);
-        assert_eq!(c.consumption_per_ant_per_s, s.consumption_per_ant_per_s);
+        assert_eq!(
+            c.consumption_mg_per_ant_per_s,
+            s.consumption_mg_per_ant_per_s
+        );
         assert!((c.maturation_s * 60.0 - s.maturation_s).abs() < 1e-3);
-        assert!((c.development_s * 60.0 - s.development_s).abs() < 1e-3);
-        assert!((c.nursing_rate / 60.0 - s.nursing_rate).abs() < 1e-12);
+        assert!((c.larva_s * 60.0 - s.larva_s).abs() < 1e-3);
+        assert!((c.nursing_rate_mg_s / 60.0 - s.nursing_rate_mg_s).abs() < 1e-12);
     }
 }

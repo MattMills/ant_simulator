@@ -14,7 +14,7 @@
 //! * [`run_division_of_labor`]: specialisation with and without response
 //!   threshold reinforcement (Theraulaz, Bonabeau & Deneubourg 1998).
 
-use crate::ant::{BASE_FEATURES, F_CROWD, F_RECENT};
+use crate::ant::{BASE_FEATURES, F_CROWD, F_RECENT, F_ROUTE};
 use crate::colony::{SimConfig, Simulation};
 use crate::geometry::Position;
 use crate::pheromone::Pheromone;
@@ -115,8 +115,8 @@ pub fn double_bridge(spec: &BridgeSpec) -> WorldConfig {
         food_sources: vec![FoodSource {
             center: Position::new(x_food + 1, y_mid),
             radius: 1,
-            amount_per_cell: 100_000,
-            quality: 1.0,
+            volume_ul_per_cell: 1.0e6,
+            molarity: 1.0,
         }],
         random_food: None,
         walls: Vec::new(),
@@ -159,6 +159,10 @@ pub fn experiment_config(species: Species, world: WorldConfig, ants: usize) -> S
     let mut cfg = SimConfig::for_species(species);
     cfg.world = world;
     cfg.ants = ants;
+    // The simulated ants are the foraging force of a starved colony many
+    // times their number, whose appetite does not saturate within the
+    // experiment: the store stands for that colony.
+    cfg.nest.store_capacity_mg_per_ant = 5.0;
     cfg.nest.initial_satiation = 0.05;
     cfg.nest.initial_brood_per_ant = 0.0;
     cfg.nest.queen = false;
@@ -168,16 +172,21 @@ pub fn experiment_config(species: Species, world: WorldConfig, ants: usize) -> S
 
 /// Reduce a configuration to the assumptions of the classic
 /// double-bridge model (Deneubourg et al. 1990): a trail that does not
-/// evaporate on the experiment's timescale and no behavioural negative
+/// evaporate on the experiment's timescale, no behavioural negative
 /// feedback at junctions (no crowding term, no memory of recently visited
-/// cells). Symmetry breaking on equal branches is a marginal instability
-/// that any such negative feedback suppresses.
+/// cells), and no private route memory. Symmetry breaking on equal
+/// branches is a marginal instability that any negative feedback
+/// suppresses, and private memory splits the colony into individuals each
+/// faithful to their own first choice (Grüter, Czaczkes & Ratnieks 2011
+/// found route memory overriding the trail in *Lasius niger*), which
+/// starves the collective feedback of the difference it needs to amplify.
 pub fn pure_pheromone_feedback(cfg: &mut SimConfig) {
     cfg.species.trail.half_life_s = f64::INFINITY;
     let mut world_pheromones = cfg.species.pheromones();
     world_pheromones[Pheromone::Trail.index()].half_life_s = f64::INFINITY;
     cfg.world.pheromones = Some(world_pheromones);
-    for f in [F_CROWD, F_RECENT] {
+    cfg.species.route_capacity = 0;
+    for f in [F_CROWD, F_RECENT, F_ROUTE] {
         cfg.instinct.weights[f] = 0.0;
         cfg.instinct.weights[BASE_FEATURES + f] = 0.0;
     }
@@ -307,8 +316,8 @@ pub fn summarize(fractions: &[f64]) -> Summary {
 }
 
 /// Build an open arena with the nest in the middle and two food sources at
-/// the same distance east (`quality_a`) and west (`quality_b`).
-pub fn two_sources(distance: i32, quality_a: f64, quality_b: f64) -> WorldConfig {
+/// the same distance east (`molarity_a`) and west (`molarity_b`).
+pub fn two_sources(distance: i32, molarity_a: f64, molarity_b: f64) -> WorldConfig {
     let margin = 4;
     let width = (2 * distance + 2 * margin + 1) as usize;
     let height = (2 * margin + 9) as usize;
@@ -322,14 +331,14 @@ pub fn two_sources(distance: i32, quality_a: f64, quality_b: f64) -> WorldConfig
             FoodSource {
                 center: Position::new(nest.x + distance, nest.y),
                 radius: 1,
-                amount_per_cell: 100_000,
-                quality: quality_a,
+                volume_ul_per_cell: 1.0e6,
+                molarity: molarity_a,
             },
             FoodSource {
                 center: Position::new(nest.x - distance, nest.y),
                 radius: 1,
-                amount_per_cell: 100_000,
-                quality: quality_b,
+                volume_ul_per_cell: 1.0e6,
+                molarity: molarity_b,
             },
         ],
         random_food: None,
@@ -356,27 +365,27 @@ pub fn two_sources(distance: i32, quality_a: f64, quality_b: f64) -> WorldConfig
 /// Outcome of one two-source replicate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourcesOutcome {
-    /// Crop loads taken from source A.
-    pub loads_a: u64,
-    /// Crop loads taken from source B.
-    pub loads_b: u64,
-    /// Share of loads taken from A (0.5 if none).
+    /// Solution taken from source A, microlitres.
+    pub volume_a: f64,
+    /// Solution taken from source B, microlitres.
+    pub volume_b: f64,
+    /// Share of the volume taken from A (0.5 if none).
     pub fraction_a: f64,
-    /// Crop loads delivered.
+    /// Loads delivered.
     pub delivered: u64,
 }
 
 /// Run one two-source replicate.
 pub fn run_two_sources_once(
     distance: i32,
-    quality_a: f64,
-    quality_b: f64,
+    molarity_a: f64,
+    molarity_b: f64,
     species: Species,
     ants: usize,
     seconds: f64,
     seed: u64,
 ) -> SourcesOutcome {
-    let world = two_sources(distance, quality_a, quality_b);
+    let world = two_sources(distance, molarity_a, molarity_b);
     let cfg = experiment_config(species, world, ants);
     let mut sim = Simulation::new(cfg, seed);
     let rect_of = |name: &str| {
@@ -392,17 +401,13 @@ pub fn run_two_sources_once(
     let (ra, rb) = (rect_of("a"), rect_of("b"));
     let (fa0, fb0) = (sim.world().food_in(&ra), sim.world().food_in(&rb));
     sim.run_seconds(seconds);
-    let loads_a = fa0 - sim.world().food_in(&ra);
-    let loads_b = fb0 - sim.world().food_in(&rb);
-    let total = loads_a + loads_b;
+    let volume_a = fa0 - sim.world().food_in(&ra);
+    let volume_b = fb0 - sim.world().food_in(&rb);
+    let total = volume_a + volume_b;
     SourcesOutcome {
-        loads_a,
-        loads_b,
-        fraction_a: if total == 0 {
-            0.5
-        } else {
-            loads_a as f64 / total as f64
-        },
+        volume_a,
+        volume_b,
+        fraction_a: if total <= 0.0 { 0.5 } else { volume_a / total },
         delivered: sim.stats().food_delivered,
     }
 }
@@ -499,7 +504,7 @@ mod tests {
         let cfg = double_bridge(&spec);
         let world = World::new(cfg.clone(), &mut Rng::seed_from_u64(1));
         assert_eq!(world.counters().len(), 2);
-        assert!(world.total_food() > 0);
+        assert!(world.total_food() > 0.0);
         // Flood fill from the nest reaches the food and both counters.
         let mut seen = vec![false; world.width() * world.height()];
         let mut stack = vec![world.nest()];
@@ -541,7 +546,10 @@ mod tests {
         assert_eq!(world.counters().len(), 2);
         let a = &cfg.counters[0].rect;
         let b = &cfg.counters[1].rect;
-        assert!(world.food_in(a) > 0 && world.food_in(b) > 0);
-        assert_eq!(world.cell(cfg.food_sources[1].center).unwrap().quality, 0.3);
+        assert!(world.food_in(a) > 0.0 && world.food_in(b) > 0.0);
+        assert_eq!(
+            world.cell(cfg.food_sources[1].center).unwrap().molarity,
+            0.3
+        );
     }
 }

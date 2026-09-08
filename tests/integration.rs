@@ -26,7 +26,7 @@ fn colony_with_default_hierarchy_forages() {
     let mut dialed = Simulation::new(config, 3);
     dialed.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.35);
     dialed.run(600);
-    let target = 0.35 * (8f64).ln();
+    let target = 0.35 * (RING as f64).ln();
     let h = dialed.stats().mean_entropy();
     assert!(
         (h - target).abs() < 0.25,
@@ -235,15 +235,12 @@ fn smoothing_keeps_paths_coherent() {
 fn sucker_with_short_reach_is_path_bound() {
     let free = geometry_run(Deformation::none(), Selection::Softmax, 6);
     let bound = geometry_run(Deformation::none(), Selection::Sucker { reach: 1 }, 6);
-    // One proposal step can never turn more than 45° unless straight ahead
-    // is blocked, so sharp turns all but vanish.
-    let sharp = |s: &Stats| {
-        let m = s.path.moves.max(1) as f64;
-        s.path.turns[2..=6].iter().sum::<u64>() as f64 / m
-    };
-    assert!(sharp(&bound) < 0.05, "bound sharp turns {}", sharp(&bound));
+    // One proposal step can never turn by more than one ring step unless
+    // straight ahead is blocked, so sharp turns (90° or more) all but vanish.
+    let sharp = |s: &Stats| s.path.sharp_turn_rate();
+    assert!(sharp(&bound) < 0.02, "bound sharp turns {}", sharp(&bound));
     assert!(
-        sharp(&free) > sharp(&bound) + 0.05,
+        sharp(&free) > sharp(&bound) + 0.02,
         "free {} vs bound {}",
         sharp(&free),
         sharp(&bound)

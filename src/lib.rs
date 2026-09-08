@@ -7,15 +7,19 @@
 //! ## The pieces
 //!
 //! * **Colony simulation** ([`colony`], [`world`], [`ant`], [`pheromone`],
-//!   [`species`]): a grid world in physical units with a nest, food of
-//!   varying quality, and five pheromone channels with literature kinetics.
-//!   Workers rest, nurse, forage, feed, return, search and unload through an
-//!   activity state machine; they navigate by path integration, follow
-//!   trails through Deneubourg's choice function, lay trail in proportion to
-//!   food quality, and engage in tasks by reinforced response thresholds.
-//!   The nest stores food, gets hungry, recruits, lays eggs and raises
-//!   brood. The [`experiments`] module reproduces the classic double-bridge,
-//!   two-source, hunger and division-of-labour setups.
+//!   [`species`]): a world in physical units, with ants moving continuously
+//!   over a substrate grid that carries a nest, sucrose solutions of varying
+//!   molarity, and five pheromone channels with literature kinetics under a
+//!   temperature that may cycle through the day. Workers rest, nurse,
+//!   forage, feed, return, search and unload through an activity state
+//!   machine; they navigate by path integration and route memory, follow
+//!   trails through Deneubourg's choice function sensed by a forward
+//!   antennal probe, lay trail in proportion to food quality, recruit by
+//!   contact, and engage in tasks by reinforced response thresholds. The
+//!   nest stores sugar, gets hungry, lays eggs and raises brood through egg,
+//!   larva and pupa. The [`experiments`] module reproduces the classic
+//!   double-bridge, equal-bridge, two-source, hunger and division-of-labour
+//!   setups.
 //!
 //! * **Entropic behavioral surface** ([`surface`], [`entropy`]): the general
 //!   object that controls behaviour. It is a weight vector over the sensory
@@ -32,8 +36,8 @@
 //!   root to a leaf, and entropy dials compose, so each level controls the
 //!   behaviour of every entity beneath it.
 //!
-//! * **Path surfaces and geometric selection** ([`landscape`]): the eight
-//!   candidate directions form a ring around the ant's heading, and the
+//! * **Path surfaces and geometric selection** ([`landscape`]): sixteen
+//!   candidate headings form a ring around the ant's direction of travel, and the
 //!   scores on that ring are the deterministic information of the path.
 //!   The entropy budget deforms it through separable channels (tempering,
 //!   smoothing along the ring, a random roughening field), and a direction
@@ -131,16 +135,16 @@ pub mod world;
 /// The commonly used types, re-exported.
 pub mod prelude {
     pub use crate::ant::{
-        Activity, Ant, Mode, Observation, SearchTarget, Site, Traits, BASE_FEATURES, FEATURES,
-        FEATURE_NAMES,
+        Activity, Ant, Mode, Observation, Route, SearchTarget, Site, Traits, BASE_FEATURES,
+        FEATURES, FEATURE_NAMES,
     };
     pub use crate::arena::{
         Arena, ArenaConfig, ArenaReport, ControlTargets, EpisodeSeeding, Evaluation, FeedbackScope,
         TurnRecord,
     };
     pub use crate::colony::{
-        BroodItem, GeometryConfig, Nest, NestConfig, PathStats, RewardSpec, Selection, SimConfig,
-        Simulation, Snapshot, Stats, SurfaceRow, Trace,
+        BroodItem, BroodStage, Environment, GeometryConfig, Nest, NestConfig, PathStats,
+        RewardSpec, Selection, SimConfig, Simulation, Snapshot, Stats, SurfaceRow, Trace,
     };
     pub use crate::entropy::{EntropyControl, Tempering};
     pub use crate::experiments::{
@@ -149,13 +153,13 @@ pub mod prelude {
         run_hunger_response, run_two_sources_once, summarize, two_sources, BridgeOutcome,
         BridgeSpec, HungerOutcome, LaborOutcome, SourcesOutcome, Summary,
     };
-    pub use crate::geometry::{Direction, Position};
+    pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,
     };
     pub use crate::landscape::{
-        ring_index, world_direction, Contributions, EntropyLedger, Landscape, Sucker, Tempered,
-        DISPLAY_ORDER, RING, TURN_LABELS,
+        ring_heading, ring_index_of, turn_degrees, turn_label, Contributions, EntropyLedger,
+        Landscape, Sucker, Tempered, DISPLAY_ORDER, RING, RING_STEP,
     };
     pub use crate::learner::{
         Arm, CrossEntropy, DialBandit, EntropyBandit, HillClimber, Learner, LeverView, Mutation,

@@ -180,3 +180,132 @@ mod tests {
         assert_eq!(Direction::North.rotated(-1), Direction::NorthWest);
     }
 }
+
+/// A continuous position in cell units: cell `(i, j)` spans
+/// `[i, i + 1) × [j, j + 1)` and has its centre at `(i + 0.5, j + 0.5)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    /// Horizontal coordinate.
+    pub x: f64,
+    /// Vertical coordinate (grows downward).
+    pub y: f64,
+}
+
+impl Point {
+    /// Construct a point.
+    pub const fn new(x: f64, y: f64) -> Self {
+        Point { x, y }
+    }
+
+    /// The centre of a cell.
+    pub fn center_of(cell: Position) -> Self {
+        Point {
+            x: cell.x as f64 + 0.5,
+            y: cell.y as f64 + 0.5,
+        }
+    }
+
+    /// The cell containing the point.
+    pub fn cell(self) -> Position {
+        Position::new(self.x.floor() as i32, self.y.floor() as i32)
+    }
+
+    /// Point displaced by `distance` along `heading` (radians, 0 = east,
+    /// increasing clockwise on screen).
+    pub fn advanced(self, heading: f64, distance: f64) -> Self {
+        let (s, c) = heading.sin_cos();
+        Point {
+            x: self.x + distance * c,
+            y: self.y + distance * s,
+        }
+    }
+
+    /// Vector from this point to another.
+    pub fn to(self, other: Point) -> (f64, f64) {
+        (other.x - self.x, other.y - self.y)
+    }
+
+    /// Euclidean distance to another point.
+    pub fn distance(self, other: Point) -> f64 {
+        let (dx, dy) = self.to(other);
+        (dx * dx + dy * dy).sqrt()
+    }
+}
+
+/// Wrap an angle into `(-π, π]`.
+pub fn wrap_angle(theta: f64) -> f64 {
+    let mut t = theta % std::f64::consts::TAU;
+    if t > std::f64::consts::PI {
+        t -= std::f64::consts::TAU;
+    } else if t <= -std::f64::consts::PI {
+        t += std::f64::consts::TAU;
+    }
+    t
+}
+
+/// Angle of a vector (radians, 0 = east, clockwise positive on screen).
+pub fn angle_of(dx: f64, dy: f64) -> f64 {
+    dy.atan2(dx)
+}
+
+/// Cosine of the angle between a heading and a vector (0 for the zero
+/// vector).
+pub fn cosine_heading_to(heading: f64, dx: f64, dy: f64) -> f64 {
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-12 {
+        return 0.0;
+    }
+    let (s, c) = heading.sin_cos();
+    (c * dx + s * dy) / len
+}
+
+impl Direction {
+    /// The heading angle of a grid direction.
+    pub fn angle(self) -> f64 {
+        let (dx, dy) = self.delta();
+        angle_of(dx as f64, dy as f64)
+    }
+
+    /// The grid direction nearest to a heading.
+    pub fn nearest(heading: f64) -> Direction {
+        let eighth = std::f64::consts::FRAC_PI_4;
+        // East is index 2 in the enum; angles grow clockwise like indices.
+        let steps = (wrap_angle(heading) / eighth).round() as i32;
+        Direction::from_index((2 + steps).rem_euclid(8) as usize)
+    }
+}
+
+#[cfg(test)]
+mod point_tests {
+    use super::*;
+
+    #[test]
+    fn cells_centres_and_advance() {
+        let c = Point::center_of(Position::new(3, 4));
+        assert_eq!(c, Point::new(3.5, 4.5));
+        assert_eq!(c.cell(), Position::new(3, 4));
+        assert_eq!(Point::new(3.999, 4.0).cell(), Position::new(3, 4));
+        let east = c.advanced(0.0, 1.0);
+        assert!((east.x - 4.5).abs() < 1e-12 && (east.y - 4.5).abs() < 1e-12);
+        let south = c.advanced(std::f64::consts::FRAC_PI_2, 2.0);
+        assert!((south.y - 6.5).abs() < 1e-12);
+        assert!((c.distance(south) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn angles_round_trip_with_directions() {
+        for d in Direction::ALL {
+            assert_eq!(Direction::nearest(d.angle()), d);
+        }
+        assert!((Direction::East.angle()).abs() < 1e-12);
+        assert!((Direction::South.angle() - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!((Direction::North.angle() + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!((wrap_angle(3.0 * std::f64::consts::PI) - std::f64::consts::PI).abs() < 1e-12);
+        assert!(
+            (wrap_angle(-3.5 * std::f64::consts::PI) - 0.5 * std::f64::consts::PI).abs() < 1e-12
+        );
+        assert!((cosine_heading_to(0.0, 5.0, 0.0) - 1.0).abs() < 1e-12);
+        assert!((cosine_heading_to(0.0, 0.0, 5.0)).abs() < 1e-12);
+        assert_eq!(cosine_heading_to(1.0, 0.0, 0.0), 0.0);
+    }
+}

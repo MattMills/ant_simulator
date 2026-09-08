@@ -1,23 +1,24 @@
 //! The surface flat in front of an ant, and the sucker that crawls on it.
 //!
-//! An ant's eight candidate directions form a ring around its heading. The
-//! scores the behavioral surface assigns to them are a *landscape* on that
-//! ring: the deterministic information of the path, laid out egocentrically
-//! with "straight ahead" at index 0. Stacked along a trajectory, the rings
-//! form the path's surface.
+//! An ant's candidate headings form a ring around its current heading:
+//! [`RING`] of them, evenly spaced, index 0 straight ahead, index
+//! `RING / 2` straight back, index 1 one step clockwise (to the right on
+//! screen). The scores the behavioral surface assigns to them are a
+//! *landscape* on that ring: the deterministic information of the path,
+//! laid out egocentrically. Stacked along a trajectory, the rings form the
+//! path's surface.
 //!
 //! Entropy is then spent on that landscape through separable geometric
 //! channels:
 //!
-//! * **tempering** rescales the landscape so the implied distribution has
-//!   exactly the requested entropy (the channel the rest of the crate
-//!   already uses);
+//! * **tempering** rescales the landscape (to a fixed temperature, or so
+//!   that the implied distribution has exactly the requested entropy);
 //! * **smoothing** blurs the landscape along the ring, spreading preference
-//!   to neighbouring directions (angular disorder, path-coherent);
+//!   to neighbouring headings (angular disorder, path-coherent);
 //! * **roughening** adds a random low-mode field, carving random basins
 //!   (landscape disorder, path-incoherent).
 //!
-//! Finally a direction is *selected*. The classic way is a global draw from
+//! Finally a heading is *selected*. The classic way is a global draw from
 //! the tempered distribution. The geometric way is a [`Sucker`]: a walker
 //! that starts straight ahead and crawls the ring by local Metropolis moves
 //! for a bounded number of steps, settling in whatever basin it can reach.
@@ -28,46 +29,64 @@
 //! still travelling towards a peak off to the side is broader.
 
 use crate::entropy::{entropy, softmax, tempered_distribution, tempered_with, Tempering};
-use crate::geometry::Direction;
 use crate::rng::Rng;
 
-/// Number of ring positions.
-pub const RING: usize = Direction::COUNT;
+/// Number of candidate headings: 22.5° apart.
+pub const RING: usize = 16;
 
-/// Ring positions in left-to-right display order: 135° left, 90° left,
-/// 45° left, straight, 45° right, 90° right, 135° right, reverse.
-pub const DISPLAY_ORDER: [usize; RING] = [5, 6, 7, 0, 1, 2, 3, 4];
+/// Angular step between neighbouring ring positions, radians.
+pub const RING_STEP: f64 = std::f64::consts::TAU / RING as f64;
 
-/// Human-readable name of each ring position (a turn relative to heading).
-pub const TURN_LABELS: [&str; RING] = [
-    "straight",
-    "right 45°",
-    "right 90°",
-    "right 135°",
-    "reverse",
-    "left 135°",
-    "left 90°",
-    "left 45°",
-];
+/// Ring positions in left-to-right display order: from the sharpest left
+/// turn through straight ahead to the sharpest right turn, then reverse.
+pub const DISPLAY_ORDER: [usize; RING] = [9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-/// Ring position of a world direction relative to a heading
-/// (0 = straight ahead, 4 = reverse, 1 = 45° clockwise).
-pub fn ring_index(dir: Direction, heading: Direction) -> usize {
-    (dir.index() + RING - heading.index()) % RING
+/// Turn angle of a ring position relative to the heading, in degrees:
+/// positive is clockwise (right on screen), `180` is reverse.
+pub fn turn_degrees(ring: usize) -> f64 {
+    let k = ring % RING;
+    let signed = if k <= RING / 2 {
+        k as f64
+    } else {
+        k as f64 - RING as f64
+    };
+    signed * 360.0 / RING as f64
 }
 
-/// World direction of a ring position relative to a heading.
-pub fn world_direction(ring: usize, heading: Direction) -> Direction {
-    Direction::from_index((heading.index() + ring) % RING)
+/// Human-readable name of a ring position.
+pub fn turn_label(ring: usize) -> String {
+    let deg = turn_degrees(ring);
+    if deg == 0.0 {
+        "straight".to_string()
+    } else if deg == 180.0 {
+        "reverse".to_string()
+    } else if deg > 0.0 {
+        format!("right {deg:.1}°")
+    } else {
+        format!("left {:.1}°", -deg)
+    }
 }
 
-/// Shortest distance around the ring between two positions (0..=4).
+/// Heading angle of a ring position given the current heading.
+pub fn ring_heading(ring: usize, heading: f64) -> f64 {
+    crate::geometry::wrap_angle(heading + (ring % RING) as f64 * RING_STEP)
+}
+
+/// Ring position nearest to a heading angle, relative to the current one.
+pub fn ring_index_of(angle: f64, heading: f64) -> usize {
+    let rel = crate::geometry::wrap_angle(angle - heading);
+    let k = (rel / RING_STEP).round() as isize;
+    k.rem_euclid(RING as isize) as usize
+}
+
+/// Shortest distance around the ring between two positions.
 pub fn ring_distance(a: usize, b: usize) -> usize {
     let d = (a as isize - b as isize).unsigned_abs() % RING;
     d.min(RING - d)
 }
 
-/// Turn magnitude of a ring position in eighth-turns (0 straight, 4 reverse).
+/// Turn magnitude of a ring position in ring steps (0 straight, `RING/2`
+/// reverse).
 pub fn turn_magnitude(ring: usize) -> usize {
     ring_distance(ring, 0)
 }
@@ -77,25 +96,21 @@ pub fn turn_magnitude(ring: usize) -> usize {
 pub struct Landscape {
     /// Score of each ring position (`-inf` where masked).
     pub values: [f64; RING],
-    /// Whether the position can be entered.
+    /// Whether the heading can be taken.
     pub valid: [bool; RING],
 }
 
 impl Landscape {
-    /// Build from world-indexed scores and validity, centred on `heading`.
-    pub fn from_world(scores: &[f64; RING], valid: &[bool; RING], heading: Direction) -> Self {
-        let mut values = [f64::NEG_INFINITY; RING];
-        let mut ok = [false; RING];
-        for (d, dir) in Direction::ALL.iter().enumerate() {
-            let j = ring_index(*dir, heading);
-            ok[j] = valid[d];
-            values[j] = if valid[d] {
-                scores[d]
-            } else {
-                f64::NEG_INFINITY
-            };
+    /// Landscape with the given values and validity mask; masked positions
+    /// are forced to `-inf`.
+    pub fn new(values: [f64; RING], valid: [bool; RING]) -> Self {
+        let mut values = values;
+        for (v, ok) in values.iter_mut().zip(&valid) {
+            if !*ok {
+                *v = f64::NEG_INFINITY;
+            }
         }
-        Landscape { values, valid: ok }
+        Landscape { values, valid }
     }
 
     /// Landscape with the given values, all positions valid.
@@ -106,7 +121,7 @@ impl Landscape {
         }
     }
 
-    /// Number of enterable positions.
+    /// Number of takeable headings.
     pub fn valid_count(&self) -> usize {
         self.valid.iter().filter(|v| **v).count()
     }
@@ -297,8 +312,6 @@ pub struct Sucker {
 }
 
 impl Sucker {
-    /// Acceptance probability of moving from `from` to `to` on a scaled
-    /// landscape (0 if `to` is masked).
     fn accept(scaled: &[f64; RING], from: usize, to: usize) -> f64 {
         if !scaled[to].is_finite() {
             return 0.0;
@@ -336,9 +349,8 @@ impl Sucker {
     pub fn distribution(&self, scaled: &[f64; RING], start: usize) -> [f64; RING] {
         let mut p = [0.0; RING];
         p[start] = 1.0;
-        let mut next = [0.0; RING];
         for _ in 0..self.reach {
-            next = [0.0; RING];
+            let mut next = [0.0; RING];
             for j in 0..RING {
                 if p[j] == 0.0 {
                     continue;
@@ -353,7 +365,6 @@ impl Sucker {
             }
             p = next;
         }
-        let _ = next;
         p
     }
 }
@@ -383,7 +394,7 @@ pub struct Contributions {
     /// started on and positive while it is still in transit towards an
     /// off-axis peak.
     pub selection: f64,
-    /// Entropy of the distribution the direction was actually drawn from.
+    /// Entropy of the distribution the heading was actually drawn from.
     pub selected: f64,
 }
 
@@ -452,57 +463,58 @@ impl EntropyLedger {
 mod tests {
     use super::*;
 
+    fn peaked(at: usize, height: f64) -> [f64; RING] {
+        let mut v = [0.0; RING];
+        v[at] = height;
+        v
+    }
+
     #[test]
     fn ring_mapping_round_trips() {
-        for heading in Direction::ALL {
-            for dir in Direction::ALL {
-                let j = ring_index(dir, heading);
-                assert_eq!(world_direction(j, heading), dir);
-            }
-            assert_eq!(ring_index(heading, heading), 0);
-            assert_eq!(ring_index(heading.opposite(), heading), 4);
-            assert_eq!(ring_index(heading.rotated(1), heading), 1);
+        for k in 0..RING {
+            let h = 0.3;
+            assert_eq!(ring_index_of(ring_heading(k, h), h), k);
         }
-        assert_eq!(ring_distance(1, 7), 2);
-        assert_eq!(turn_magnitude(5), 3);
+        assert_eq!(ring_index_of(0.0, 0.0), 0);
+        assert_eq!(ring_index_of(std::f64::consts::PI, 0.0), RING / 2);
+        assert_eq!(ring_index_of(RING_STEP, 0.0), 1);
+        assert_eq!(ring_distance(1, RING - 1), 2);
+        assert_eq!(turn_magnitude(RING - 3), 3);
+        assert!((turn_degrees(1) - 22.5).abs() < 1e-12);
+        assert!((turn_degrees(RING - 1) + 22.5).abs() < 1e-12);
+        assert_eq!(turn_label(0), "straight");
+        assert_eq!(turn_label(RING / 2), "reverse");
+        assert!(turn_label(2).starts_with("right 45"));
+        assert!(turn_label(RING - 4).starts_with("left 90"));
         let mut seen: Vec<usize> = DISPLAY_ORDER.to_vec();
         seen.sort_unstable();
         assert_eq!(seen, (0..RING).collect::<Vec<_>>());
     }
 
     #[test]
-    fn from_world_masks_and_centres() {
-        let mut scores = [0.0; RING];
-        scores[Direction::East.index()] = 3.0;
+    fn new_masks_and_finds_neighbours() {
         let mut valid = [true; RING];
-        valid[Direction::West.index()] = false;
-        let land = Landscape::from_world(&scores, &valid, Direction::East);
-        assert_eq!(land.values[0], 3.0);
-        assert!(!land.valid[4]);
-        assert_eq!(land.values[4], f64::NEG_INFINITY);
-        assert_eq!(land.valid_count(), 7);
+        valid[RING / 2] = false;
+        let land = Landscape::new(peaked(0, 3.0), valid);
+        assert!(!land.valid[RING / 2]);
+        assert_eq!(land.values[RING / 2], f64::NEG_INFINITY);
+        assert_eq!(land.valid_count(), RING - 1);
         assert_eq!(land.range(), 3.0);
-        assert_eq!(land.nearest_valid(4), Some(5));
-        let none = Landscape {
-            values: [f64::NEG_INFINITY; RING],
-            valid: [false; RING],
-        };
+        assert_eq!(land.nearest_valid(RING / 2), Some(RING / 2 + 1));
+        let none = Landscape::new([0.0; RING], [false; RING]);
         assert_eq!(none.nearest_valid(0), None);
         assert_eq!(none.range(), 0.0);
     }
 
     #[test]
     fn smoothing_spreads_and_raises_entropy() {
-        let mut values = [0.0; RING];
-        values[0] = 5.0;
-        let land = Landscape::open(values);
+        let land = Landscape::open(peaked(0, 5.0));
         let blurred = land.smoothed(1.0);
         assert!(blurred.values[0] < 5.0);
-        assert!(blurred.values[1] > 0.0 && blurred.values[7] > 0.0);
-        assert!((blurred.values[1] - blurred.values[7]).abs() < 1e-12);
+        assert!(blurred.values[1] > 0.0 && blurred.values[RING - 1] > 0.0);
+        assert!((blurred.values[1] - blurred.values[RING - 1]).abs() < 1e-12);
         assert!(blurred.entropy_at(1.0) > land.entropy_at(1.0));
         assert_eq!(land.smoothed(0.0), land);
-        // Masked positions are excluded from the blur.
         let mut masked = land.clone();
         masked.valid[1] = false;
         masked.values[1] = f64::NEG_INFINITY;
@@ -530,41 +542,48 @@ mod tests {
 
     #[test]
     fn tempering_matches_entropy_target() {
-        let land = Landscape::open([2.0, 0.5, -1.0, 0.0, 1.0, -0.5, 0.2, 0.9]);
+        let mut v = [0.0; RING];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = ((i as f64) * 0.7).sin() * 2.0;
+        }
+        let land = Landscape::open(v);
         let t = land.temper(0.4);
-        assert!((t.entropy - 0.4 * (8f64).ln()).abs() < 1e-3);
+        assert!((t.entropy - 0.4 * (RING as f64).ln()).abs() < 1e-3);
         assert!((t.probs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        assert_eq!(t.scaled[0], 0.0);
         assert!(t.scaled.iter().all(|s| s.is_finite() && *s <= 0.0));
         let cold = land.temper(0.0);
-        assert!(
-            cold.scaled[2] < -1e3 && cold.scaled[2].is_finite(),
-            "scaled landscape stays finite"
-        );
-        assert!(cold.probs[2] == 0.0);
+        let argmax = v
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        assert!((cold.probs[argmax] - 1.0).abs() < 1e-3);
         let fixed = land.temper_with(Tempering::Temperature(1.0));
         assert_eq!(fixed.temperature, 1.0);
-        assert!((fixed.probs[0] / fixed.probs[1] - (2.0f64 - 0.5).exp()).abs() < 1e-9);
-        assert!((land.entropy_fraction_at(1.0) - fixed.entropy / (8f64).ln()).abs() < 1e-12);
+        assert!((fixed.probs[1] / fixed.probs[0] - (v[1] - v[0]).exp()).abs() < 1e-9);
+        assert!((land.entropy_fraction_at(1.0) - fixed.entropy / (RING as f64).ln()).abs() < 1e-12);
     }
 
     #[test]
     fn sucker_with_no_reach_stays_put() {
         let mut rng = Rng::seed_from_u64(1);
-        let land = Landscape::open([0.0, 5.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0]);
+        let land = Landscape::open(peaked(RING / 2, 9.0));
         let t = land.temper(0.5);
         let (j, trail) = Sucker { reach: 0 }.walk(&t.scaled, 0, &mut rng);
         assert_eq!(j, 0);
         assert_eq!(trail, vec![0]);
-        let d = Sucker { reach: 0 }.distribution(&t.scaled, 0);
-        assert_eq!(d[0], 1.0);
+        assert_eq!(Sucker { reach: 0 }.distribution(&t.scaled, 0)[0], 1.0);
     }
 
     #[test]
     fn sucker_walk_matches_exact_distribution() {
         let mut rng = Rng::seed_from_u64(2);
-        let land = Landscape::open([1.0, 2.0, 0.0, -1.0, 3.0, -2.0, 0.5, 0.0]);
-        let t = land.temper(0.6);
+        let mut v = [0.0; RING];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = ((i as f64) * 1.3).cos() * 3.0;
+        }
+        let t = Landscape::open(v).temper(0.6);
         let sucker = Sucker { reach: 5 };
         let exact = sucker.distribution(&t.scaled, 0);
         assert!((exact.iter().sum::<f64>() - 1.0).abs() < 1e-9);
@@ -587,9 +606,12 @@ mod tests {
 
     #[test]
     fn sucker_converges_to_the_target_with_long_reach() {
-        let land = Landscape::open([1.0, 0.5, 0.0, 0.2, 0.8, 0.1, 0.3, 0.6]);
-        let t = land.temper(0.9);
-        let far = Sucker { reach: 400 }.distribution(&t.scaled, 3);
+        let mut v = [0.0; RING];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = ((i as f64) * 0.5).sin();
+        }
+        let t = Landscape::open(v).temper(0.9);
+        let far = Sucker { reach: 1500 }.distribution(&t.scaled, 3);
         let tv: f64 = far
             .iter()
             .zip(&t.probs)
@@ -601,32 +623,32 @@ mod tests {
 
     #[test]
     fn cold_sucker_climbs_to_the_nearest_peak_not_the_highest() {
-        // Two peaks: a small one one step to the right, a huge one behind.
-        let land = Landscape::open([0.0, 1.0, -3.0, -3.0, 10.0, -3.0, -3.0, -1.0]);
-        let t = land.temper(0.0);
-        let d = Sucker { reach: 12 }.distribution(&t.scaled, 0);
-        assert!(d[1] > 0.99, "sucker settles on the nearby peak: {d:?}");
-        assert!(d[4] < 1e-6);
-        // A global draw at the same entropy would take the highest peak.
-        assert!(t.probs[4] > 0.99);
+        // A small peak two steps to the right, a huge one straight back.
+        let mut v = [-3.0; RING];
+        v[0] = 0.0;
+        v[1] = 0.5;
+        v[2] = 1.0;
+        v[RING / 2] = 10.0;
+        let t = Landscape::open(v).temper(0.0);
+        let d = Sucker { reach: 24 }.distribution(&t.scaled, 0);
+        assert!(d[2] > 0.99, "sucker settles on the nearby peak: {d:?}");
+        assert!(d[RING / 2] < 1e-6);
+        assert!(t.probs[RING / 2] > 0.99);
     }
 
     #[test]
     fn sucker_never_enters_masked_positions() {
         let mut rng = Rng::seed_from_u64(3);
-        let mut land = Landscape::open([0.0; RING]);
-        land.valid[1] = false;
-        land.values[1] = f64::NEG_INFINITY;
-        land.valid[7] = false;
-        land.values[7] = f64::NEG_INFINITY;
-        let t = land.temper(1.0);
+        let mut valid = [true; RING];
+        valid[1] = false;
+        valid[RING - 1] = false;
+        let t = Landscape::new([0.0; RING], valid).temper(1.0);
         for _ in 0..200 {
             let (j, trail) = Sucker { reach: 6 }.walk(&t.scaled, 0, &mut rng);
             assert_eq!(j, 0);
             assert!(trail.iter().all(|p| *p == 0));
         }
-        let d = Sucker { reach: 6 }.distribution(&t.scaled, 0);
-        assert_eq!(d[0], 1.0);
+        assert_eq!(Sucker { reach: 6 }.distribution(&t.scaled, 0)[0], 1.0);
     }
 
     #[test]

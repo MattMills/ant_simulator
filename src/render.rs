@@ -3,7 +3,7 @@
 use crate::ant::Activity;
 use crate::colony::{Simulation, SurfaceRow};
 use crate::geometry::Position;
-use crate::landscape::DISPLAY_ORDER;
+use crate::landscape::{turn_degrees, DISPLAY_ORDER};
 use crate::pheromone::Pheromone;
 use crate::world::Terrain;
 use std::fmt::Write as _;
@@ -34,7 +34,7 @@ pub fn render(sim: &Simulation) -> String {
                 Terrain::Nest => 'N',
                 Terrain::Open => {
                     let trail = cell.level(Pheromone::Trail);
-                    if cell.food > 0 {
+                    if cell.has_food() {
                         'F'
                     } else if cell.level(Pheromone::Alarm) > 1.0 {
                         'x'
@@ -59,7 +59,11 @@ pub fn render(sim: &Simulation) -> String {
         if ant.is_inside() {
             continue;
         }
-        let (x, y) = (ant.position.x as usize, ant.position.y as usize);
+        let cell = ant.cell();
+        if cell.x < 0 || cell.y < 0 {
+            continue;
+        }
+        let (x, y) = (cell.x as usize, cell.y as usize);
         if y < h && x < w {
             grid[y][x] = match ant.activity {
                 Activity::Outbound => 'o',
@@ -83,12 +87,14 @@ pub fn render(sim: &Simulation) -> String {
     let s = sim.stats();
     let _ = writeln!(
         out,
-        "t = {:.0} s | alive {} | outside {} | delivered {} | store {:.1} ({:.0}% full) | food left {} | trail {:.0} | mean entropy {:.3}",
+        "t = {:.0} s | {:.1} °C | alive {} | outside {} | delivered {} ({:.2} mg sugar) | store {:.2} mg ({:.0}% full) | food left {:.0} µl | trail {:.0} | mean entropy {:.3}",
         sim.time_s(),
+        sim.temperature(),
         sim.alive(),
         sim.outside(),
         s.food_delivered,
-        sim.nest().store,
+        s.sugar_delivered_mg,
+        sim.nest().store_mg,
         100.0 * sim.nest().satiation(),
         world.total_food(),
         world.total_pheromone(Pheromone::Trail),
@@ -97,13 +103,17 @@ pub fn render(sim: &Simulation) -> String {
     out
 }
 
+/// Width of one ring column in the surface rendering.
+const COLUMN: usize = 5;
+
 /// Render recorded path-surface rows as text, newest row last.
 ///
-/// Each row shows the ant's tick, position and load, then the eight ring
-/// positions from 135° left through straight ahead to 135° right and finally
-/// reverse, shaded by the probability the direction was drawn with
-/// (` .:-=+*#@` from nothing to certainty). The chosen position is bracketed,
-/// masked positions show `xx`, and the sucker's trail (if any) follows.
+/// Each row shows the ant's tick, position and load, then the ring
+/// positions from the sharpest left turn through straight ahead to the
+/// sharpest right turn and finally reverse, shaded by the probability the
+/// heading was drawn with (` .:-=+*#@` from nothing to certainty). The
+/// chosen position is bracketed, blocked positions show `xx`, and the
+/// sucker's trail (if any) follows.
 pub fn render_surface(rows: &[SurfaceRow], last: usize) -> String {
     const SHADES: [char; 9] = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
     let shade = |p: f64| -> char {
@@ -111,16 +121,26 @@ pub fn render_surface(rows: &[SurfaceRow], last: usize) -> String {
         SHADES[idx]
     };
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{:>5} {:>9} {:>1}  {:^4}{:^4}{:^4}{:^4}{:^4}{:^4}{:^4}{:^4}  trail",
-        "tick", "position", "", "L135", "L90", "L45", "^", "R45", "R90", "R135", "rev"
-    );
+    let _ = write!(out, "{:>5} {:>11} {:>1}  ", "tick", "position", "");
+    for &j in &DISPLAY_ORDER {
+        let deg = turn_degrees(j);
+        let label = if deg == 0.0 {
+            "^".to_string()
+        } else if deg == 180.0 {
+            "rev".to_string()
+        } else if deg > 0.0 {
+            format!("R{}", deg.round() as i32)
+        } else {
+            format!("L{}", (-deg).round() as i32)
+        };
+        let _ = write!(out, "{label:^COLUMN$}");
+    }
+    out.push_str("  trail\n");
     let start = rows.len().saturating_sub(last);
     for row in &rows[start..] {
         let _ = write!(
             out,
-            "{:>5} ({:>3},{:>3}) {}  ",
+            "{:>5} ({:>4.1},{:>4.1}) {}  ",
             row.tick,
             row.position.x,
             row.position.y,
@@ -134,9 +154,9 @@ pub fn render_surface(rows: &[SurfaceRow], last: usize) -> String {
                 format!("{c}{c}")
             };
             if j == row.chosen {
-                let _ = write!(out, "[{cell}]");
+                let _ = write!(out, "{:^COLUMN$}", format!("[{cell}]"));
             } else {
-                let _ = write!(out, " {cell} ");
+                let _ = write!(out, "{:^COLUMN$}", cell);
             }
         }
         if !row.walk.is_empty() {
@@ -152,7 +172,8 @@ pub fn render_surface(rows: &[SurfaceRow], last: usize) -> String {
 mod tests {
     use super::*;
     use crate::colony::{Selection, SimConfig};
-    use crate::geometry::Direction;
+    use crate::geometry::Point;
+    use crate::landscape::RING;
 
     #[test]
     fn renders_a_frame() {
@@ -177,7 +198,13 @@ mod tests {
         };
         cfg.nest.initial_satiation = 0.0;
         let mut sim = Simulation::new(cfg, 2);
-        sim.run(400);
+        // Ant 0 leaves the nest when its own threshold lets it; wait for it.
+        for _ in 0..40 {
+            sim.run(100);
+            if sim.surface_trace().len() >= 5 {
+                break;
+            }
+        }
         let text = render_surface(sim.surface_trace(), 5);
         assert!(text.lines().count() >= 2, "{text}");
         assert!(text.contains('['));
@@ -187,19 +214,19 @@ mod tests {
 
     #[test]
     fn chosen_bracket_sits_under_its_column() {
-        for chosen in 0..8 {
-            let mut valid = [true; 8];
-            valid[(chosen + 3) % 8] = false;
-            let mut selected = [0.0; 8];
+        for chosen in 0..RING {
+            let mut valid = [true; RING];
+            valid[(chosen + 3) % RING] = false;
+            let mut selected = [0.0; RING];
             selected[chosen] = 1.0;
             let row = SurfaceRow {
                 tick: 1,
-                position: Position::new(2, 3),
-                heading: Direction::North,
+                position: Point::new(2.5, 3.5),
+                heading: 0.0,
                 carrying: false,
                 valid,
-                base: [0.0; 8],
-                deformed: [0.0; 8],
+                base: [0.0; RING],
+                deformed: [0.0; RING],
                 probs: selected,
                 selected,
                 chosen,
@@ -207,16 +234,19 @@ mod tests {
                 temperature: 1.0,
             };
             let text = render_surface(&[row], 1);
+            let header = text.lines().next().unwrap();
             let line = text.lines().nth(1).unwrap();
+            let prefix = header.find("L158").unwrap();
             let column = DISPLAY_ORDER.iter().position(|&j| j == chosen).unwrap();
-            let cells = &line[19..19 + 32];
-            let cell = &cells[column * 4..column * 4 + 4];
-            assert_eq!(cell, "[@@]", "chosen {chosen}: {line:?}");
+            let cell = &line[prefix + column * COLUMN..prefix + (column + 1) * COLUMN];
+            assert_eq!(cell.trim(), "[@@]", "chosen {chosen}: {line:?}");
             let masked_column = DISPLAY_ORDER
                 .iter()
-                .position(|&j| j == (chosen + 3) % 8)
+                .position(|&j| j == (chosen + 3) % RING)
                 .unwrap();
-            assert_eq!(&cells[masked_column * 4..masked_column * 4 + 4], " xx ");
+            let masked =
+                &line[prefix + masked_column * COLUMN..prefix + (masked_column + 1) * COLUMN];
+            assert_eq!(masked.trim(), "xx");
         }
     }
 }

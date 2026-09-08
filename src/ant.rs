@@ -1,25 +1,28 @@
-//! Individual ants: activity, traits, path integration, and what they
-//! perceive.
+//! Individual ants: activity, traits, path integration, route memory, and
+//! what they perceive.
 //!
 //! An ant is a leaf entity of the hierarchy: it belongs to exactly one leaf
 //! category and moves through the effective policy composed along that
-//! category's path to the root. Inside the nest it rests, nurses, or
-//! unloads; outside it heads out, feeds, heads home, or searches. It keeps
-//! a path-integration home vector with odometric noise (Müller & Wehner
-//! 1988), remembers the last rewarding site as a vector from the nest (site
-//! fidelity), and carries individual response thresholds (Bonabeau et al.
-//! 1996).
+//! category's path to the root. It has a continuous position and heading.
+//! Inside the nest it rests, nurses, or unloads; outside it heads out,
+//! feeds, heads home, or searches. It keeps a path-integration home vector
+//! with odometric noise (Müller & Wehner 1988), remembers the last rewarding
+//! site as a vector from the nest (site fidelity), learns local vectors at
+//! familiar places (route memory: Collett & Collett 2002), and carries
+//! individual response thresholds (Bonabeau et al. 1996).
 
-use crate::geometry::{Direction, Position};
+use crate::geometry::{cosine_heading_to, Point, Position};
+use crate::landscape::{ring_heading, turn_magnitude, RING, RING_STEP};
 use crate::pheromone::{perceived, Pheromone};
 use crate::rng::Rng;
 use crate::species::Species;
-use crate::world::{Terrain, World};
+use crate::world::World;
+use std::collections::HashMap;
 
 /// Identifier of an ant within a simulation.
 pub type AntId = usize;
 
-/// How many recent positions an ant remembers (to avoid dithering).
+/// How many recently visited cells an ant remembers (to avoid dithering).
 pub const MEMORY_LEN: usize = 8;
 
 /// What an ant is doing.
@@ -27,7 +30,7 @@ pub const MEMORY_LEN: usize = 8;
 pub enum Activity {
     /// Inside the nest, not engaged in a task.
     Resting,
-    /// Inside the nest, feeding brood.
+    /// Inside the nest, feeding larvae.
     Nursing,
     /// Outside, heading away from the nest in search of food.
     Outbound,
@@ -115,7 +118,7 @@ pub struct Traits {
     pub foraging_threshold: f64,
     /// Nursing response threshold.
     pub nursing_threshold: f64,
-    /// Walking speed in cells per tick.
+    /// Walking speed in cells per tick at the reference temperature.
     pub speed: f64,
     /// Multiplier on the probability of laying trail.
     pub laying: f64,
@@ -148,22 +151,38 @@ pub struct Site {
     pub quality: f64,
 }
 
+/// Local vectors remembered at a familiar place.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Route {
+    /// Remembered vector from this place to the nest, in cells.
+    pub home: (f64, f64),
+    /// Visits on which the homeward vector was learned.
+    pub home_strength: f32,
+    /// Remembered vector from this place to the food site, in cells.
+    pub out: (f64, f64),
+    /// Visits on which the outward vector was learned.
+    pub out_strength: f32,
+    last_used: u64,
+}
+
 /// A single ant.
 #[derive(Clone, Debug)]
 pub struct Ant {
     /// Identifier.
     pub id: AntId,
-    /// Current cell (the nest centre while inside).
-    pub position: Position,
-    /// Direction of the last move.
-    pub heading: Direction,
+    /// Current position in cell units (the nest centre while inside).
+    pub position: Point,
+    /// Heading in radians (0 = east, clockwise positive on screen).
+    pub heading: f64,
     /// What the ant is doing.
     pub activity: Activity,
     /// What a searching ant looks for.
     pub search_target: SearchTarget,
-    /// Food carried, in crop loads (0 or up to the species' capacity).
-    pub crop: f64,
-    /// Quality of the food carried or last collected.
+    /// Food carried, microlitres.
+    pub crop_ul: f64,
+    /// Molarity of the food carried or last collected.
+    pub load_molarity: f64,
+    /// Quality (0..1) of the food carried or last collected.
     pub load_quality: f64,
     /// Seconds of reserve before starvation.
     pub energy: f64,
@@ -177,9 +196,11 @@ pub struct Ant {
     pub traits: Traits,
     /// Path-integrated displacement from the nest, in cells.
     pub home_vector: (f64, f64),
+    /// Whether path integration has failed and been reset outside the nest.
+    pub lost: bool,
     /// Remembered food site.
     pub site: Option<Site>,
-    /// Ticks remaining in a timed activity (feeding, unloading, nursing).
+    /// Ticks remaining in a timed activity (unloading, nursing).
     pub timer: u32,
     /// Channel currently being laid while walking, if any.
     pub laying: Option<Pheromone>,
@@ -189,8 +210,8 @@ pub struct Ant {
     pub steps_since_nest: u32,
     /// Ticks since the ant last picked up food.
     pub steps_since_food: u32,
-    /// Moves made since the ant last picked up food.
-    pub trip_moves: u32,
+    /// Path length walked since the ant last picked up food, cells.
+    pub trip_length: f64,
     /// Ticks spent in the current search.
     pub search_steps: u32,
     /// Completed food deliveries.
@@ -198,13 +219,16 @@ pub struct Ant {
     /// Outbound trips that ended without food.
     pub failed_trips: u32,
     /// Where the food currently carried was picked up.
-    pub pickup: Option<Position>,
+    pub pickup: Option<Point>,
     /// Ticks spent outside the nest.
     pub time_foraging: u64,
     /// Ticks spent nursing.
     pub time_nursing: u64,
-    /// Fractional movement credit (speed below one cell per tick).
+    /// Recruitment excitation from contacts with successful foragers.
+    pub excitement: f64,
+    /// Fractional movement credit (unused sub-cell movement).
     pub move_credit: f64,
+    routes: HashMap<Position, Route>,
     memory: [Position; MEMORY_LEN],
     memory_cursor: usize,
 }
@@ -214,18 +238,19 @@ impl Ant {
     pub fn new(
         id: AntId,
         nest: Position,
-        heading: Direction,
+        heading: f64,
         leaf: usize,
         traits: Traits,
         energy: f64,
     ) -> Self {
         Ant {
             id,
-            position: nest,
+            position: Point::center_of(nest),
             heading,
             activity: Activity::Resting,
             search_target: SearchTarget::Nest,
-            crop: 0.0,
+            crop_ul: 0.0,
+            load_molarity: 0.0,
             load_quality: 0.0,
             energy,
             age: 0,
@@ -233,23 +258,31 @@ impl Ant {
             leaf,
             traits,
             home_vector: (0.0, 0.0),
+            lost: false,
             site: None,
             timer: 0,
             laying: None,
             lay_strength: 1.0,
             steps_since_nest: 0,
             steps_since_food: u32::MAX / 2,
-            trip_moves: 0,
+            trip_length: 0.0,
             search_steps: 0,
             deliveries: 0,
             failed_trips: 0,
             pickup: None,
             time_foraging: 0,
             time_nursing: 0,
+            excitement: 0.0,
             move_credit: 0.0,
+            routes: HashMap::new(),
             memory: [nest; MEMORY_LEN],
             memory_cursor: 0,
         }
+    }
+
+    /// The cell the ant stands in.
+    pub fn cell(&self) -> Position {
+        self.position.cell()
     }
 
     /// Whether the ant is inside the nest.
@@ -259,10 +292,10 @@ impl Ant {
 
     /// Whether the ant carries food.
     pub fn carrying(&self) -> bool {
-        self.crop > 0.0
+        self.crop_ul > 1e-9
     }
 
-    /// Record a position in the short-term memory ring.
+    /// Record a cell in the short-term memory ring.
     pub fn remember(&mut self, p: Position) {
         self.memory[self.memory_cursor] = p;
         self.memory_cursor = (self.memory_cursor + 1) % MEMORY_LEN;
@@ -275,12 +308,17 @@ impl Ant {
 
     /// Forget every remembered position.
     pub fn clear_memory(&mut self) {
-        self.memory = [self.position; MEMORY_LEN];
+        self.memory = [self.cell(); MEMORY_LEN];
     }
 
-    /// Believed direction to the nest (the negated home vector).
-    pub fn believed_nest_direction(&self) -> (f64, f64) {
-        (-self.home_vector.0, -self.home_vector.1)
+    /// Believed direction to the nest (the negated home vector), `None`
+    /// when the ant is at the nest or lost.
+    pub fn believed_nest_direction(&self) -> Option<(f64, f64)> {
+        if self.lost || self.believed_distance_home() < 1e-9 {
+            None
+        } else {
+            Some((-self.home_vector.0, -self.home_vector.1))
+        }
     }
 
     /// Believed distance to the nest, in cells.
@@ -290,6 +328,9 @@ impl Ant {
 
     /// Believed vector from the current position to the remembered site.
     pub fn site_direction(&self) -> Option<(f64, f64)> {
+        if self.lost {
+            return None;
+        }
         self.site.map(|s| {
             (
                 s.vector.0 - self.home_vector.0,
@@ -303,31 +344,112 @@ impl Ant {
         self.site_direction().map(|(x, y)| (x * x + y * y).sqrt())
     }
 
-    /// Update the home vector for a move in `dir`, with the species'
-    /// heading and odometric noise.
-    pub fn integrate(&mut self, dir: Direction, species: &Species, rng: &mut Rng) {
-        let (dx, dy) = dir.delta();
-        let (dx, dy) = (dx as f64, dy as f64);
-        let theta = species.pi_heading_noise_deg.to_radians() * rng.normal();
-        let scale = 1.0 + species.pi_distance_noise * rng.normal();
+    /// Update the home vector for a displacement `(dx, dy)` in cells, with
+    /// the species' heading and odometric noise (scaled by the distance).
+    pub fn integrate(&mut self, dx: f64, dy: f64, species: &Species, rng: &mut Rng) {
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist <= 0.0 {
+            return;
+        }
+        let theta = species.pi_heading_noise_deg.to_radians() * dist.sqrt() * rng.normal();
+        let scale = 1.0 + species.pi_distance_noise * dist.sqrt() * rng.normal();
         let (s, c) = theta.sin_cos();
-        let bx = (c * dx - s * dy) * scale;
-        let by = (s * dx + c * dy) * scale;
-        self.home_vector.0 += bx;
-        self.home_vector.1 += by;
+        self.home_vector.0 += (c * dx - s * dy) * scale;
+        self.home_vector.1 += (s * dx + c * dy) * scale;
     }
 
     /// Reset path integration at the nest.
     pub fn reset_home_vector(&mut self) {
         self.home_vector = (0.0, 0.0);
+        self.lost = false;
+    }
+
+    /// The route memory at a cell, if any.
+    pub fn route(&self, cell: Position) -> Option<&Route> {
+        self.routes.get(&cell)
+    }
+
+    /// Number of familiar places remembered.
+    pub fn familiar_places(&self) -> usize {
+        self.routes.len()
+    }
+
+    fn route_entry(&mut self, cell: Position, capacity: usize, now: u64) -> &mut Route {
+        if !self.routes.contains_key(&cell) && self.routes.len() >= capacity.max(1) {
+            if let Some((&oldest, _)) = self.routes.iter().min_by_key(|(_, r)| r.last_used) {
+                self.routes.remove(&oldest);
+            }
+        }
+        let entry = self.routes.entry(cell).or_insert(Route {
+            home: (0.0, 0.0),
+            home_strength: 0.0,
+            out: (0.0, 0.0),
+            out_strength: 0.0,
+            last_used: now,
+        });
+        entry.last_used = now;
+        entry
+    }
+
+    /// Learn the homeward local vector at a cell from the current estimate.
+    pub fn learn_route_home(
+        &mut self,
+        cell: Position,
+        home: (f64, f64),
+        rate: f64,
+        capacity: usize,
+    ) {
+        let now = self.age;
+        let r = self.route_entry(cell, capacity, now);
+        if r.home_strength <= 0.0 {
+            r.home = home;
+        } else {
+            r.home.0 += rate * (home.0 - r.home.0);
+            r.home.1 += rate * (home.1 - r.home.1);
+        }
+        r.home_strength += 1.0;
+    }
+
+    /// Learn the outward local vector at a cell from the current estimate.
+    pub fn learn_route_out(&mut self, cell: Position, out: (f64, f64), rate: f64, capacity: usize) {
+        let now = self.age;
+        let r = self.route_entry(cell, capacity, now);
+        if r.out_strength <= 0.0 {
+            r.out = out;
+        } else {
+            r.out.0 += rate * (out.0 - r.out.0);
+            r.out.1 += rate * (out.1 - r.out.1);
+        }
+        r.out_strength += 1.0;
+    }
+
+    /// On recognising a familiar place, pull the path-integration estimate
+    /// towards the remembered homeward vector. Returns whether a correction
+    /// was applied.
+    pub fn recalibrate(&mut self, cell: Position, correction: f64) -> bool {
+        let now = self.age;
+        let Some(r) = self.routes.get_mut(&cell) else {
+            return false;
+        };
+        if r.home_strength < 2.0 {
+            return false;
+        }
+        r.last_used = now;
+        let w =
+            correction.clamp(0.0, 1.0) * (r.home_strength as f64 / (r.home_strength as f64 + 2.0));
+        let target = (-r.home.0, -r.home.1);
+        self.home_vector.0 += w * (target.0 - self.home_vector.0);
+        self.home_vector.1 += w * (target.1 - self.home_vector.1);
+        self.lost = false;
+        true
     }
 }
 
-/// Number of sensory features per candidate direction in one mode.
-pub const BASE_FEATURES: usize = 12;
+/// Number of sensory features per candidate heading in one mode.
+pub const BASE_FEATURES: usize = 14;
 
-/// Total features per candidate direction: one block for outbound
-/// movement and one for inbound movement, so behaviour differs by mode.
+/// Total features per candidate heading: one block for outbound movement
+/// and one for inbound movement, so behaviour differs by mode.
 pub const FEATURES: usize = 2 * BASE_FEATURES;
 
 /// Index of the recruitment-trail feature within a block.
@@ -340,20 +462,24 @@ pub const F_TERRITORY: usize = 2;
 pub const F_NO_ENTRY: usize = 3;
 /// Index of the alarm feature.
 pub const F_ALARM: usize = 4;
-/// Index of the food-present feature.
+/// Index of the food-ahead feature.
 pub const F_FOOD: usize = 5;
-/// Index of the nest-cell feature.
+/// Index of the nest-ahead feature.
 pub const F_NEST: usize = 6;
-/// Index of the heading-alignment feature.
+/// Index of the heading-persistence feature.
 pub const F_HEADING: usize = 7;
 /// Index of the path-integration home-vector alignment feature.
 pub const F_HOME_VECTOR: usize = 8;
 /// Index of the remembered-site alignment feature.
 pub const F_SITE: usize = 9;
+/// Index of the remembered-route alignment feature.
+pub const F_ROUTE: usize = 10;
 /// Index of the recently-visited feature.
-pub const F_RECENT: usize = 10;
+pub const F_RECENT: usize = 11;
 /// Index of the crowding feature.
-pub const F_CROWD: usize = 11;
+pub const F_CROWD: usize = 12;
+/// Index of the wall-ahead feature.
+pub const F_WALL: usize = 13;
 
 /// Human-readable feature names, indexed like a surface's weight vector.
 pub const FEATURE_NAMES: [&str; FEATURES] = [
@@ -362,25 +488,29 @@ pub const FEATURE_NAMES: [&str; FEATURES] = [
     "out:territory",
     "out:no_entry",
     "out:alarm",
-    "out:food_here",
-    "out:nest_here",
-    "out:heading_alignment",
+    "out:food_ahead",
+    "out:nest_ahead",
+    "out:heading_persistence",
     "out:home_vector_alignment",
     "out:site_alignment",
+    "out:route_alignment",
     "out:recently_visited",
     "out:crowding",
+    "out:wall_ahead",
     "in:trail",
     "in:home_trail",
     "in:territory",
     "in:no_entry",
     "in:alarm",
-    "in:food_here",
-    "in:nest_here",
-    "in:heading_alignment",
+    "in:food_ahead",
+    "in:nest_ahead",
+    "in:heading_persistence",
     "in:home_vector_alignment",
     "in:site_alignment",
+    "in:route_alignment",
     "in:recently_visited",
     "in:crowding",
+    "in:wall_ahead",
 ];
 
 /// Which block of the surface a movement decision uses.
@@ -402,62 +532,97 @@ impl Mode {
     }
 }
 
-/// What an ant perceives: one feature vector per candidate direction, and
-/// whether that direction is walkable at all.
-#[derive(Clone, Debug, Default)]
+/// What an ant perceives: one feature vector per candidate heading, and
+/// whether a step in that heading is possible.
+#[derive(Clone, Debug)]
 pub struct Observation {
-    /// Feature vectors, indexed by [`Direction::index`].
-    pub features: [[f64; FEATURES]; Direction::COUNT],
-    /// Whether the cell in that direction can be entered.
-    pub valid: [bool; Direction::COUNT],
+    /// Feature vectors, indexed by ring position (0 straight ahead).
+    pub features: [[f64; FEATURES]; RING],
+    /// Whether a step of the requested length can be taken that way.
+    pub valid: [bool; RING],
+}
+
+impl Default for Observation {
+    fn default() -> Self {
+        Observation {
+            features: [[0.0; FEATURES]; RING],
+            valid: [false; RING],
+        }
+    }
 }
 
 impl Observation {
-    /// Number of walkable directions.
+    /// Number of takeable headings.
     pub fn valid_count(&self) -> usize {
         self.valid.iter().filter(|v| **v).count()
     }
 }
 
-fn cosine(dir: Direction, v: Option<(f64, f64)>) -> f64 {
+fn cosine(heading: f64, v: Option<(f64, f64)>) -> f64 {
     match v {
-        Some((x, y)) => dir.cosine_to(x, y),
+        Some((x, y)) => cosine_heading_to(heading, x, y),
         None => 0.0,
     }
 }
 
-/// Sense the world from an ant's point of view in the given mode.
+/// Heading persistence of a ring position: a quadratic turning cost,
+/// `1 - (turn / 90°)²`, which agrees with the cosine for moderate turns
+/// (1 straight ahead, 0 at a right angle) but charges a reversal three
+/// units rather than one. Ants on a trail keep their direction; U-turns
+/// come from losing the trail, not from the trail being stronger behind.
+pub fn turn_persistence(ring: usize) -> f64 {
+    let turn = turn_magnitude(ring) as f64 * RING_STEP;
+    let x = turn / std::f64::consts::FRAC_PI_2;
+    1.0 - x * x
+}
+
+/// Whether a ring position lies within the antennal sweep (a turn of at
+/// most 90°): pheromone ahead is sensed, pheromone behind is not.
+pub fn within_antennal_sweep(ring: usize) -> bool {
+    turn_magnitude(ring) <= RING / 4
+}
+
+/// Sense the world from an ant's point of view in the given mode, for a
+/// step of `step` cells.
 ///
 /// Pheromone features integrate an antennal sweep of `species.sense_range`
-/// cells ahead (the second cell at half weight) and pass through the
+/// cells ahead (the second cell at half weight), read patch by patch from
+/// the substrate along a probe that stops at walls, and pass through the
 /// saturating perception `ln(1 + C/k)` with the ant's own sensitivity.
-pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode) -> Observation {
+/// The sweep covers the forward half-plane only: headings that turn by
+/// more than 90° sense nothing, so a strong trail behind does not pull an
+/// ant round and U-turns arise from losing the trail ahead.
+pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode, step: f64) -> Observation {
     let mut obs = Observation::default();
     let nest_dir = ant.believed_nest_direction();
-    let nest_dir = if ant.believed_distance_home() < 1e-9 {
-        None
-    } else {
-        Some(nest_dir)
-    };
     let site_dir = ant.site_direction();
+    let here = ant.cell();
+    let route_dir = ant.route(here).and_then(|r| match mode {
+        Mode::Inbound if r.home_strength > 0.0 => {
+            Some((r.home, (r.home_strength as f64 / 3.0).min(1.0)))
+        }
+        Mode::Outbound if r.out_strength > 0.0 && ant.site.is_some() => {
+            Some((r.out, (r.out_strength as f64 / 3.0).min(1.0)))
+        }
+        _ => None,
+    });
     let offset = mode.offset();
-    for (d, dir) in Direction::ALL.iter().enumerate() {
-        let target = ant.position.step(*dir);
-        let Some(cell) = world.cell(target) else {
-            continue;
-        };
-        if cell.terrain == Terrain::Wall {
+    let step = step.max(1e-6);
+    for k in 0..RING {
+        let heading = ring_heading(k, ant.heading);
+        let target = ant.position.advanced(heading, step);
+        if !world.segment_passable(ant.position, target) {
             continue;
         }
-        obs.valid[d] = true;
-        let beyond = if species.sense_range >= 2 {
-            world
-                .cell(target.step(*dir))
-                .filter(|c| c.terrain != Terrain::Wall)
-        } else {
-            None
-        };
-        let f = &mut obs.features[d][offset..offset + BASE_FEATURES];
+        obs.valid[k] = true;
+        let target_cell = target.cell();
+        // The antennal probe: one cell ahead, then a second, stopping at
+        // the first wall so nothing is sensed through or around a corner.
+        let (one, _) = world.probe(ant.position, heading, 1.0);
+        let (two, reach) = world.probe(ant.position, heading, 2.0);
+        let second = species.sense_range >= 2 && reach > 1.0 + 1e-9;
+        let ahead = within_antennal_sweep(k);
+        let f = &mut obs.features[k][offset..offset + BASE_FEATURES];
         for (slot, kind) in [
             (F_TRAIL, Pheromone::Trail),
             (F_HOME, Pheromone::Home),
@@ -465,28 +630,48 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode) -> Obser
             (F_NO_ENTRY, Pheromone::NoEntry),
             (F_ALARM, Pheromone::Alarm),
         ] {
-            let mut c = cell.level(kind);
-            if let Some(b) = beyond {
-                c += 0.5 * b.level(kind);
-            }
-            let k = world.channel(kind).k * ant.traits.sensitivity;
-            f[slot] = perceived(c, k);
+            // Nothing is sensed behind: headings outside the sweep carry
+            // no pheromone information, so turning back is governed by the
+            // turning cost alone. U-turns then happen where the trail
+            // ahead has faded and hardly ever on a strong trail (Beckers,
+            // Deneubourg & Goss 1992, *J. Theor. Biol.* 159:397).
+            let c = if ahead {
+                let mut c = world.level_at(one, kind);
+                if second {
+                    c += 0.5 * world.level_at(two, kind);
+                }
+                c
+            } else {
+                0.0
+            };
+            let k_half = world.channel(kind).k * ant.traits.sensitivity;
+            f[slot] = perceived(c, k_half);
         }
-        f[F_FOOD] = if cell.food > 0 { 1.0 } else { 0.0 };
-        f[F_NEST] = if cell.terrain == Terrain::Nest {
+        let food_at = |p: Point| world.cell(p.cell()).map(|c| c.has_food()).unwrap_or(false);
+        f[F_FOOD] = if food_at(target) || food_at(one) {
+            1.0
+        } else if second && food_at(two) {
+            0.5
+        } else {
+            0.0
+        };
+        f[F_NEST] = if world.is_nest(target_cell) { 1.0 } else { 0.0 };
+        f[F_HEADING] = turn_persistence(k);
+        f[F_HOME_VECTOR] = cosine(heading, nest_dir);
+        f[F_SITE] = cosine(heading, site_dir);
+        f[F_ROUTE] = route_dir
+            .map(|(v, w)| w * cosine(heading, Some(v)))
+            .unwrap_or(0.0);
+        f[F_RECENT] = if target_cell != here && ant.recently_visited(target_cell) {
             1.0
         } else {
             0.0
         };
-        f[F_HEADING] = ant.heading.cosine(*dir);
-        f[F_HOME_VECTOR] = cosine(*dir, nest_dir);
-        f[F_SITE] = cosine(*dir, site_dir);
-        f[F_RECENT] = if ant.recently_visited(target) {
-            1.0
-        } else {
-            0.0
-        };
-        f[F_CROWD] = cell.occupancy.min(4) as f64 / 4.0;
+        f[F_CROWD] = world
+            .cell(target_cell)
+            .map(|c| c.occupancy.min(4) as f64 / 4.0)
+            .unwrap_or(0.0);
+        f[F_WALL] = if reach < 2.0 - 1e-9 { 1.0 } else { 0.0 };
     }
     obs
 }
@@ -494,6 +679,7 @@ pub fn observe(ant: &Ant, world: &World, species: &Species, mode: Mode) -> Obser
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::landscape::ring_index_of;
     use crate::world::{FoodSource, WorldConfig};
 
     fn world() -> World {
@@ -505,8 +691,8 @@ mod tests {
             food_sources: vec![FoodSource {
                 center: Position::new(2, 2),
                 radius: 0,
-                amount_per_cell: 3,
-                quality: 1.0,
+                volume_ul_per_cell: 3.0,
+                molarity: 1.0,
             }],
             random_food: None,
             ..WorldConfig::default()
@@ -514,11 +700,11 @@ mod tests {
         World::new(cfg, &mut Rng::seed_from_u64(0))
     }
 
-    fn ant_at(p: Position, heading: Direction) -> Ant {
+    fn ant_at(cell: Position, heading: f64) -> Ant {
         let species = Species::lasius_niger();
         let traits = Traits::draw(&species, 2.0, 1.0, &mut Rng::seed_from_u64(1));
         let mut a = Ant::new(0, Position::new(5, 5), heading, 0, traits, 100.0);
-        a.position = p;
+        a.position = Point::center_of(cell);
         a.activity = Activity::Outbound;
         a
     }
@@ -527,70 +713,89 @@ mod tests {
     fn observation_masks_edges_and_uses_the_mode_block() {
         let w = world();
         let species = Species::lasius_niger();
-        let mut ant = ant_at(Position::new(0, 0), Direction::East);
+        let east = 0.0;
+        let mut ant = ant_at(Position::new(0, 0), east);
         ant.home_vector = (-5.0, -5.0);
-        let obs = observe(&ant, &w, &species, Mode::Outbound);
-        assert_eq!(obs.valid_count(), 3);
-        assert!(!obs.valid[Direction::North.index()]);
-        let se = &obs.features[Direction::SouthEast.index()];
-        assert!(se[BASE_FEATURES..].iter().all(|x| *x == 0.0));
-        assert!(se[F_HOME_VECTOR] > 0.9, "south-east points home");
-        let obs = observe(&ant, &w, &species, Mode::Inbound);
-        let se = &obs.features[Direction::SouthEast.index()];
-        assert!(se[..BASE_FEATURES].iter().all(|x| *x == 0.0));
-        assert!(se[BASE_FEATURES + F_HOME_VECTOR] > 0.9);
+        let obs = observe(&ant, &w, &species, Mode::Outbound, 0.75);
+        // Headings pointing up or left leave the grid.
+        assert!(obs.valid[0], "east is open");
+        assert!(!obs.valid[RING / 2], "west leaves the grid");
+        assert!(!obs.valid[RING * 3 / 4], "north leaves the grid");
+        assert!(obs.valid[RING / 4], "south is open");
+        let se = ring_index_of(std::f64::consts::FRAC_PI_4, east);
+        let f = &obs.features[se];
+        assert!(f[BASE_FEATURES..].iter().all(|x| *x == 0.0));
+        assert!(f[F_HOME_VECTOR] > 0.99, "south-east points home");
+        let obs = observe(&ant, &w, &species, Mode::Inbound, 0.75);
+        let f = &obs.features[se];
+        assert!(f[..BASE_FEATURES].iter().all(|x| *x == 0.0));
+        assert!(f[BASE_FEATURES + F_HOME_VECTOR] > 0.99);
+        assert!((obs.features[0][BASE_FEATURES + F_HEADING] - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    fn pheromone_features_are_perceived_and_swept() {
+    fn pheromone_features_are_sampled_and_swept() {
         let mut w = world();
         let species = Species::lasius_niger();
         w.deposit(Position::new(6, 5), Pheromone::Trail, 40.0);
         w.deposit(Position::new(7, 5), Pheromone::Trail, 40.0);
-        let mut ant = ant_at(Position::new(5, 5), Direction::East);
+        let mut ant = ant_at(Position::new(5, 5), 0.0);
         ant.traits.sensitivity = 1.0;
-        let obs = observe(&ant, &w, &species, Mode::Outbound);
-        let east = obs.features[Direction::East.index()][F_TRAIL];
+        let obs = observe(&ant, &w, &species, Mode::Outbound, 0.75);
+        let east = obs.features[0][F_TRAIL];
         assert!(
-            (east - perceived(60.0, 20.0)).abs() < 1e-12,
+            (east - perceived(60.0, 20.0)).abs() < 1e-9,
             "sweep adds half the second cell"
         );
-        assert_eq!(obs.features[Direction::West.index()][F_TRAIL], 0.0);
+        assert_eq!(obs.features[RING / 2][F_TRAIL], 0.0);
         let mut near = Species::lasius_niger();
         near.sense_range = 1;
-        let obs = observe(&ant, &w, &near, Mode::Outbound);
-        assert!(
-            (obs.features[Direction::East.index()][F_TRAIL] - perceived(40.0, 20.0)).abs() < 1e-12
-        );
+        let obs = observe(&ant, &w, &near, Mode::Outbound, 0.75);
+        assert!((obs.features[0][F_TRAIL] - perceived(40.0, 20.0)).abs() < 1e-9);
     }
 
     #[test]
-    fn food_memory_and_site_features() {
+    fn food_memory_route_and_wall_features() {
         let w = world();
         let species = Species::lasius_niger();
-        let mut ant = ant_at(Position::new(2, 3), Direction::North);
+        let north = -std::f64::consts::FRAC_PI_2;
+        let mut ant = ant_at(Position::new(2, 3), north);
         ant.remember(Position::new(3, 3));
         ant.home_vector = (-3.0, -2.0);
         ant.site = Some(Site {
             vector: (-3.0, -12.0),
             quality: 1.0,
         });
-        let obs = observe(&ant, &w, &species, Mode::Outbound);
-        assert_eq!(obs.features[Direction::North.index()][F_FOOD], 1.0);
-        assert_eq!(obs.features[Direction::East.index()][F_RECENT], 1.0);
-        assert_eq!(obs.features[Direction::West.index()][F_RECENT], 0.0);
-        assert!((obs.features[Direction::North.index()][F_HEADING] - 1.0).abs() < 1e-12);
-        assert!((obs.features[Direction::North.index()][F_SITE] - 1.0).abs() < 1e-12);
+        ant.learn_route_out(Position::new(2, 3), (0.0, -1.0), 0.3, 10);
+        let obs = observe(&ant, &w, &species, Mode::Outbound, 0.75);
+        assert_eq!(obs.features[0][F_FOOD], 1.0, "food straight ahead");
+        assert_eq!(
+            obs.features[RING / 4][F_RECENT],
+            1.0,
+            "east was just visited"
+        );
+        assert_eq!(obs.features[RING / 2][F_RECENT], 0.0);
+        assert!((obs.features[0][F_SITE] - 1.0).abs() < 1e-12);
+        assert!(
+            (obs.features[0][F_ROUTE] - 1.0 / 3.0).abs() < 1e-12,
+            "one visit gives a third"
+        );
         assert!((ant.believed_distance_to_site().unwrap() - 10.0).abs() < 1e-12);
+        // Two cells north of (2,1) is off the grid: wall ahead.
+        let mut edge = ant_at(Position::new(2, 1), north);
+        edge.site = None;
+        let obs = observe(&edge, &w, &species, Mode::Outbound, 0.5);
+        assert_eq!(obs.features[0][F_WALL], 1.0);
+        assert_eq!(obs.features[RING / 4][F_WALL], 0.0);
     }
 
     #[test]
     fn path_integration_accumulates_with_noise() {
         let species = Species::lasius_niger();
         let mut rng = Rng::seed_from_u64(7);
-        let mut ant = ant_at(Position::new(5, 5), Direction::East);
+        let mut ant = ant_at(Position::new(5, 5), 0.0);
         for _ in 0..100 {
-            ant.integrate(Direction::East, &species, &mut rng);
+            ant.integrate(1.0, 0.0, &species, &mut rng);
         }
         let d = ant.believed_distance_home();
         assert!(
@@ -602,17 +807,50 @@ mod tests {
             "heading noise stays modest: {:?}",
             ant.home_vector
         );
-        let (nx, _) = ant.believed_nest_direction();
+        let (nx, _) = ant.believed_nest_direction().unwrap();
         assert!(nx < 0.0);
+        ant.lost = true;
+        assert!(ant.believed_nest_direction().is_none());
         ant.reset_home_vector();
-        assert_eq!(ant.believed_distance_home(), 0.0);
+        assert!(!ant.lost && ant.believed_distance_home() == 0.0);
         let exact = Species {
             pi_heading_noise_deg: 0.0,
             pi_distance_noise: 0.0,
             ..species
         };
-        ant.integrate(Direction::NorthEast, &exact, &mut rng);
+        ant.integrate(1.0, -1.0, &exact, &mut rng);
         assert!((ant.home_vector.0 - 1.0).abs() < 1e-12 && (ant.home_vector.1 + 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn route_memory_learns_and_recalibrates() {
+        let mut ant = ant_at(Position::new(4, 4), 0.0);
+        let c = Position::new(4, 4);
+        ant.learn_route_home(c, (-4.0, 0.0), 0.5, 3);
+        assert_eq!(ant.route(c).unwrap().home, (-4.0, 0.0));
+        ant.learn_route_home(c, (-2.0, 0.0), 0.5, 3);
+        assert!((ant.route(c).unwrap().home.0 + 3.0).abs() < 1e-12);
+        assert_eq!(ant.route(c).unwrap().home_strength, 2.0);
+        // Capacity evicts the least recently used place.
+        ant.age = 10;
+        ant.learn_route_home(Position::new(1, 1), (0.0, 0.0), 0.5, 3);
+        ant.age = 20;
+        ant.learn_route_home(Position::new(2, 2), (0.0, 0.0), 0.5, 3);
+        ant.age = 30;
+        ant.learn_route_home(Position::new(3, 3), (0.0, 0.0), 0.5, 3);
+        assert_eq!(ant.familiar_places(), 3);
+        assert!(ant.route(c).is_none(), "the oldest place was forgotten");
+        // Recalibration pulls the estimate towards the remembered vector.
+        let d = Position::new(7, 7);
+        ant.learn_route_home(d, (-7.0, -7.0), 0.5, 10);
+        ant.home_vector = (10.0, 10.0);
+        assert!(!ant.recalibrate(d, 0.5), "one visit is not enough");
+        ant.learn_route_home(d, (-7.0, -7.0), 0.5, 10);
+        ant.lost = true;
+        assert!(ant.recalibrate(d, 0.5));
+        assert!(!ant.lost);
+        assert!(ant.home_vector.0 < 10.0 && ant.home_vector.0 > 7.0);
+        assert!(!ant.recalibrate(Position::new(9, 9), 0.5));
     }
 
     #[test]
@@ -631,5 +869,8 @@ mod tests {
         assert!(Activity::Nursing.is_inside());
         assert!(Activity::Searching.is_moving() && Activity::Searching.is_foraging());
         assert_eq!(Activity::Feeding.name(), "feeding");
+        let ant = ant_at(Position::new(3, 3), 0.0);
+        assert_eq!(ant.cell(), Position::new(3, 3));
+        assert!(!ant.carrying());
     }
 }
