@@ -300,12 +300,13 @@ pub struct WorldConfig {
     /// `k`, below which a node of that channel may be coarse: a node
     /// whose cells are all below half of it is composed into its mean,
     /// and a coarse node whose mean reaches it is refined into cells
-    /// again. A coarse node reads as the interpolation of the means
-    /// around it, so the field keeps its gradient at the grain.
+    /// again.
     pub coarse_below: f64,
     /// The same for the volatile channels (the smell of food, alarm),
     /// which spread through the air over the whole field and are read
-    /// at the grain beyond their near field.
+    /// at the grain beyond their near field, a coarse node reading as
+    /// the interpolation of the means around it so that a smell keeps
+    /// its gradient there.
     pub coarse_below_volatile: f64,
     /// Corpses scattered at random over open cells when the world is built
     /// (the arenas of the cemetery-formation experiments).
@@ -393,6 +394,14 @@ struct Grain {
     active: Vec<[bool; Pheromone::COUNT]>,
     /// Per node and channel, the mean concentration of a coarse node.
     mean: Vec<[f64; Pheromone::COUNT]>,
+    /// Per node and channel, the mean concentration of every node as of
+    /// the last sweep, active or coarse.
+    avg: Vec<[f64; Pheromone::COUNT]>,
+    /// Per node and channel, the gradient of the mean across a coarse
+    /// node's neighbours, per cell, as of the last sweep (volatiles
+    /// only): a coarse node reads as a plane, so a smell keeps its
+    /// gradient at the grain.
+    grad: Vec<[(f64, f64); Pheromone::COUNT]>,
     /// Sweep scratch: the mass flowing into a coarse node, its own mass
     /// after evaporation and outflow, and whether the front of the field
     /// has reached it (an active cell at its door above the threshold).
@@ -401,6 +410,9 @@ struct Grain {
     touched: Vec<bool>,
     /// Per channel, the concentration below which a node may be coarse.
     threshold: [f64; Pheromone::COUNT],
+    /// Per channel, whether it spreads through the air and is read at
+    /// the grain by interpolation where coarse.
+    volatile: [bool; Pheromone::COUNT],
     since_coarsen: u32,
     /// Corpses per node, for counts over regions.
     corpses: Vec<u32>,
@@ -430,20 +442,25 @@ impl Grain {
             walled: vec![false; n],
             active: vec![[false; Pheromone::COUNT]; n],
             mean: vec![[0.0; Pheromone::COUNT]; n],
+            avg: vec![[0.0; Pheromone::COUNT]; n],
+            grad: vec![[(0.0, 0.0); Pheromone::COUNT]; n],
             inflow: vec![0.0; n],
             pool: vec![0.0; n],
             touched: vec![false; n],
             threshold: [0.0; Pheromone::COUNT],
+            volatile: [false; Pheromone::COUNT],
             since_coarsen: 0,
             corpses: vec![0; n],
         };
         for (k, p) in params.iter().enumerate() {
-            let below = if Pheromone::ALL[k].is_volatile() {
+            let volatile = Pheromone::ALL[k].is_volatile();
+            let below = if volatile {
                 config.coarse_below_volatile
             } else {
                 config.coarse_below
             };
             g.threshold[k] = below.max(0.0) * p.k.max(1e-9);
+            g.volatile[k] = volatile;
         }
         for node in 0..n {
             let (x0, y0, x1, y1) = g.rect(node);
@@ -534,8 +551,35 @@ impl Grain {
             }
         }
         let open = self.open[node] as f64;
-        self.mean[node][k] = if open > 0.0 { sum / open } else { 0.0 };
+        let mean = if open > 0.0 { sum / open } else { 0.0 };
+        self.mean[node][k] = mean;
+        self.avg[node][k] = mean;
         self.active[node][k] = false;
+    }
+
+    /// The gradients of a volatile channel across the coarse nodes,
+    /// from the means of their neighbours (one-sided at the grid's
+    /// edge), per cell.
+    fn gradients(&mut self, k: usize) {
+        let side = (1usize << self.shift) as f64;
+        for node in 0..self.cols * self.rows {
+            if self.active[node][k] {
+                self.grad[node][k] = (0.0, 0.0);
+                continue;
+            }
+            let c = self.avg[node][k];
+            let along = |a: Option<usize>, b: Option<usize>, g: &Grain| -> f64 {
+                match (a, b) {
+                    (Some(a), Some(b)) => (g.avg[b][k] - g.avg[a][k]) / (2.0 * side),
+                    (None, Some(b)) => (g.avg[b][k] - c) / side,
+                    (Some(a), None) => (c - g.avg[a][k]) / side,
+                    (None, None) => 0.0,
+                }
+            };
+            let gx = along(self.neighbour(node, 3), self.neighbour(node, 1), self);
+            let gy = along(self.neighbour(node, 0), self.neighbour(node, 2), self);
+            self.grad[node][k] = (gx, gy);
+        }
     }
 }
 
@@ -1082,60 +1126,37 @@ impl World {
     }
 
     /// The field of a channel at a cell: the cell's own value in an
-    /// active node; in a coarse one, the means of the nodes around it
-    /// interpolated to the cell (an active node in the stencil counts
-    /// with its cell nearest the reader), so that the field keeps its
-    /// gradient at the grain.
+    /// active node; in a coarse one, the node's mean for a substrate
+    /// mark (faint there by construction), and for a volatile the means
+    /// of the nodes around it interpolated to the cell (an active node
+    /// in the stencil counting with its cell nearest the reader), so
+    /// that a smell keeps its gradient at the grain.
     #[inline]
     fn read(&self, idx: usize, p: Position, k: usize) -> f64 {
         if let Some(g) = &self.grain {
             let node = g.node_of(p.x as usize, p.y as usize);
             if !g.active[node][k] {
-                return self.read_coarse(g, node, p, k);
+                return if g.volatile[k] {
+                    self.read_coarse(g, node, p, k)
+                } else {
+                    g.mean[node][k]
+                };
             }
         }
         self.cells[idx].pheromone[k]
     }
 
-    /// The interpolated reading of a coarse node at a cell.
+    /// The reading of a coarse node at a cell for a volatile: the plane
+    /// through the node's mean with the gradient of its neighbours'
+    /// means, never below zero.
+    #[inline]
     fn read_coarse(&self, g: &Grain, node: usize, p: Position, k: usize) -> f64 {
-        let side = (1usize << g.shift) as f64;
-        // Offset of the cell centre from the node centre, in node sides.
-        let col = node % g.cols;
-        let row = node / g.cols;
-        let fx = (p.x as f64 + 0.5 - (col as f64 + 0.5) * side) / side;
-        let fy = (p.y as f64 + 0.5 - (row as f64 + 0.5) * side) / side;
-        let (dc, wx) = if fx >= 0.0 { (1i64, fx) } else { (-1i64, -fx) };
-        let (dr, wy) = if fy >= 0.0 { (1i64, fy) } else { (-1i64, -fy) };
-        let value_of = |c: i64, r: i64| -> f64 {
-            if c < 0 || r < 0 || c >= g.cols as i64 || r >= g.rows as i64 {
-                return g.mean[node][k];
-            }
-            let n = r as usize * g.cols + c as usize;
-            if g.active[n][k] {
-                // The cell of the active node nearest the reader.
-                let (x0, y0, x1, y1) = g.rect(n);
-                let x = (p.x as usize).clamp(x0, x1 - 1);
-                let y = (p.y as usize).clamp(y0, y1 - 1);
-                let c = &self.cells[y * self.config.width + x];
-                if c.terrain == Terrain::Wall {
-                    g.mean[node][k]
-                } else {
-                    c.pheromone[k]
-                }
-            } else {
-                g.mean[n][k]
-            }
-        };
-        let (c0, r0) = (col as i64, row as i64);
-        let v00 = g.mean[node][k];
-        let v10 = value_of(c0 + dc, r0);
-        let v01 = value_of(c0, r0 + dr);
-        let v11 = value_of(c0 + dc, r0 + dr);
-        (1.0 - wx) * (1.0 - wy) * v00
-            + wx * (1.0 - wy) * v10
-            + (1.0 - wx) * wy * v01
-            + wx * wy * v11
+        let mask = (1usize << g.shift) - 1;
+        let half = (1usize << g.shift) as f64 / 2.0;
+        let fx = ((p.x as usize) & mask) as f64 + 0.5 - half;
+        let fy = ((p.y as usize) & mask) as f64 + 0.5 - half;
+        let (gx, gy) = g.grad[node][k];
+        (g.mean[node][k] + gx * fx + gy * fy).max(0.0)
     }
 
     /// Refine the node holding a cell for a channel, if it is coarse.
@@ -1526,6 +1547,7 @@ impl World {
             for node in 0..nodes {
                 if g.active[node][k] {
                     let (x0, y0, x1, y1) = g.rect(node);
+                    let mut sum = 0.0;
                     for y in y0..y1 {
                         for x in x0..x1 {
                             let idx = y * w + x;
@@ -1533,11 +1555,14 @@ impl World {
                             // node is composed into its mean instead.
                             let value = self.scratch[idx][k].min(cap);
                             self.cells[idx].pheromone[k] = value;
+                            sum += value;
                             if value > 0.0 {
                                 present[k] = true;
                             }
                         }
                     }
+                    let open = g.open[node] as f64;
+                    g.avg[node][k] = if open > 0.0 { sum / open } else { 0.0 };
                 } else {
                     let open = g.open[node] as f64;
                     let m = if open > 0.0 {
@@ -1547,6 +1572,7 @@ impl World {
                     };
                     let m = m.min(cap);
                     g.mean[node][k] = m;
+                    g.avg[node][k] = m;
                     if m > 0.0 {
                         present[k] = true;
                     }
@@ -1554,6 +1580,9 @@ impl World {
                         g.refine(k, node, &mut self.cells, w);
                     }
                 }
+            }
+            if g.volatile[k] {
+                g.gradients(k);
             }
         }
         g.since_coarsen += 1;
