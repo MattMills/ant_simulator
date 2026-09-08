@@ -158,22 +158,13 @@ impl BehavioralSurface {
         self
     }
 
-    /// A hand-tuned foraging instinct: follow food pheromone and pick up food
-    /// when empty-handed, follow home pheromone and head for the nest when
-    /// carrying, keep some momentum, avoid recently visited cells.
+    /// The foraging instinct of the default species
+    /// ([`crate::species::Species::lasius_niger`]): Deneubourg's choice
+    /// exponent on the recruitment trail, path integration home, site
+    /// fidelity out, at a fixed temperature of 1 so the pheromone response
+    /// is the published choice function.
     pub fn instinct() -> Self {
-        // Base (foraging) weights, indexed like `FEATURE_NAMES[0..8]`.
-        let foraging = [2.0, -0.3, 4.0, -1.0, 1.2, -0.4, -2.0, -0.5];
-        // Additive adjustments applied while carrying food.
-        let carrying = [-2.0, 2.3, -4.0, 5.0, -0.2, 2.4, 1.0, 0.5];
-        let mut weights = [0.0; FEATURES];
-        weights[..8].copy_from_slice(&foraging);
-        weights[8..].copy_from_slice(&carrying);
-        BehavioralSurface {
-            weights,
-            entropy: EntropyControl::absolute(0.35),
-            deformation: Deformation::none(),
-        }
+        crate::species::Species::lasius_niger().instinct()
     }
 
     /// Score of one candidate action's feature vector.

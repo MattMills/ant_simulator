@@ -17,15 +17,20 @@ fn colony_with_default_hierarchy_forages() {
         ants: 40,
         ..SimConfig::default()
     };
-    let mut sim = Simulation::new(config, 3);
-    sim.run(500);
+    let mut sim = Simulation::new(config.clone(), 3);
+    sim.run(1500);
     let s = sim.stats();
     assert!(s.food_delivered >= 5, "expected foraging to work: {s:?}");
+    // Under the biological default the temperature is fixed and entropy
+    // simply reports what the choice function does; an entropy dial pins it.
+    let mut dialed = Simulation::new(config, 3);
+    dialed.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.35);
+    dialed.run(600);
     let target = 0.35 * (8f64).ln();
+    let h = dialed.stats().mean_entropy();
     assert!(
-        (s.mean_entropy() - target).abs() < 0.25,
-        "mean entropy {} should track the dial ({target})",
-        s.mean_entropy()
+        (h - target).abs() < 0.25,
+        "mean entropy {h} should track the dial ({target})"
     );
 }
 
@@ -162,15 +167,19 @@ fn fresh_rotation_is_unlearnable_but_runs() {
 }
 
 fn geometry_run(deformation: Deformation, selection: Selection, seed: u64) -> Stats {
-    let config = SimConfig {
+    // A fixed entropy budget so that only its shape differs between runs.
+    let mut instinct = BehavioralSurface::instinct().with_deformation(deformation);
+    instinct.entropy = EntropyControl::absolute(0.35);
+    let mut config = SimConfig {
         world: world(),
         ants: 40,
         selection,
-        instinct: BehavioralSurface::instinct().with_deformation(deformation),
+        instinct,
         ..SimConfig::default()
     };
+    config.nest.initial_satiation = 0.05;
     let mut sim = Simulation::new(config, seed);
-    sim.run(300);
+    sim.run(900);
     sim.stats().clone()
 }
 
@@ -226,7 +235,19 @@ fn smoothing_keeps_paths_coherent() {
 fn sucker_with_short_reach_is_path_bound() {
     let free = geometry_run(Deformation::none(), Selection::Softmax, 6);
     let bound = geometry_run(Deformation::none(), Selection::Sucker { reach: 1 }, 6);
-    assert!(bound.path.straight_rate() > free.path.straight_rate() + 0.1);
+    // One proposal step can never turn more than 45° unless straight ahead
+    // is blocked, so sharp turns all but vanish.
+    let sharp = |s: &Stats| {
+        let m = s.path.moves.max(1) as f64;
+        s.path.turns[2..=6].iter().sum::<u64>() as f64 / m
+    };
+    assert!(sharp(&bound) < 0.05, "bound sharp turns {}", sharp(&bound));
+    assert!(
+        sharp(&free) > sharp(&bound) + 0.05,
+        "free {} vs bound {}",
+        sharp(&free),
+        sharp(&bound)
+    );
     assert!(bound.mean_selected_entropy() < bound.mean_entropy() - 0.05);
     let c = bound.path.ledger.contributions();
     assert!(c.selection < -0.05, "{c:?}");

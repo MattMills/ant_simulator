@@ -17,17 +17,14 @@ fn main() {
         _ => Selection::Softmax,
     };
 
+    let mut sim = SimConfig::default();
+    sim.world.seed = Some(2024);
+    sim.trace = true;
+    sim.selection = selection;
+    sim.nest.initial_satiation = 0.1;
     let config = ArenaConfig {
-        sim: SimConfig {
-            world: WorldConfig {
-                seed: Some(2024),
-                ..WorldConfig::default()
-            },
-            trace: true,
-            selection,
-            ..SimConfig::default()
-        },
-        steps_per_turn: 300,
+        sim,
+        steps_per_turn: 600,
         targets: ControlTargets::AllNodes,
         schedule: RotationSchedule::RandomStatic { period },
         feedback: FeedbackScope::Subtree,

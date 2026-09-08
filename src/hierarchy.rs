@@ -16,6 +16,7 @@
 //! machinery reads and writes.
 
 use crate::ant::FEATURES;
+use crate::entropy::Tempering;
 use crate::surface::{BehavioralSurface, Deformation, SurfaceError, PARAM_LEN};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -113,10 +114,22 @@ impl Node {
 pub struct EffectivePolicy {
     /// Sum of weights along the path.
     pub weights: [f64; FEATURES],
-    /// Composed entropy fraction in `[0, 1]`.
-    pub entropy_fraction: f64,
+    /// Composed tempering: an entropy target or a fixed temperature.
+    pub tempering: Tempering,
     /// Sum of the raw deformation parameters along the path.
     pub deformation: Deformation,
+}
+
+impl EffectivePolicy {
+    /// The entropy fraction, if the path composes to an entropy target.
+    pub fn entropy_fraction(&self) -> Option<f64> {
+        self.tempering.fraction()
+    }
+
+    /// The temperature, if the path composes to a fixed temperature.
+    pub fn temperature(&self) -> Option<f64> {
+        self.tempering.temperature()
+    }
 }
 
 /// A tree of controllable nodes.
@@ -302,21 +315,21 @@ impl Hierarchy {
     /// Compose the surfaces along the path to `id`.
     pub fn effective(&self, id: NodeId) -> EffectivePolicy {
         let mut weights = [0.0; FEATURES];
-        let mut fraction: Option<f64> = None;
+        let mut tempering: Option<Tempering> = None;
         let mut deformation = Deformation::none();
         for &n in &self.paths[id] {
             let s = &self.nodes[n].surface;
             for (w, x) in weights.iter_mut().zip(&s.weights) {
                 *w += x;
             }
-            fraction = Some(s.entropy.effective(fraction));
+            tempering = Some(s.entropy.effective(tempering));
             deformation.smooth += s.deformation.smooth;
             deformation.rough += s.deformation.rough;
             deformation.reach += s.deformation.reach;
         }
         EffectivePolicy {
             weights,
-            entropy_fraction: fraction.unwrap_or(0.0),
+            tempering: tempering.unwrap_or(Tempering::Entropy(0.0)),
             deformation,
         }
     }
@@ -371,12 +384,12 @@ impl Hierarchy {
             };
             let _ = writeln!(
                 out,
-                "{}{} [{}] entropy: {} → effective {:.3}, |w| = {:.2}{}",
+                "{}{} [{}] dial: {} → effective {}, |w| = {:.2}{}",
                 "  ".repeat(n.depth),
                 n.name,
                 n.level,
                 n.surface.entropy.describe(),
-                eff.entropy_fraction,
+                eff.tempering.describe(),
                 eff.weights.iter().map(|w| w * w).sum::<f64>().sqrt(),
                 geometry
             );
@@ -423,21 +436,34 @@ mod tests {
     #[test]
     fn composition_along_path() {
         let mut h = Hierarchy::default();
+        h.node_mut(0).surface.entropy = EntropyControl::absolute(0.35);
         let root_eff = h.effective(0);
-        assert!((root_eff.entropy_fraction - 0.35).abs() < 1e-9);
+        assert!((root_eff.entropy_fraction().unwrap() - 0.35).abs() < 1e-9);
         h.node_mut(1).surface.weights[0] = 1.5;
         h.node_mut(1).surface.entropy = EntropyControl::relative(2.0);
         h.node_mut(2).surface.weights[0] = -0.5;
         let leaf = h.effective(2);
         let expected_w0 = BehavioralSurface::instinct().weights[0] + 1.5 - 0.5;
         assert!((leaf.weights[0] - expected_w0).abs() < 1e-12);
-        assert!((leaf.entropy_fraction - 0.7).abs() < 1e-9);
+        assert!((leaf.entropy_fraction().unwrap() - 0.7).abs() < 1e-9);
         let other = h.effective(5);
-        assert!((other.entropy_fraction - 0.35).abs() < 1e-9);
+        assert!((other.entropy_fraction().unwrap() - 0.35).abs() < 1e-9);
         let compiled = h.compile();
         assert_eq!(compiled.len(), 6);
         assert_eq!(compiled[0], leaf);
         assert!(leaf.deformation.is_none());
+    }
+
+    #[test]
+    fn default_instinct_is_a_fixed_temperature() {
+        let h = Hierarchy::default();
+        let eff = h.effective(2);
+        assert_eq!(eff.temperature(), Some(1.0));
+        assert!(eff.entropy_fraction().is_none());
+        let mut h = h;
+        h.node_mut(1).surface.entropy = EntropyControl::relative(0.5);
+        assert!((h.effective(2).temperature().unwrap() - 0.5).abs() < 1e-12);
+        assert!(h.describe().contains("temperature 1.000"));
     }
 
     #[test]

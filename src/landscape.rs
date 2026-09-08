@@ -27,7 +27,7 @@
 //! a walker parked on the peak ahead is narrower than the target, a walker
 //! still travelling towards a peak off to the side is broader.
 
-use crate::entropy::{entropy, softmax, tempered_distribution};
+use crate::entropy::{entropy, softmax, tempered_distribution, tempered_with, Tempering};
 use crate::geometry::Direction;
 use crate::rng::Rng;
 
@@ -198,11 +198,32 @@ impl Landscape {
         entropy(&probs)
     }
 
+    /// Fraction of the maximum entropy the landscape's distribution carries
+    /// at a temperature (0 if fewer than two positions are valid).
+    pub fn entropy_fraction_at(&self, temperature: f64) -> f64 {
+        let n = self.valid_count();
+        if n < 2 {
+            0.0
+        } else {
+            (self.entropy_at(temperature) / (n as f64).ln()).clamp(0.0, 1.0)
+        }
+    }
+
     /// Temper the landscape so its distribution carries `fraction` of the
     /// maximum entropy over the valid positions.
     pub fn temper(&self, fraction: f64) -> Tempered {
+        self.temper_with(Tempering::Entropy(fraction))
+    }
+
+    /// Temper the landscape by an entropy target or a fixed temperature.
+    pub fn temper_with(&self, tempering: Tempering) -> Tempered {
         let mut probs = [0.0; RING];
-        let (temperature, h) = tempered_distribution(&self.values, fraction, &mut probs);
+        let (temperature, h) = match tempering {
+            Tempering::Entropy(fraction) => {
+                tempered_distribution(&self.values, fraction, &mut probs)
+            }
+            Tempering::Temperature(_) => tempered_with(&self.values, tempering, &mut probs),
+        };
         let max = self
             .values
             .iter()
@@ -521,6 +542,10 @@ mod tests {
             "scaled landscape stays finite"
         );
         assert!(cold.probs[2] == 0.0);
+        let fixed = land.temper_with(Tempering::Temperature(1.0));
+        assert_eq!(fixed.temperature, 1.0);
+        assert!((fixed.probs[0] / fixed.probs[1] - (2.0f64 - 0.5).exp()).abs() < 1e-9);
+        assert!((land.entropy_fraction_at(1.0) - fixed.entropy / (8f64).ln()).abs() < 1e-12);
     }
 
     #[test]

@@ -128,14 +128,68 @@ pub fn tempered_distribution(logits: &[f64], fraction: f64, out: &mut [f64]) -> 
     (t, h)
 }
 
+/// How a landscape is to be tempered: by an entropy target or by a fixed
+/// temperature. This is what composing the dials along a path yields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tempering {
+    /// Solve the temperature so the distribution has this fraction of the
+    /// maximum entropy (entropic control).
+    Entropy(f64),
+    /// Divide the logits by this temperature and let the entropy fall where
+    /// it may (the biological choice function; `1.0` is Deneubourg's).
+    Temperature(f64),
+}
+
+impl Tempering {
+    /// The entropy fraction, if this is an entropy target.
+    pub fn fraction(&self) -> Option<f64> {
+        match self {
+            Tempering::Entropy(f) => Some(*f),
+            Tempering::Temperature(_) => None,
+        }
+    }
+
+    /// The temperature, if fixed.
+    pub fn temperature(&self) -> Option<f64> {
+        match self {
+            Tempering::Entropy(_) => None,
+            Tempering::Temperature(t) => Some(*t),
+        }
+    }
+
+    /// Scale the temperature (or, for an entropy target, raise the target
+    /// towards uniform) by a factor above one; used while searching.
+    pub fn heated(&self, factor: f64) -> Tempering {
+        match self {
+            Tempering::Entropy(f) => {
+                Tempering::Entropy((1.0 - (1.0 - f) / factor.max(1e-9)).clamp(0.0, 1.0))
+            }
+            Tempering::Temperature(t) => Tempering::Temperature(t * factor.max(1e-9)),
+        }
+    }
+
+    /// Human-readable description.
+    pub fn describe(&self) -> String {
+        match self {
+            Tempering::Entropy(f) => format!("entropy {f:.3}"),
+            Tempering::Temperature(t) => format!("temperature {t:.3}"),
+        }
+    }
+}
+
 /// The entropy dial carried by every node of the hierarchy.
 ///
-/// Both variants store an unconstrained real `raw` so learners can treat
+/// All variants store an unconstrained real `raw` so learners can treat
 /// every parameter as a free real number:
 ///
-/// * `Absolute`: the effective fraction is `sigmoid(raw)`, ignoring the parent.
-/// * `Relative`: the effective fraction is `parent × exp(raw)` (clamped to
-///   `[0, 1]`); with no parent it scales a neutral base of `0.5`.
+/// * `Absolute`: the effective entropy fraction is `sigmoid(raw)`, ignoring
+///   the parent.
+/// * `Fixed`: the effective temperature is `exp(raw)`, ignoring the parent.
+///   With `raw = 0` the logits are used as they are, which for the
+///   pheromone features is Deneubourg's choice function.
+/// * `Relative`: scales what it inherits by `exp(raw)`: an entropy fraction
+///   (clamped to `[0, 1]`) or a temperature. With no parent it scales a
+///   neutral entropy fraction of `0.5`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EntropyControl {
     /// Set the entropy fraction outright.
@@ -143,9 +197,14 @@ pub enum EntropyControl {
         /// Logit of the fraction.
         raw: f64,
     },
-    /// Scale the inherited entropy fraction.
+    /// Scale the inherited setting.
     Relative {
         /// Natural log of the gain.
+        raw: f64,
+    },
+    /// Set the temperature outright.
+    Fixed {
+        /// Natural log of the temperature.
         raw: f64,
     },
 }
@@ -168,10 +227,19 @@ impl EntropyControl {
         }
     }
 
+    /// Fixed temperature.
+    pub fn fixed(temperature: f64) -> Self {
+        EntropyControl::Fixed {
+            raw: temperature.max(1e-12).ln(),
+        }
+    }
+
     /// The unconstrained parameter.
     pub fn raw(&self) -> f64 {
         match self {
-            EntropyControl::Absolute { raw } | EntropyControl::Relative { raw } => *raw,
+            EntropyControl::Absolute { raw }
+            | EntropyControl::Relative { raw }
+            | EntropyControl::Fixed { raw } => *raw,
         }
     }
 
@@ -181,7 +249,9 @@ impl EntropyControl {
             return;
         }
         match self {
-            EntropyControl::Absolute { raw } | EntropyControl::Relative { raw } => *raw = value,
+            EntropyControl::Absolute { raw }
+            | EntropyControl::Relative { raw }
+            | EntropyControl::Fixed { raw } => *raw = value,
         }
     }
 
@@ -190,22 +260,27 @@ impl EntropyControl {
         matches!(self, EntropyControl::Absolute { .. })
     }
 
-    /// Set the fraction (for `Absolute`) or gain (for `Relative`) directly.
+    /// Set the fraction (`Absolute`), gain (`Relative`) or temperature
+    /// (`Fixed`) directly.
     pub fn set_level(&mut self, level: f64) {
         match self {
             EntropyControl::Absolute { raw } => *raw = logit(level),
-            EntropyControl::Relative { raw } => *raw = level.max(1e-12).ln(),
+            EntropyControl::Relative { raw } | EntropyControl::Fixed { raw } => {
+                *raw = level.max(1e-12).ln()
+            }
         }
     }
 
-    /// Effective entropy fraction given the parent's effective fraction.
-    pub fn effective(&self, parent: Option<f64>) -> f64 {
+    /// Effective tempering given the parent's.
+    pub fn effective(&self, parent: Option<Tempering>) -> Tempering {
         match self {
-            EntropyControl::Absolute { raw } => sigmoid(*raw),
-            EntropyControl::Relative { raw } => {
-                let base = parent.unwrap_or(Self::ORPHAN_BASE);
-                (base * raw.exp()).clamp(0.0, 1.0)
-            }
+            EntropyControl::Absolute { raw } => Tempering::Entropy(sigmoid(*raw)),
+            EntropyControl::Fixed { raw } => Tempering::Temperature(raw.exp()),
+            EntropyControl::Relative { raw } => match parent {
+                Some(Tempering::Temperature(t)) => Tempering::Temperature(t * raw.exp()),
+                Some(Tempering::Entropy(f)) => Tempering::Entropy((f * raw.exp()).clamp(0.0, 1.0)),
+                None => Tempering::Entropy((Self::ORPHAN_BASE * raw.exp()).clamp(0.0, 1.0)),
+            },
         }
     }
 
@@ -214,6 +289,19 @@ impl EntropyControl {
         match self {
             EntropyControl::Absolute { raw } => format!("absolute {:.3}", sigmoid(*raw)),
             EntropyControl::Relative { raw } => format!("gain ×{:.3}", raw.exp()),
+            EntropyControl::Fixed { raw } => format!("temperature {:.3}", raw.exp()),
+        }
+    }
+}
+
+/// Temper logits according to a [`Tempering`]. Returns `(temperature, entropy)`.
+pub fn tempered_with(logits: &[f64], tempering: Tempering, out: &mut [f64]) -> (f64, f64) {
+    match tempering {
+        Tempering::Entropy(fraction) => tempered_distribution(logits, fraction, out),
+        Tempering::Temperature(t) => {
+            let t = t.max(1e-12);
+            softmax(logits, t, out);
+            (t, entropy(out))
         }
     }
 }
@@ -270,19 +358,68 @@ mod tests {
         assert!((h1 - max_entropy(7)).abs() < 1e-3);
     }
 
+    fn frac(t: Tempering) -> f64 {
+        t.fraction().expect("entropy target")
+    }
+
     #[test]
     fn entropy_control_composition() {
         let root = EntropyControl::absolute(0.4);
-        assert!((root.effective(None) - 0.4).abs() < 1e-9);
+        assert!((frac(root.effective(None)) - 0.4).abs() < 1e-9);
         let child = EntropyControl::relative(2.0);
-        assert!((child.effective(Some(0.4)) - 0.8).abs() < 1e-9);
-        assert_eq!(child.effective(Some(0.9)), 1.0);
-        assert!((child.effective(None) - 1.0).abs() < 1e-9);
+        assert!((frac(child.effective(Some(Tempering::Entropy(0.4)))) - 0.8).abs() < 1e-9);
+        assert_eq!(frac(child.effective(Some(Tempering::Entropy(0.9)))), 1.0);
+        assert!((frac(child.effective(None)) - 1.0).abs() < 1e-9);
         let mut c = EntropyControl::default();
-        assert!((c.effective(Some(0.3)) - 0.3).abs() < 1e-9);
+        assert!((frac(c.effective(Some(Tempering::Entropy(0.3)))) - 0.3).abs() < 1e-9);
         c.set_raw(f64::NAN);
         assert_eq!(c.raw(), 0.0);
         c.set_level(0.5);
-        assert!((c.effective(Some(0.6)) - 0.3).abs() < 1e-9);
+        assert!((frac(c.effective(Some(Tempering::Entropy(0.6)))) - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fixed_temperature_composes_multiplicatively() {
+        let root = EntropyControl::fixed(1.0);
+        assert_eq!(root.effective(None), Tempering::Temperature(1.0));
+        let child = EntropyControl::relative(0.5);
+        let eff = child.effective(Some(Tempering::Temperature(2.0)));
+        assert!((eff.temperature().unwrap() - 1.0).abs() < 1e-12);
+        assert!(eff.fraction().is_none());
+        let mut f = EntropyControl::fixed(3.0);
+        f.set_level(0.25);
+        assert!(
+            (f.effective(Some(Tempering::Entropy(0.9)))
+                .temperature()
+                .unwrap()
+                - 0.25)
+                .abs()
+                < 1e-12
+        );
+        assert!(f.describe().starts_with("temperature"));
+        assert!(
+            Tempering::Temperature(2.0)
+                .heated(2.0)
+                .temperature()
+                .unwrap()
+                > 3.99
+        );
+        let hot = Tempering::Entropy(0.4).heated(2.0);
+        assert!((hot.fraction().unwrap() - 0.7).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tempered_with_fixed_temperature_uses_logits_as_they_are() {
+        let logits = [2.0 * (1.0f64 + 40.0 / 20.0).ln(), 0.0];
+        let mut out = [0.0; 2];
+        let (t, h) = tempered_with(&logits, Tempering::Temperature(1.0), &mut out);
+        assert_eq!(t, 1.0);
+        assert!(
+            (out[0] - 0.9).abs() < 1e-12,
+            "Deneubourg's 0.9 for 40 vs 0 marks"
+        );
+        assert!(h > 0.0);
+        let (_, h2) = tempered_with(&logits, Tempering::Entropy(0.5), &mut out);
+        assert!((h2 - 0.5 * (2f64).ln()).abs() < 1e-3);
     }
 }

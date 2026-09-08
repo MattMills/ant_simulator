@@ -6,13 +6,10 @@
 use ant_simulator::prelude::*;
 
 fn base_config() -> SimConfig {
-    SimConfig {
-        world: WorldConfig {
-            seed: Some(2024),
-            ..WorldConfig::default()
-        },
-        ..SimConfig::default()
-    }
+    let mut cfg = SimConfig::default();
+    cfg.world.seed = Some(2024);
+    cfg.nest.initial_satiation = 0.1;
+    cfg
 }
 
 /// Derived measurements of one run, so several seeds can be averaged.
@@ -132,7 +129,7 @@ fn print_row(label: &str, m: &Metrics) {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let ticks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(400);
+    let ticks: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1200);
     let seeds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3);
     let sucker = Selection::Sucker { reach: 8 };
     let none = Deformation::none();
@@ -158,7 +155,7 @@ fn main() {
         ..base_config()
     };
     let mut sim = Simulation::new(config, 5);
-    sim.run(160);
+    sim.run(900);
     println!("{}", render_surface(sim.surface_trace(), 24));
 
     // 2. Same entropy budget, different geometry.

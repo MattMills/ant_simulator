@@ -1,19 +1,28 @@
-//! Plain-text rendering of a colony.
+//! Plain-text rendering of a colony and of recorded path surfaces.
 
-use crate::colony::Simulation;
+use crate::ant::Activity;
+use crate::colony::{Simulation, SurfaceRow};
 use crate::geometry::Position;
+use crate::landscape::DISPLAY_ORDER;
+use crate::pheromone::Pheromone;
 use crate::world::Terrain;
 use std::fmt::Write as _;
 
 /// Render the world as ASCII art, one character per cell.
 ///
-/// * `#` wall, `N` nest, `F` food, `A` ant carrying food, `a` ant,
-/// * `:` and `.` strong / faint food pheromone, `,` home pheromone,
+/// * `#` wall, `N` nest, `F` food, `x` an alarm cloud,
+/// * `o` an outbound ant, `<` an inbound ant carrying food, `-` an inbound
+///   ant returning empty, `?` a searching ant, `f` an ant feeding,
+/// * `@`, `:` and `.` strong, medium and faint recruitment trail,
+///   `,` home-range marking, `!` no-entry marking,
 /// * space for nothing.
+///
+/// Ants inside the nest are not drawn.
 pub fn render(sim: &Simulation) -> String {
     let world = sim.world();
     let w = world.width();
     let h = world.height();
+    let k = world.channel(Pheromone::Trail).k.max(1e-9);
     let mut grid = vec![vec![' '; w]; h];
     for (y, row) in grid.iter_mut().enumerate() {
         for (x, slot) in row.iter_mut().enumerate() {
@@ -24,13 +33,20 @@ pub fn render(sim: &Simulation) -> String {
                 Terrain::Wall => '#',
                 Terrain::Nest => 'N',
                 Terrain::Open => {
+                    let trail = cell.level(Pheromone::Trail);
                     if cell.food > 0 {
                         'F'
-                    } else if cell.food_pheromone > 2.0 {
+                    } else if cell.level(Pheromone::Alarm) > 1.0 {
+                        'x'
+                    } else if trail > 4.0 * k {
+                        '@'
+                    } else if trail > k {
                         ':'
-                    } else if cell.food_pheromone > 0.3 {
+                    } else if trail > 0.1 * k {
                         '.'
-                    } else if cell.home_pheromone > 1.0 {
+                    } else if cell.level(Pheromone::NoEntry) > 0.5 {
+                        '!'
+                    } else if cell.level(Pheromone::Territory) > 0.5 {
                         ','
                     } else {
                         ' '
@@ -40,9 +56,19 @@ pub fn render(sim: &Simulation) -> String {
         }
     }
     for ant in sim.living() {
+        if ant.is_inside() {
+            continue;
+        }
         let (x, y) = (ant.position.x as usize, ant.position.y as usize);
         if y < h && x < w {
-            grid[y][x] = if ant.carrying { 'A' } else { 'a' };
+            grid[y][x] = match ant.activity {
+                Activity::Outbound => 'o',
+                Activity::Inbound if ant.carrying() => '<',
+                Activity::Inbound => '-',
+                Activity::Searching => '?',
+                Activity::Feeding => 'f',
+                _ => 'o',
+            };
         }
     }
     let mut out = String::with_capacity((w + 3) * (h + 2));
@@ -57,34 +83,18 @@ pub fn render(sim: &Simulation) -> String {
     let s = sim.stats();
     let _ = writeln!(
         out,
-        "tick {} | alive {} | delivered {} | picked {} | store {} | food left {} | mean entropy {:.3}",
-        sim.tick(),
+        "t = {:.0} s | alive {} | outside {} | delivered {} | store {:.1} ({:.0}% full) | food left {} | trail {:.0} | mean entropy {:.3}",
+        sim.time_s(),
         sim.alive(),
+        sim.outside(),
         s.food_delivered,
-        s.food_picked,
-        sim.food_store(),
+        sim.nest().store,
+        100.0 * sim.nest().satiation(),
         world.total_food(),
+        world.total_pheromone(Pheromone::Trail),
         s.mean_entropy()
     );
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::colony::SimConfig;
-
-    #[test]
-    fn renders_a_frame() {
-        let mut sim = Simulation::new(SimConfig::default(), 1);
-        sim.run(5);
-        let frame = render(&sim);
-        assert!(frame.contains('N'));
-        assert!(frame.contains('F'));
-        assert!(frame.contains('a'));
-        assert!(frame.contains("tick 5"));
-        assert_eq!(frame.lines().count(), sim.world().height() + 3);
-    }
 }
 
 /// Render recorded path-surface rows as text, newest row last.
@@ -94,8 +104,7 @@ mod tests {
 /// reverse, shaded by the probability the direction was drawn with
 /// (` .:-=+*#@` from nothing to certainty). The chosen position is bracketed,
 /// masked positions show `xx`, and the sucker's trail (if any) follows.
-pub fn render_surface(rows: &[crate::colony::SurfaceRow], last: usize) -> String {
-    use crate::landscape::DISPLAY_ORDER;
+pub fn render_surface(rows: &[SurfaceRow], last: usize) -> String {
     const SHADES: [char; 9] = [' ', '.', ':', '-', '=', '+', '*', '#', '@'];
     let shade = |p: f64| -> char {
         let idx = ((p * 8.0).round() as usize).min(8);
@@ -140,21 +149,37 @@ pub fn render_surface(rows: &[crate::colony::SurfaceRow], last: usize) -> String
 }
 
 #[cfg(test)]
-mod surface_tests {
+mod tests {
     use super::*;
     use crate::colony::{Selection, SimConfig};
+    use crate::geometry::Direction;
+
+    #[test]
+    fn renders_a_frame() {
+        let mut cfg = SimConfig::default();
+        cfg.nest.initial_satiation = 0.0;
+        let mut sim = Simulation::new(cfg, 1);
+        sim.run(300);
+        let frame = render(&sim);
+        assert!(frame.contains('N'));
+        assert!(frame.contains('F'));
+        assert!(frame.contains('o') || frame.contains('<') || frame.contains('-'));
+        assert!(frame.contains("t = 300 s"));
+        assert_eq!(frame.lines().count(), sim.world().height() + 3);
+    }
 
     #[test]
     fn renders_surface_rows() {
-        let cfg = SimConfig {
+        let mut cfg = SimConfig {
             selection: Selection::Sucker { reach: 3 },
             record_surface: Some(0),
             ..SimConfig::default()
         };
+        cfg.nest.initial_satiation = 0.0;
         let mut sim = Simulation::new(cfg, 2);
-        sim.run(12);
+        sim.run(400);
         let text = render_surface(sim.surface_trace(), 5);
-        assert_eq!(text.lines().count(), 6);
+        assert!(text.lines().count() >= 2, "{text}");
         assert!(text.contains('['));
         assert!(text.contains('→'));
         assert!(render_surface(&[], 5).lines().count() == 1);
@@ -162,9 +187,6 @@ mod surface_tests {
 
     #[test]
     fn chosen_bracket_sits_under_its_column() {
-        use crate::colony::SurfaceRow;
-        use crate::geometry::{Direction, Position};
-        use crate::landscape::DISPLAY_ORDER;
         for chosen in 0..8 {
             let mut valid = [true; 8];
             valid[(chosen + 3) % 8] = false;

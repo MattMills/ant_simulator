@@ -1,14 +1,14 @@
 # ant_simulator
 
-An ant colony simulator, written in Rust with no dependencies, built around one
-idea:
+An ant colony simulator, written in Rust with no dependencies. Its foraging
+biology follows the literature (pheromone kinetics, Deneubourg's choice
+function, quality-modulated recruitment, path integration, response-threshold
+task allocation) and is validated against the classic experiments. On top of
+that biology sits one idea:
 
 > Behaviour is governed through **entropy**, by a **hierarchy of general
 > objects**, operated through **levers whose connections are hidden and rotate**
 > in a sequence that is random, but static, and therefore learnable.
-
-The colony is a real simulation (stigmergy, foraging, starvation,
-reproduction). The control system on top of it is the point.
 
 ## Concepts
 
@@ -16,65 +16,50 @@ reproduction). The control system on top of it is the point.
 | --- | --- |
 | System of categorization | [`Hierarchy`](src/hierarchy.rs): a tree such as `colony → castes → squads`, with the ants hanging off the leaves. Any shape can be specified. |
 | General object at every level | [`Node`](src/hierarchy.rs): every level is the same object. It owns a `BehavioralSurface` and controls everything beneath it. |
-| Entropic behavioral surface | [`BehavioralSurface`](src/surface.rs): a weight vector over the ant's senses (the surface: preferences over what to do) plus an [`EntropyControl`](src/entropy.rs) (the dial: how much disorder those preferences are executed with). |
-| Entropic control | On every decision the action distribution is *solved* to have exactly the requested fraction of maximum entropy. Dial at 0: the ant follows the surface deterministically. Dial at 1: a random walk. |
-| Control flows down the hierarchy | Surfaces add up along the root-to-leaf path; entropy dials compose (the root sets an absolute level, every level below scales what it inherits). |
-| Multiple learners | [`Learner`](src/learner/mod.rs) implementations: hill climbing, rotation search, cross-entropy method, policy gradient, an entropy-only bandit, plus static and random baselines. |
+| Entropic behavioral surface | [`BehavioralSurface`](src/surface.rs): a weight vector over the ant's senses plus an [`EntropyControl`](src/entropy.rs) dial. The dial either fixes a temperature (the biological default: 1 gives Deneubourg's choice function) or pins the entropy of every decision to a fraction of its maximum. |
+| Control flows down the hierarchy | Surfaces add up along the root-to-leaf path; dials compose (an absolute setting at the root, gains below). |
+| Multiple learners | [`Learner`](src/learner/mod.rs) implementations: hill climbing, rotation search, cross-entropy, policy gradient, dial bandits, plus static and random baselines. |
 | Randomly rotated in a sequence | [`Rotation`](src/rotation.rs): each turn maps levers to nodes. `RandomStatic { period }` draws `period` random permutations once and replays them forever. |
-| Learning to interact with an unknown connection | [`PhaseAware`](src/learner/phase_aware.rs) wraps any learner, infers the rotation period from the pattern of its own rewards, and keeps a separate copy of the learner per phase. |
-| The path as a surface flat in front of you | [`Landscape`](src/landscape.rs): the eight candidate directions as a ring around the ant's heading, scored by the effective surface; stacked along a trajectory they are the path's surface (`Simulation::surface_trace`, `render_surface`). |
-| Deformation over the deterministic information | The scores are the deterministic information. The entropy budget is spent on them through separable geometric channels: tempering, smoothing along the ring, and a random roughening field ([`Deformation`](src/surface.rs)). |
-| Geometric selection, like a sucker | [`Sucker`](src/landscape.rs): a walker that starts straight ahead and crawls the ring by local Metropolis moves for a bounded reach, settling in the basin it can get to (`Selection::Sucker`). |
-| Behaviour as separable entropy | The [`EntropyLedger`](src/landscape.rs) decomposes every decision's entropy into tempering, smoothing, roughening, selection, and the disorder the field injects between decisions; [`PathStats`](src/colony.rs) measures what that does to the paths. |
+| Learning to interact with an unknown connection | [`PhaseAware`](src/learner/phase_aware.rs) wraps any learner, infers the rotation period from its own rewards and parameter fingerprints, and keeps one learner per phase. |
+| The path as a surface flat in front of you | [`Landscape`](src/landscape.rs): the eight candidate directions as a ring around the heading, scored by the effective surface; recorded and rendered by `render_surface`. |
+| Deformation over the deterministic information | The scores are the deterministic information; the entropy budget is spent through separable geometric channels: tempering, smoothing along the ring, a random roughening field ([`Deformation`](src/surface.rs)). |
+| Geometric selection, like a sucker | [`Sucker`](src/landscape.rs): a walker that starts straight ahead and crawls the ring by local Metropolis moves for a bounded reach (`Selection::Sucker`). |
+| Behaviour as separable entropy | The [`EntropyLedger`](src/landscape.rs) decomposes each decision's entropy into tempering, smoothing, roughening, selection and between-decision field terms; [`PathStats`](src/colony.rs) measures what that does to the paths. |
+| Pheromonally styled | Five [`Pheromone`](src/pheromone.rs) channels with literature half-lives, diffusion, saturation and a saturating perception; four [`Species`](src/species.rs) profiles. |
+| Emergent behaviour | Trail formation, shortest-path selection, choice of the richer source, hunger-driven foraging and division of labour all arise from individual rules; the [`experiments`](src/experiments.rs) module reproduces the published setups. |
 
 A learner never sees the hierarchy. It gets a [`LeverView`](src/learner/mod.rs):
 the parameter vector at the far end of its lever, the turn number, and the
-reward from last time. Everything it knows about *what* it controls it has to
-infer from the regularity of the feedback: how the lever feels (the
-parameters it shows) and what it pays (the reward).
-
-A lever is a dial, not a memory. Every learner in the crate moves the surface
-*from where it finds it*: a bounded displacement that is kept if it paid and
-reverted if it did not. A learner that wrote a remembered configuration onto
-whatever it happened to be holding would, under a hidden rotation, overwrite
-the colony's instinct with a squad's blank slate. (That is exactly what the
-first version of the hill climber did, and the colony collapsed.)
+reward from last time. A lever is a dial, not a memory: every learner moves the
+surface from where it finds it with bounded, revertible displacements.
 
 ## Quick start
 
 ```rust
 use ant_simulator::prelude::*;
 
-// A colony on instinct alone.
-let mut sim = Simulation::new(SimConfig::default(), 42);
-sim.run(500);
+// A hungry colony of Lasius niger on a random map, one simulated hour.
+let mut cfg = SimConfig::default();
+cfg.nest.initial_satiation = 0.1;
+let mut sim = Simulation::new(cfg, 42);
+sim.run_seconds(3600.0);
 println!("{}", render(&sim));
-println!("{:?}", sim.stats());
+let s = sim.stats();
+println!("delivered {} loads; {:.0}% of ant-time outside; division of labour {:.2}",
+    s.food_delivered, 100.0 * s.foraging_fraction(), sim.division_of_labor());
 
-// Turn the colony-wide entropy dial down: ants follow their preferences
-// more strictly. Turn a single caste up: that caste alone becomes erratic.
-sim.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.15);
-let scouts = sim.hierarchy().find("caste-0").unwrap();
-sim.hierarchy_mut().node_mut(scouts).surface.entropy = EntropyControl::relative(3.0);
-sim.reset_stats();
-sim.run(500);
+// Another species, and the colony-wide temperature dial.
+let mut cfg = SimConfig::for_species(Species::argentine());
+cfg.nest.initial_satiation = 0.1;
+let mut sim = Simulation::new(cfg, 7);
+sim.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::fixed(0.5);
+sim.run_seconds(1800.0);
 
-// Spend the budget geometrically instead, and select with a sucker.
-let config = SimConfig {
-    selection: Selection::Sucker { reach: 8 },
-    instinct: BehavioralSurface::instinct().with_deformation(Deformation {
-        smooth: 1.0,
-        rough: 0.5,
-        reach: 0.0,
-    }),
-    record_surface: Some(0),
-    ..SimConfig::default()
-};
-let mut sim = Simulation::new(config, 7);
-sim.run(200);
-println!("{}", render_surface(sim.surface_trace(), 16));
-println!("{:?}", sim.stats().path.ledger.contributions());
-println!("turn entropy {:.3}", sim.stats().path.turn_entropy());
+// The double bridge, six replicates.
+let outcomes = run_double_bridge(&BridgeSpec::ratio_two(), &Species::argentine(),
+    80, 1800.0, 600.0, &[1, 2, 3, 4, 5, 6]);
+let summary = summarize(&outcomes.iter().map(|o| o.short_fraction).collect::<Vec<_>>());
+println!("short branch carries {:.0}% of traffic", 100.0 * summary.mean);
 ```
 
 ```rust
@@ -84,11 +69,16 @@ use ant_simulator::prelude::*;
 let learners: Vec<Box<dyn Learner>> = vec![
     Box::new(PhaseAware::new(HillClimber::new(0.2), 8)),
     Box::new(HillClimber::new(0.2)),
-    Box::new(PhaseAware::new(EntropyBandit::default(), 8)),
+    Box::new(PhaseAware::new(DialBandit::entropy(), 8)),
+    Box::new(PhaseAware::new(DialBandit::geometry(), 8)),
     Box::new(PolicyGradient::new(0.02)),
 ];
+let mut sim = SimConfig::default();
+sim.trace = true;
+sim.nest.initial_satiation = 0.1;
 let config = ArenaConfig {
-    sim: SimConfig { trace: true, ..SimConfig::default() },
+    sim,
+    steps_per_turn: 600,
     schedule: RotationSchedule::RandomStatic { period: 4 },
     targets: ControlTargets::AllNodes,
     feedback: FeedbackScope::Subtree,
@@ -97,131 +87,144 @@ let config = ArenaConfig {
 let mut arena = Arena::new(config, learners, 7).unwrap();
 let report = arena.run(100);
 println!("{report}");
-println!("{}", arena.hierarchy().describe());
 ```
+
+## The biological model
+
+Units are physical: cells of `cell_cm` centimetres (2 by default), ticks of
+`tick_s` seconds (1 by default); species parameters are in centimetres,
+seconds and pheromone "marks", and are converted on the way in.
+
+**Pheromones.** Every cell carries five channels: the recruitment *trail*,
+an optional outbound *home* trail (for bidirectional-trail models), colony
+*territory* marking (Devigne & Detrain 2002), the Pharaoh ant's repellent
+*no entry* marking (Robinson et al. 2005), and volatile *alarm* released at a
+worker's death. Each channel decays by first-order kinetics from its
+half-life, diffuses conservatively to orthogonal neighbours, and saturates
+on the substrate. Perception is `ln(1 + C/k)`; a weight `n` on that feature
+makes the movement softmax exactly Deneubourg's choice function
+`(k + C₁)ⁿ / Σ (k + Cⱼ)ⁿ` with `k = 20` marks and `n = 2` (Deneubourg, Aron,
+Goss & Pasteels 1990), extended from two branches to eight directions.
+
+**Senses and movement.** An ant scores its eight neighbouring cells on
+twelve features (the five channels through an antennal sweep two cells
+ahead, food, nest, heading persistence, alignment with its path-integrated
+home vector, alignment with a remembered site, recent visits, crowding),
+with a separate weight block for outbound and inbound movement. Speed is a
+species value in cm/s, lower when loaded and higher on a strong trail.
+
+**Foraging.** Feeding time and crop load rise with sugar concentration
+(Josens, Farina & Roces 1998). On the way home a forager lays trail with a
+probability and an intensity that rise with quality (Beckers, Deneubourg &
+Goss 1993). It navigates by path integration with odometric and heading
+noise (Müller & Wehner 1988), searches around the fictive location when its
+estimate runs out (Wehner & Srinivasan 1981), remembers a rewarding site and
+returns to it, but abandons poor sites with a quality-dependent probability
+(Mailleux, Deneubourg & Detrain 2000). Unsuccessful trips are given up after
+a species-specific time; Pharaoh's ants then mark the route as unrewarding.
+
+**Colony.** Loads are handed over by trophallaxis, slower in a satiated
+nest. The store's hunger and the excitation left by returning foragers make
+up the foraging stimulus; every worker engages by a response threshold
+`sⁿ / (sⁿ + θⁿ)` (Bonabeau, Theraulaz & Deneubourg 1996) drawn from a broad
+log-normal distribution, high in young workers (temporal polyethism), and
+reinforced while a task is performed (Theraulaz, Bonabeau & Deneubourg 1998).
+Nursing competes for the same workers, with a stimulus that falls as nurses
+are recruited. Inside workers consume the store; a queen lays eggs when the
+colony is fed; brood must be fed by nurses and emerges after its development
+time. Foragers face a predation hazard and starve without food.
+
+**Species** ([`Species`](src/species.rs)): *Lasius niger* (default; 1.5 cm/s,
+47-minute trail half-life, inbound trail laying), *Linepithema humile*
+(lays trail both ways, faster-decaying trail, the double-bridge species),
+*Monomorium pharaonis* (adds the no-entry marking), and *Cataglyphis* (no
+trail at all; fast, path-integrating solitary foragers). `Species::compressed`
+shortens life-history clocks (maturation, development, egg laying) for
+demonstrations without touching behavioural clocks.
+
+## Validation against the classic experiments
+
+`cargo run --release --example experiments` runs each setup in replicate;
+`tests/experiments.rs` asserts the same outcomes at smaller size.
+
+| Experiment | Published finding | Here (80 ants, 30 min, 6 replicates) |
+| --- | --- | --- |
+| Double bridge, long branch 2× short (Goss et al. 1989; Beckers et al. 1992) | traffic concentrates on the short branch | short branch carries 99–100% of late traffic in every run, for both the Argentine profile and *Lasius* |
+| Two sources at equal distance, 1.0 vs 0.1 quality (Beckers et al. 1990) | the colony focuses on the richer source | 81% ± 1% of loads from the rich source, majority in every run |
+| Colony satiation 0.05 → 1.0 (Mailleux et al. 2003) | hungrier colonies forage more | ant-time outside falls monotonically from 78% to 3% |
+| Threshold reinforcement (Theraulaz et al. 1998) | specialisation | division-of-labour index 0.44 with reinforcement, 0.27 without |
+| Equal branches (Deneubourg et al. 1990) | symmetry breaking onto one branch | see below |
+
+Symmetry breaking on equal branches is a marginal instability. With the
+model's assumptions matched (`pure_pheromone_feedback`: a trail that does
+not evaporate on the experiment's timescale and no behavioural negative
+feedback at junctions) one branch wins in a third to three quarters of
+45-minute runs, depending on colony size. With the full behavioural model the
+split stays near one half: a modest crowding term and the memory that stops
+ants dithering both act as negative feedback at the junction, and either is
+enough to hold the symmetric state. The crowding effect is itself documented
+(Dussutour, Fourcassié, Helbing & Deneubourg 2004). The crate exposes both
+regimes rather than hiding the sensitivity.
 
 ## Path surfaces: separable entropy, deformation, and geometric selection
 
 Every decision runs through a short geometric pipeline:
 
-1. **Deterministic information.** The effective surface scores the eight
-   walkable directions. Laid out as a ring around the heading (straight
-   ahead in the middle) this is the landscape in front of the ant.
-2. **Deformation with the entropy budget** `h` (the node's dial):
-   * *smoothing* blurs the landscape along the ring with a circular
-     Gaussian of scale `h × share × 2` ring steps: preference leaks to
-     neighbouring directions (angular disorder, path-coherent);
-   * *roughening* adds a random field of a few low Fourier modes with
-     amplitude `h × share × range`: random basins (landscape disorder,
-     path-incoherent);
-   * *tempering* solves the temperature so the deformed landscape's
-     distribution has exactly `h` of the maximum entropy.
-   The shares are per node (`Deformation { smooth, rough, reach }`, three
-   more parameters learners can move) and compose down the hierarchy like
-   the weights.
-3. **Selection.** `Selection::Softmax` draws globally from the tempered
-   distribution. `Selection::Sucker { reach }` starts a walker straight
-   ahead and lets it crawl the ring for `reach × exp(node reach)` local
-   Metropolis steps; it goes where it can get to. Reach 0 never turns, reach
-   1 turns at most 45°, and by reach 8 the walker is nearly a global draw
-   unless the landscape has a valley between it and the peak.
+1. **Deterministic information.** The effective surface scores the
+   walkable directions. Laid out as a ring around the heading this is the
+   landscape in front of the ant.
+2. **Deformation with the entropy budget** `h`: *smoothing* blurs the
+   landscape along the ring (angular disorder, path-coherent); *roughening*
+   adds a random field of a few low Fourier modes (landscape disorder,
+   path-incoherent); *tempering* then either divides by a fixed temperature
+   or solves the temperature for an exact entropy target. The shares are per
+   node (`Deformation { smooth, rough, reach }`) and compose down the
+   hierarchy like the weights.
+3. **Selection.** `Selection::Softmax` draws globally. `Selection::Sucker`
+   crawls the ring from straight ahead for a bounded reach and goes where it
+   can get to.
 
 `cargo run --release --example surface` shows one ant's surface scrolling
-past under the sucker (`[..]` is the choice, the trail is the walk):
+past and then holds an entropy budget of 0.35 while changing its shape
+(20 simulated minutes, mean of 2 seeds):
 
 ```
- tick  position    L135L90 L45  ^  R45 R90 R135rev   trail
-  146 ( 52, 23)                 ** [::]              0→0→0→0→0→0→0→1→1
-  147 ( 53, 23)             .. [**] ..               0→0→0→1→0→0→0→0→0
-  157 ( 63, 23)                 xx  xx  xx [@@]      2→2→2→2→2→2→2→2→2
+setting           target  drawn | temper smooth  rough  field select | turnH  str%  eff | deliv
+flat / softmax     0.704  0.704 |  0.704 +0.000 +0.000 +0.000 +0.000 | 1.101  63.6 0.96 |   105
+smooth / softmax   0.716  0.716 |  0.634 +0.082 +0.000 +0.000 +0.000 | 1.123  62.3 0.97 |   137
+rough / softmax    0.723  0.723 |  1.014 +0.000 -0.291 +0.604 +0.000 | 1.789  29.4 0.69 |    71
+reach 1 / sucker   0.744  0.575 |  0.744 +0.000 +0.000 +0.000 -0.168 | 0.874  70.6 0.83 |   134
 ```
 
-and then holds the budget fixed at 0.35 of maximum entropy while changing
-its shape (400 ticks, mean of 3 seeds):
-
-```
-setting          target  drawn | temper smooth  rough  field select |  turnH  str%   eff | deliv
-flat / softmax    0.703  0.703 |  0.703 +0.000 +0.000 +0.000 +0.000 |  1.197  54.4  0.96 |   421
-smooth / softmax  0.705  0.705 |  0.579 +0.126 +0.000 +0.000 +0.000 |  1.163  55.5  0.97 |   415
-rough / softmax   0.707  0.707 |  1.025 +0.000 -0.319 +0.629 +0.000 |  1.775  29.4  0.69 |   102
-reach 1 / sucker  0.684  0.542 |  0.684 +0.000 +0.000 +0.000 -0.142 |  0.839  72.8  0.87 |   208
-```
-
-Same per-decision entropy, different paths. Smoothing spends a fifth of the
-budget on angular blur and the paths stay as straight and efficient as
-before. Roughening looks *sharper* inside each decision (a random spike is a
-confident choice, so it displaces 0.32 nats of tempering) but the ledger's
-`field` column shows the 0.63 nats it injects *between* decisions, and the
-paths turn twice as much and deliver a quarter of the food. The entropy of
-behaviour is separable, and the split between within-decision and
-between-decision disorder is what the path's topology responds to. A short
-sucker reach cuts the realised entropy below the target and binds the ant
-to its heading; a long one converges back to the global draw.
+Same per-decision entropy, different paths: roughening looks sharper inside
+each decision but injects 0.6 nats *between* decisions (the `field` column),
+and the paths turn twice as much and deliver a third less. A short sucker
+reach binds the ant to its heading; a long one converges to the global draw.
 
 ## Examples
 
 ```
-cargo run --release --example colony  [ticks]
-cargo run --release --example arena   [turns] [period] [sucker]
-cargo run --release --example surface [ticks] [seeds]
+cargo run --release --example colony      [minutes]
+cargo run --release --example experiments [replicates] [minutes]
+cargo run --release --example arena       [turns] [period] [sucker]
+cargo run --release --example surface     [ticks] [seeds]
 ```
 
-`colony` renders the world as ASCII, sweeps the colony-wide entropy dial, and
-heats a single caste. `arena` runs six learners over the ten nodes of the
-default hierarchy with a hidden rotation of period 4, prints which learners
-recover the period, and finally evaluates the untouched instinct, the learned
-hierarchy, and the best turn's parameters on the same fresh episodes:
-
-```
-  phase-aware(hill-climb)      ... period 4
-  hill-climb                   ... period -     112 evaluations (never sure what it holds)
-  phase-aware(entropy-bandit)  ... period 4
-  policy-gradient              ... period -
-  cross-entropy                ... period -
-  static                       ... period -
-
-evaluation over 12 fresh episodes:
-  instinct (untouched): reward 297.9 ± 47.2, delivered 268, entropy 0.702 nats
-  learned hierarchy:    reward 407.1 ± 56.1, delivered 366, entropy 0.346 nats
-```
-
-The colony-wide dial ends up near 0.18 of maximum entropy, which is also
-where a brute-force sweep of the dial in the `colony` example puts the
-optimum. Nobody told the learners that; two of them worked out the rotation
-and one of them only ever touched entropy.
-
-## How the simulation works
-
-* **World**: a grid with a nest, food clusters (random or placed), optional
-  walls, and two pheromone fields. Foraging ants lay *home* pheromone; ants
-  carrying food lay *food* pheromone. Both evaporate and diffuse each tick.
-* **Senses**: for each of the eight neighbouring cells an ant computes eight
-  features (food and home pheromone, food present, nest present, alignment
-  with its heading, alignment with the direction of the nest, recently
-  visited, crowding). The same eight are repeated gated by "carrying food",
-  so the surface can prefer different things in the two modes. Sixteen
-  weights plus one dial value make a surface: 17 parameters per node.
-* **Decision**: the effective surface of the ant's leaf scores each walkable
-  direction; the scores are turned into a distribution whose entropy is
-  exactly the effective dial's fraction of `ln(walkable directions)`; a
-  direction is sampled.
-* **Life**: ants pick food up automatically, deliver it at the nest, burn
-  energy and refuel at the nest, and starve if they run out. The colony spends
-  delivered food on new ants.
-* **Reward**: configurable per delivery, pickup, death and birth. Every event
-  is credited to the whole root-to-leaf path, so each node has a subtree
-  reward that learners can be fed instead of the colony total.
+`colony` renders the world, compares the four species on one map, sweeps
+the colony-wide temperature, and heats one caste. `experiments` replicates
+the classic setups. `arena` runs learners over the hierarchy with a hidden
+rotation and evaluates the untouched instinct against the learned hierarchy
+on fresh episodes. `surface` explores the geometric entropy channels.
 
 ## The arena, turn by turn
 
 1. The rotation says which node each lever reaches this turn.
 2. Each connected learner sees that node's parameters and writes new ones.
 3. The colony runs for `steps_per_turn` ticks (a fresh episode, or one
-   persistent colony, as configured).
+   persistent colony).
 4. Each connected learner receives its reward (colony-wide or subtree) and,
-   if tracing is on, the REINFORCE score for the node it held. It may then
-   leave different parameters behind (for instance its best known setting
-   rather than the last probe) before the lever rotates away.
+   with tracing on, the REINFORCE score for the node it held, and may leave
+   different parameters behind before the lever rotates away.
 
 Schedules: `Fixed`, `Cyclic`, `RandomStatic { period }`, `Fresh` (a new
 permutation every turn, unlearnable by construction), and `Explicit`.
@@ -230,33 +233,32 @@ permutation every turn, unlearnable by construction), and `Explicit`.
 
 | Learner | What it does with the lever |
 | --- | --- |
-| `HillClimber` | (1+1) evolution strategy on displacements with adaptive step size. When the surface it is handed is not the one it left, it spends a turn feeling it out before probing. `Mutation::Rotation` rotates the weight vector in a random plane instead of adding noise. |
-| `CrossEntropy` | Probes Gaussian displacements, applies the mean of the elite displacements once per generation, refits the spread. |
-| `PolicyGradient` | REINFORCE using the traced score, with a normalised advantage and a unit gradient direction so the step size is independent of reward scale and temperature. |
-| `DialBandit` | UCB1 over dial settings only, leaving the weights alone. `DialBandit::entropy()` (alias `EntropyBandit`) searches the entropy dial; `DialBandit::geometry()` searches smoothing, roughening and reach. |
+| `HillClimber` | (1+1) evolution strategy on displacements with adaptive step size; feels out a surface it does not recognise before probing. `Mutation::Rotation` rotates the weight vector in a random plane. |
+| `CrossEntropy` | Probes Gaussian displacements, applies the mean of the elite displacements once per generation. |
+| `PolicyGradient` | REINFORCE with a normalised advantage and unit gradient direction. |
+| `DialBandit` | UCB1 over dial settings only. `DialBandit::entropy()` (alias `EntropyBandit`) searches the dial; `DialBandit::geometry()` searches smoothing, roughening and reach. |
 | `PhaseAware<L>` | Infers the rotation period (BIC over candidate periods, from rewards and parameter fingerprints) and runs one `L` per phase. |
 | `StaticLearner`, `RandomLearner` | Controls. |
-
-Whether the period is discoverable depends on whether the categories differ.
-Levers rotating over the root, a caste and a squad produce a strongly periodic
-reward. Levers rotating over nodes with similar rewards can still be told
-apart by the parameter vectors they show, as long as those have diverged.
 
 ## Evaluating what was learned
 
 `Arena::evaluate(params, episodes, seed)` runs fresh episodes with any
 parameter vector, so the instinct (`Arena::initial_params`), the current
 hierarchy, and the best turn (`Arena::best`) can be compared on identical
-seeds. Turn-by-turn rewards in the arena are noisy and are shaped by every
-learner's exploration; the evaluation is the honest number.
+seeds.
 
-## Reproducibility
+## What is simplified
+
+A two-dimensional grid with eight-neighbour moves; one crop load as the unit
+of food; no vision or landmarks (navigation is path integration, marking and
+trails); brood as a single developing stage; no queen pheromone, nest
+architecture or temperature; and parameters that are representative values
+from the cited studies rather than fits to any one dataset.
+
+## Reproducibility and tests
 
 Everything is driven by a single `u64` seed through the crate's own xoshiro
-generator, so simulations, arenas and learners replay exactly. The world's
-food layout can be pinned separately with `WorldConfig::seed`.
-
-## Tests
+generator, so simulations, experiments, arenas and learners replay exactly.
 
 ```
 cargo test

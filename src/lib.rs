@@ -6,12 +6,16 @@
 //!
 //! ## The pieces
 //!
-//! * **Colony simulation** ([`colony`], [`world`], [`ant`]): a grid world
-//!   with a nest, food clusters, and two evaporating, diffusing pheromone
-//!   fields. Every ant senses its eight neighbouring cells as feature
-//!   vectors, scores them, draws a direction, moves, lays pheromone, picks up
-//!   and delivers food, burns energy, and may starve. The colony spends
-//!   delivered food on new ants.
+//! * **Colony simulation** ([`colony`], [`world`], [`ant`], [`pheromone`],
+//!   [`species`]): a grid world in physical units with a nest, food of
+//!   varying quality, and five pheromone channels with literature kinetics.
+//!   Workers rest, nurse, forage, feed, return, search and unload through an
+//!   activity state machine; they navigate by path integration, follow
+//!   trails through Deneubourg's choice function, lay trail in proportion to
+//!   food quality, and engage in tasks by reinforced response thresholds.
+//!   The nest stores food, gets hungry, recruits, lays eggs and raises
+//!   brood. The [`experiments`] module reproduces the classic double-bridge,
+//!   two-source, hunger and division-of-labour setups.
 //!
 //! * **Entropic behavioral surface** ([`surface`], [`entropy`]): the general
 //!   object that controls behaviour. It is a weight vector over the sensory
@@ -53,10 +57,13 @@
 //! ```
 //! use ant_simulator::prelude::*;
 //!
-//! // Run a colony on instinct alone.
-//! let mut sim = Simulation::new(SimConfig::default(), 42);
-//! sim.run(200);
+//! // Run a hungry colony of the default species for ten simulated minutes.
+//! let mut cfg = SimConfig::default();
+//! cfg.nest.initial_satiation = 0.1;
+//! let mut sim = Simulation::new(cfg, 42);
+//! sim.run_seconds(600.0);
 //! println!("{}", render(&sim));
+//! assert!(sim.stats().food_delivered > 0);
 //!
 //! // Turn the colony's entropy dial and watch behaviour change.
 //! sim.hierarchy_mut().node_mut(0).surface.entropy = EntropyControl::absolute(0.9);
@@ -108,28 +115,40 @@ pub mod ant;
 pub mod arena;
 pub mod colony;
 pub mod entropy;
+pub mod experiments;
 pub mod geometry;
 pub mod hierarchy;
 pub mod landscape;
 pub mod learner;
+pub mod pheromone;
 pub mod render;
 pub mod rng;
 pub mod rotation;
+pub mod species;
 pub mod surface;
 pub mod world;
 
 /// The commonly used types, re-exported.
 pub mod prelude {
-    pub use crate::ant::{Ant, Observation, FEATURES, FEATURE_NAMES};
+    pub use crate::ant::{
+        Activity, Ant, Mode, Observation, SearchTarget, Site, Traits, BASE_FEATURES, FEATURES,
+        FEATURE_NAMES,
+    };
     pub use crate::arena::{
         Arena, ArenaConfig, ArenaReport, ControlTargets, EpisodeSeeding, Evaluation, FeedbackScope,
         TurnRecord,
     };
     pub use crate::colony::{
-        EnergyConfig, GeometryConfig, PathStats, PheromoneConfig, RewardSpec, Selection, SimConfig,
-        Simulation, Stats, SurfaceRow, Trace,
+        BroodItem, GeometryConfig, Nest, NestConfig, PathStats, RewardSpec, Selection, SimConfig,
+        Simulation, Snapshot, Stats, SurfaceRow, Trace,
     };
-    pub use crate::entropy::EntropyControl;
+    pub use crate::entropy::{EntropyControl, Tempering};
+    pub use crate::experiments::{
+        double_bridge, experiment_config, pure_pheromone_feedback, run_division_of_labor,
+        run_double_bridge, run_double_bridge_configured, run_double_bridge_once,
+        run_hunger_response, run_two_sources_once, summarize, two_sources, BridgeOutcome,
+        BridgeSpec, HungerOutcome, LaborOutcome, SourcesOutcome, Summary,
+    };
     pub use crate::geometry::{Direction, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,
@@ -142,12 +161,16 @@ pub mod prelude {
         Arm, CrossEntropy, DialBandit, EntropyBandit, HillClimber, Learner, LeverView, Mutation,
         Outcome, PeriodDetector, PhaseAware, PolicyGradient, RandomLearner, StaticLearner,
     };
+    pub use crate::pheromone::{perceived, Pheromone, PheromoneParams, PheromoneSet};
     pub use crate::render::{render, render_surface};
     pub use crate::rng::Rng;
     pub use crate::rotation::{Mapping, Rotation, RotationSchedule};
+    pub use crate::species::Species;
     pub use crate::surface::{
         BehavioralSurface, Deformation, ENTROPY_PARAM, PARAM_LEN, REACH_PARAM, ROUGH_PARAM,
         SMOOTH_PARAM,
     };
-    pub use crate::world::{FoodSource, RandomFood, Rect, Terrain, World, WorldConfig};
+    pub use crate::world::{
+        Cell, Counter, CounterState, FoodSource, RandomFood, Rect, Terrain, World, WorldConfig,
+    };
 }

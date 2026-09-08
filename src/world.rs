@@ -1,11 +1,15 @@
-//! The grid world: terrain, food, nest, and the two pheromone fields.
+//! The grid world: terrain, food, nest, pheromone fields, and counters.
 //!
-//! Ants communicate stigmergically. Foraging ants lay *home* pheromone
-//! (pointing back to the nest), ants carrying food lay *food* pheromone
-//! (pointing to a food source). Both fields evaporate and diffuse each tick.
+//! The grid has a physical scale (`cell_cm`) and the simulation a time step
+//! (`tick_s`), so species parameters in centimetres and seconds convert to
+//! cells and ticks. Each cell carries every [`Pheromone`] channel; the
+//! channels evaporate by first-order kinetics from their half-lives and
+//! diffuse a little to orthogonal neighbours each tick.
 
 use crate::geometry::{Direction, Position};
+use crate::pheromone::{Pheromone, PheromoneParams, PheromoneSet};
 use crate::rng::Rng;
+use crate::species::Species;
 
 /// What a cell fundamentally is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,18 +24,28 @@ pub enum Terrain {
 }
 
 /// One grid cell.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cell {
     /// Terrain type.
     pub terrain: Terrain,
-    /// Units of food lying here.
+    /// Crop loads of food lying here.
     pub food: u32,
-    /// Pheromone laid by foraging ants ("this way home").
-    pub home_pheromone: f64,
-    /// Pheromone laid by ants carrying food ("this way to food").
-    pub food_pheromone: f64,
-    /// Number of living ants currently on the cell.
+    /// Quality of that food in `0..=1` (sucrose concentration relative to
+    /// the most attractive solution).
+    pub quality: f32,
+    /// Concentration of every pheromone channel, indexed by
+    /// [`Pheromone::index`].
+    pub pheromone: [f64; Pheromone::COUNT],
+    /// Number of living ants currently on the cell (ants inside the nest are
+    /// not on the grid).
     pub occupancy: u16,
+}
+
+impl Cell {
+    /// Concentration of one channel.
+    pub fn level(&self, kind: Pheromone) -> f64 {
+        self.pheromone[kind.index()]
+    }
 }
 
 /// A hand-placed cluster of food.
@@ -41,8 +55,10 @@ pub struct FoodSource {
     pub center: Position,
     /// Chebyshev radius of the cluster.
     pub radius: i32,
-    /// Food units placed on every cell of the cluster.
+    /// Crop loads placed on every cell of the cluster.
     pub amount_per_cell: u32,
+    /// Quality in `0..=1`.
+    pub quality: f64,
 }
 
 /// An inclusive axis-aligned rectangle of cells.
@@ -76,10 +92,22 @@ pub struct RandomFood {
     pub clusters: usize,
     /// Chebyshev radius of each cluster.
     pub radius: i32,
-    /// Food units per cell.
+    /// Crop loads per cell.
     pub amount_per_cell: u32,
     /// Minimum Chebyshev distance between a cluster centre and the nest.
     pub min_distance_from_nest: i32,
+    /// Quality range the clusters are drawn from.
+    pub quality: (f64, f64),
+}
+
+/// A region whose crossings are counted (the "bridge counters" of the
+/// double-bridge experiments).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Counter {
+    /// Name used in reports.
+    pub name: String,
+    /// Cells that count.
+    pub rect: Rect,
 }
 
 /// World construction parameters.
@@ -89,6 +117,10 @@ pub struct WorldConfig {
     pub width: usize,
     /// Grid height in cells.
     pub height: usize,
+    /// Edge length of a cell, centimetres.
+    pub cell_cm: f64,
+    /// Duration of a tick, seconds.
+    pub tick_s: f64,
     /// Nest centre.
     pub nest: Position,
     /// Chebyshev radius of the nest.
@@ -99,12 +131,13 @@ pub struct WorldConfig {
     pub random_food: Option<RandomFood>,
     /// Wall rectangles.
     pub walls: Vec<Rect>,
-    /// Fraction of pheromone lost per tick.
-    pub evaporation: f64,
-    /// Fraction of remaining pheromone spread to orthogonal neighbours per tick.
-    pub diffusion: f64,
-    /// Upper bound on pheromone per cell.
-    pub pheromone_cap: f64,
+    /// Whether everything outside `open` rectangles is wall (for mazes and
+    /// bridges). Ignored when empty.
+    pub open: Vec<Rect>,
+    /// Crossing counters.
+    pub counters: Vec<Counter>,
+    /// Pheromone kinetics; `None` takes them from the species.
+    pub pheromones: Option<PheromoneSet>,
     /// Seed for random food placement. `None` uses the simulation's generator,
     /// `Some` fixes the map independently of everything else.
     pub seed: Option<u64>,
@@ -115,6 +148,8 @@ impl Default for WorldConfig {
         WorldConfig {
             width: 64,
             height: 40,
+            cell_cm: 2.0,
+            tick_s: 1.0,
             nest: Position::new(32, 20),
             nest_radius: 2,
             food_sources: Vec::new(),
@@ -123,14 +158,24 @@ impl Default for WorldConfig {
                 radius: 2,
                 amount_per_cell: 25,
                 min_distance_from_nest: 12,
+                quality: (0.4, 1.0),
             }),
             walls: Vec::new(),
-            evaporation: 0.02,
-            diffusion: 0.05,
-            pheromone_cap: 40.0,
+            open: Vec::new(),
+            counters: Vec::new(),
+            pheromones: None,
             seed: None,
         }
     }
+}
+
+/// A counter's running total.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CounterState {
+    /// The counter's definition.
+    pub counter: Counter,
+    /// Ant moves that ended inside the region.
+    pub crossings: u64,
 }
 
 /// The simulated environment.
@@ -138,21 +183,52 @@ impl Default for WorldConfig {
 pub struct World {
     config: WorldConfig,
     cells: Vec<Cell>,
-    scratch: Vec<(f64, f64)>,
+    scratch: Vec<[f64; Pheromone::COUNT]>,
+    params: PheromoneSet,
+    retention: [f64; Pheromone::COUNT],
+    diffusion: [f64; Pheromone::COUNT],
+    counters: Vec<CounterState>,
 }
 
 impl World {
     /// Build a world. Random food clusters are drawn from `rng` unless the
-    /// config carries its own seed.
+    /// config carries its own seed. Pheromone kinetics default to those of
+    /// [`Species::lasius_niger`] when the config has none.
     pub fn new(config: WorldConfig, rng: &mut Rng) -> World {
         assert!(
             config.width > 0 && config.height > 0,
             "world must be non-empty"
         );
+        assert!(
+            config.tick_s > 0.0 && config.cell_cm > 0.0,
+            "units must be positive"
+        );
+        let params = config
+            .pheromones
+            .clone()
+            .unwrap_or_else(|| Species::lasius_niger().pheromones());
+        let mut retention = [0.0; Pheromone::COUNT];
+        let mut diffusion = [0.0; Pheromone::COUNT];
+        for (i, p) in params.iter().enumerate() {
+            retention[i] = p.retention_per_tick(config.tick_s);
+            diffusion[i] = p.diffusion_per_tick(config.tick_s);
+        }
         let n = config.width * config.height;
+        let counters = config
+            .counters
+            .iter()
+            .map(|c| CounterState {
+                counter: c.clone(),
+                crossings: 0,
+            })
+            .collect();
         let mut world = World {
             cells: vec![Cell::default(); n],
-            scratch: vec![(0.0, 0.0); n],
+            scratch: vec![[0.0; Pheromone::COUNT]; n],
+            params,
+            retention,
+            diffusion,
+            counters,
             config,
         };
         world.lay_terrain();
@@ -176,10 +252,13 @@ impl World {
 
     fn lay_terrain(&mut self) {
         let walls = self.config.walls.clone();
+        let open = self.config.open.clone();
         for y in 0..self.config.height as i32 {
             for x in 0..self.config.width as i32 {
                 let p = Position::new(x, y);
-                if walls.iter().any(|w| w.contains(p)) {
+                let closed = (!open.is_empty() && !open.iter().any(|o| o.contains(p)))
+                    || walls.iter().any(|w| w.contains(p));
+                if closed {
                     self.cell_mut(p).unwrap().terrain = Terrain::Wall;
                 }
             }
@@ -201,6 +280,7 @@ impl World {
                 if let Some(c) = self.cell_mut(src.center.offset(dx, dy)) {
                     if c.terrain == Terrain::Open {
                         c.food = c.food.saturating_add(src.amount_per_cell);
+                        c.quality = src.quality.clamp(0.0, 1.0) as f32;
                     }
                 }
             }
@@ -221,15 +301,17 @@ impl World {
                 }
                 if self
                     .cell(center)
-                    .map(|c| c.terrain != Terrain::Open)
+                    .map(|c| c.terrain != Terrain::Open || c.food > 0)
                     .unwrap_or(true)
                 {
                     continue;
                 }
+                let quality = rng.range(random.quality.0, random.quality.1);
                 self.place_food(&FoodSource {
                     center,
                     radius: r,
                     amount_per_cell: random.amount_per_cell,
+                    quality,
                 });
                 break;
             }
@@ -239,6 +321,16 @@ impl World {
     /// Construction parameters.
     pub fn config(&self) -> &WorldConfig {
         &self.config
+    }
+
+    /// Pheromone kinetics in use.
+    pub fn pheromone_params(&self) -> &PheromoneSet {
+        &self.params
+    }
+
+    /// Parameters of one channel.
+    pub fn channel(&self, kind: Pheromone) -> &PheromoneParams {
+        &self.params[kind.index()]
     }
 
     /// Grid width.
@@ -254,6 +346,21 @@ impl World {
     /// Nest centre.
     pub fn nest(&self) -> Position {
         self.config.nest
+    }
+
+    /// Chebyshev radius of the nest.
+    pub fn nest_radius(&self) -> i32 {
+        self.config.nest_radius
+    }
+
+    /// Duration of a tick in seconds.
+    pub fn tick_s(&self) -> f64 {
+        self.config.tick_s
+    }
+
+    /// Edge of a cell in centimetres.
+    pub fn cell_cm(&self) -> f64 {
+        self.config.cell_cm
     }
 
     /// Linear index of a position, if in bounds.
@@ -303,13 +410,58 @@ impl World {
             .unwrap_or(false)
     }
 
-    /// Add pheromone to a cell (clamped to the cap).
-    pub fn deposit(&mut self, p: Position, home: f64, food: f64) {
-        let cap = self.config.pheromone_cap;
-        if let Some(c) = self.cell_mut(p) {
-            c.home_pheromone = (c.home_pheromone + home).min(cap);
-            c.food_pheromone = (c.food_pheromone + food).min(cap);
+    /// All nest cells.
+    pub fn nest_cells(&self) -> Vec<Position> {
+        let mut out = Vec::new();
+        for y in 0..self.config.height as i32 {
+            for x in 0..self.config.width as i32 {
+                let p = Position::new(x, y);
+                if self.is_nest(p) {
+                    out.push(p);
+                }
+            }
         }
+        out
+    }
+
+    /// Concentration of a channel at `p` (0 outside the grid).
+    pub fn level(&self, p: Position, kind: Pheromone) -> f64 {
+        self.cell(p).map(|c| c.level(kind)).unwrap_or(0.0)
+    }
+
+    /// Add pheromone of one channel to a cell (clamped to the channel's cap;
+    /// inert channels take nothing).
+    pub fn deposit(&mut self, p: Position, kind: Pheromone, amount: f64) {
+        let cap = self.params[kind.index()].cap;
+        if amount <= 0.0 || cap <= 0.0 {
+            return;
+        }
+        if let Some(c) = self.cell_mut(p) {
+            let v = &mut c.pheromone[kind.index()];
+            *v = (*v + amount).min(cap);
+        }
+    }
+
+    /// Record an ant move ending at `p` in every counter covering it.
+    pub fn record_crossing(&mut self, p: Position) {
+        for c in self.counters.iter_mut() {
+            if c.counter.rect.contains(p) {
+                c.crossings += 1;
+            }
+        }
+    }
+
+    /// Crossing counters.
+    pub fn counters(&self) -> &[CounterState] {
+        &self.counters
+    }
+
+    /// Crossings of the counter with the given name.
+    pub fn crossings(&self, name: &str) -> Option<u64> {
+        self.counters
+            .iter()
+            .find(|c| c.counter.name == name)
+            .map(|c| c.crossings)
     }
 
     /// The passable neighbours of `p` with the direction leading to each.
@@ -327,19 +479,16 @@ impl World {
         })
     }
 
-    /// Evaporate and diffuse both pheromone fields by one tick.
+    /// Evaporate and diffuse every pheromone channel by one tick.
     pub fn step_pheromones(&mut self) {
         let w = self.config.width as i32;
         let h = self.config.height as i32;
-        let retain = 1.0 - self.config.evaporation.clamp(0.0, 1.0);
-        let diffusion = self.config.diffusion.clamp(0.0, 1.0);
-        let keep = 1.0 - diffusion;
-        let share = diffusion / 4.0;
-        let cap = self.config.pheromone_cap;
-
         for s in self.scratch.iter_mut() {
-            *s = (0.0, 0.0);
+            *s = [0.0; Pheromone::COUNT];
         }
+        let active: Vec<usize> = (0..Pheromone::COUNT)
+            .filter(|&k| self.retention[k] > 0.0)
+            .collect();
         for y in 0..h {
             for x in 0..w {
                 let idx = y as usize * w as usize + x as usize;
@@ -347,31 +496,41 @@ impl World {
                 if cell.terrain == Terrain::Wall {
                     continue;
                 }
-                let home = cell.home_pheromone * retain;
-                let food = cell.food_pheromone * retain;
-                if home <= 0.0 && food <= 0.0 {
-                    continue;
-                }
-                self.scratch[idx].0 += home * keep;
-                self.scratch[idx].1 += food * keep;
-                for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
-                    let nx = x + dx;
-                    let ny = y + dy;
-                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                for &k in &active {
+                    let amount = cell.pheromone[k] * self.retention[k];
+                    if amount <= 0.0 {
                         continue;
                     }
-                    let nidx = ny as usize * w as usize + nx as usize;
-                    if self.cells[nidx].terrain == Terrain::Wall {
-                        continue;
+                    let diffusion = self.diffusion[k];
+                    if diffusion > 0.0 {
+                        // Conservative diffusion: shares that would cross
+                        // into a wall or off the grid stay in the cell.
+                        let share = amount * diffusion / 4.0;
+                        let mut moved = 0.0;
+                        for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                                continue;
+                            }
+                            let nidx = ny as usize * w as usize + nx as usize;
+                            if self.cells[nidx].terrain == Terrain::Wall {
+                                continue;
+                            }
+                            self.scratch[nidx][k] += share;
+                            moved += share;
+                        }
+                        self.scratch[idx][k] += amount - moved;
+                    } else {
+                        self.scratch[idx][k] += amount;
                     }
-                    self.scratch[nidx].0 += home * share;
-                    self.scratch[nidx].1 += food * share;
                 }
             }
         }
         for (cell, s) in self.cells.iter_mut().zip(self.scratch.iter()) {
-            cell.home_pheromone = if s.0 < 1e-6 { 0.0 } else { s.0.min(cap) };
-            cell.food_pheromone = if s.1 < 1e-6 { 0.0 } else { s.1.min(cap) };
+            for ((slot, &v), params) in cell.pheromone.iter_mut().zip(s).zip(self.params.iter()) {
+                *slot = if v < 1e-6 { 0.0 } else { v.min(params.cap) };
+            }
         }
     }
 
@@ -380,11 +539,34 @@ impl World {
         self.cells.iter().map(|c| c.food as u64).sum()
     }
 
-    /// Total pheromone of both kinds, `(home, food)`.
-    pub fn total_pheromone(&self) -> (f64, f64) {
-        self.cells.iter().fold((0.0, 0.0), |acc, c| {
-            (acc.0 + c.home_pheromone, acc.1 + c.food_pheromone)
-        })
+    /// Total amount of one channel over the grid.
+    pub fn total_pheromone(&self, kind: Pheromone) -> f64 {
+        self.cells.iter().map(|c| c.level(kind)).sum()
+    }
+
+    /// Food remaining inside a region.
+    pub fn food_in(&self, rect: &Rect) -> u64 {
+        let mut total = 0;
+        for y in rect.min.y..=rect.max.y {
+            for x in rect.min.x..=rect.max.x {
+                total += self
+                    .cell(Position::new(x, y))
+                    .map(|c| c.food as u64)
+                    .unwrap_or(0);
+            }
+        }
+        total
+    }
+
+    /// Total of one channel inside a region.
+    pub fn pheromone_in(&self, rect: &Rect, kind: Pheromone) -> f64 {
+        let mut total = 0.0;
+        for y in rect.min.y..=rect.max.y {
+            for x in rect.min.x..=rect.max.x {
+                total += self.level(Position::new(x, y), kind);
+            }
+        }
+        total
     }
 }
 
@@ -402,6 +584,7 @@ mod tests {
                 center: Position::new(1, 1),
                 radius: 1,
                 amount_per_cell: 5,
+                quality: 0.7,
             }],
             random_food: None,
             walls: vec![Rect::new(Position::new(9, 0), Position::new(9, 9))],
@@ -418,8 +601,25 @@ mod tests {
         assert!(!world.is_nest(Position::new(8, 5)));
         assert!(!world.is_passable(Position::new(9, 4)));
         assert!(!world.is_passable(Position::new(-1, 0)));
-        // 3x3 cluster at (1,1) → 9 cells × 5 food, but (0,0)…(2,2) are all open.
         assert_eq!(world.total_food(), 45);
+        assert_eq!(world.cell(Position::new(1, 1)).unwrap().quality, 0.7);
+        assert_eq!(world.nest_cells().len(), 9);
+    }
+
+    #[test]
+    fn open_regions_make_everything_else_wall() {
+        let cfg = WorldConfig {
+            open: vec![Rect::new(Position::new(0, 5), Position::new(11, 5))],
+            walls: Vec::new(),
+            ..small_config()
+        };
+        let world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        assert!(world.is_passable(Position::new(3, 5)));
+        assert!(!world.is_passable(Position::new(3, 4)));
+        assert!(
+            world.is_nest(Position::new(6, 4)),
+            "the nest is carved regardless"
+        );
     }
 
     #[test]
@@ -432,40 +632,108 @@ mod tests {
         let mut r2 = Rng::seed_from_u64(2);
         let a = World::new(cfg.clone(), &mut r1);
         let b = World::new(cfg, &mut r2);
-        let fa: Vec<u32> = a.cells().iter().map(|c| c.food).collect();
-        let fb: Vec<u32> = b.cells().iter().map(|c| c.food).collect();
+        let fa: Vec<(u32, f32)> = a.cells().iter().map(|c| (c.food, c.quality)).collect();
+        let fb: Vec<(u32, f32)> = b.cells().iter().map(|c| (c.food, c.quality)).collect();
         assert_eq!(fa, fb);
         assert!(a.total_food() > 0);
+        assert!(a.cells().iter().any(|c| c.food > 0 && c.quality >= 0.4));
     }
 
     #[test]
-    fn pheromone_evaporates_and_diffuses() {
+    fn pheromone_evaporates_by_half_life_and_diffuses() {
+        let mut rng = Rng::seed_from_u64(1);
+        let cfg = WorldConfig {
+            tick_s: 60.0,
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut rng);
+        let p = Position::new(3, 3);
+        world.deposit(p, Pheromone::Trail, 10.0);
+        let before = world.total_pheromone(Pheromone::Trail);
+        world.step_pheromones();
+        let after = world.total_pheromone(Pheromone::Trail);
+        let expected = before * world.channel(Pheromone::Trail).retention_per_tick(60.0);
+        assert!((after - expected).abs() < 1e-9, "{after} vs {expected}");
+        assert!(
+            world
+                .cell(Position::new(3, 2))
+                .unwrap()
+                .level(Pheromone::Trail)
+                > 0.0
+        );
+        assert!(world.cell(p).unwrap().level(Pheromone::Trail) > 5.0);
+        world.deposit(p, Pheromone::Trail, 1e9);
+        assert_eq!(
+            world.level(p, Pheromone::Trail),
+            world.channel(Pheromone::Trail).cap
+        );
+    }
+
+    #[test]
+    fn inert_channels_take_nothing() {
         let mut rng = Rng::seed_from_u64(1);
         let mut world = World::new(small_config(), &mut rng);
-        let p = Position::new(3, 3);
-        world.deposit(p, 10.0, 0.0);
-        let before = world.total_pheromone().0;
+        world.deposit(Position::new(3, 3), Pheromone::NoEntry, 10.0);
+        assert_eq!(world.total_pheromone(Pheromone::NoEntry), 0.0);
+        world.deposit(Position::new(3, 3), Pheromone::Alarm, 10.0);
         world.step_pheromones();
-        let after = world.total_pheromone().0;
-        assert!(after < before, "evaporation must lower the total");
-        assert!(after > before * 0.9, "only a little is lost per tick");
-        assert!(world.cell(Position::new(3, 2)).unwrap().home_pheromone > 0.0);
-        assert!(world.cell(Position::new(3, 3)).unwrap().home_pheromone > 5.0);
-        // Cap is respected.
-        world.deposit(p, 1e9, 1e9);
-        assert_eq!(
-            world.cell(p).unwrap().home_pheromone,
-            world.config().pheromone_cap
+        assert!(world.total_pheromone(Pheromone::Alarm) > 0.0);
+        assert!(world.total_pheromone(Pheromone::Alarm) < 10.0);
+    }
+
+    #[test]
+    fn diffusion_conserves_mass_in_corridors() {
+        let cfg = WorldConfig {
+            open: vec![Rect::new(Position::new(0, 5), Position::new(11, 5))],
+            walls: Vec::new(),
+            pheromones: Some({
+                let mut set = Species::lasius_niger().pheromones();
+                set[Pheromone::Trail.index()].half_life_s = f64::INFINITY;
+                set[Pheromone::Trail.index()].diffusion_per_s = 0.05;
+                set
+            }),
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        world.deposit(Position::new(5, 5), Pheromone::Trail, 50.0);
+        for _ in 0..200 {
+            world.step_pheromones();
+        }
+        let total = world.total_pheromone(Pheromone::Trail);
+        assert!(
+            (total - 50.0).abs() < 1e-3,
+            "no evaporation, no leak: {total}"
         );
+        assert!(world.level(Position::new(8, 5), Pheromone::Trail) > 0.0);
     }
 
     #[test]
     fn walls_block_diffusion() {
         let mut rng = Rng::seed_from_u64(1);
         let mut world = World::new(small_config(), &mut rng);
-        world.deposit(Position::new(8, 4), 10.0, 10.0);
+        world.deposit(Position::new(8, 4), Pheromone::Trail, 10.0);
         world.step_pheromones();
-        assert_eq!(world.cell(Position::new(9, 4)).unwrap().home_pheromone, 0.0);
-        assert!(world.cell(Position::new(7, 4)).unwrap().home_pheromone > 0.0);
+        assert_eq!(world.level(Position::new(9, 4), Pheromone::Trail), 0.0);
+        assert!(world.level(Position::new(7, 4), Pheromone::Trail) > 0.0);
+    }
+
+    #[test]
+    fn counters_count_crossings() {
+        let cfg = WorldConfig {
+            counters: vec![Counter {
+                name: "gate".to_string(),
+                rect: Rect::new(Position::new(4, 0), Position::new(4, 9)),
+            }],
+            ..small_config()
+        };
+        let mut world = World::new(cfg, &mut Rng::seed_from_u64(1));
+        world.record_crossing(Position::new(4, 2));
+        world.record_crossing(Position::new(5, 2));
+        world.record_crossing(Position::new(4, 7));
+        assert_eq!(world.crossings("gate"), Some(2));
+        assert_eq!(world.crossings("nope"), None);
+        let rect = Rect::new(Position::new(0, 0), Position::new(2, 2));
+        world.deposit(Position::new(1, 1), Pheromone::Trail, 3.0);
+        assert!((world.pheromone_in(&rect, Pheromone::Trail) - 3.0).abs() < 1e-12);
     }
 }
