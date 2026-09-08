@@ -799,6 +799,51 @@ pub fn run_discovery(
     }
 }
 
+/// Outcome of one temperature in a thermal trade-off scan.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThermalOutcome {
+    /// Surface temperature, °C.
+    pub temperature_c: f64,
+    /// Loads delivered.
+    pub delivered: u64,
+    /// Workers killed by heat.
+    pub deaths_heat: u64,
+    /// Walking-speed multiplier at that temperature.
+    pub speed_factor: f64,
+}
+
+/// Foraging return against heat losses across temperatures (Cerdá, Retana
+/// & Cros 1998): a hungry colony of `ants` workers on the default map for
+/// `seconds` at each temperature.
+pub fn run_thermal_tradeoff(
+    species: &Species,
+    ants: usize,
+    temperatures_c: &[f64],
+    seconds: f64,
+    seed: u64,
+) -> Vec<ThermalOutcome> {
+    temperatures_c
+        .iter()
+        .map(|&t| {
+            let world = WorldConfig {
+                seed: Some(seed),
+                ..WorldConfig::default()
+            };
+            let mut cfg = experiment_config(species.clone(), world, ants);
+            cfg.nest.mortality = true;
+            cfg.environment.temperature_c = t;
+            let mut sim = Simulation::new(cfg, seed);
+            sim.run_seconds(seconds);
+            ThermalOutcome {
+                temperature_c: t,
+                delivered: sim.stats().food_delivered,
+                deaths_heat: sim.stats().deaths_heat,
+                speed_factor: species.speed_factor(t),
+            }
+        })
+        .collect()
+}
+
 /// Division of labour with and without threshold reinforcement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaborOutcome {

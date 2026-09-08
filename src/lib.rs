@@ -160,6 +160,7 @@ pub mod prelude {
     };
     pub use crate::experiments::{hidden_source, run_discovery, DiscoveryOutcome};
     pub use crate::experiments::{run_communal_nutrition, sugar_and_prey, NutritionOutcome};
+    pub use crate::experiments::{run_thermal_tradeoff, ThermalOutcome};
     pub use crate::geometry::{Direction, Point, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,

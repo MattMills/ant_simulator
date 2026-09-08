@@ -53,8 +53,8 @@ fn main() {
         100.0 * s.activity_fraction(Activity::Unloading)
     );
     println!(
-        "delivered {} loads, {} failed trips, {} deaths ({} predation, {} starvation), {} eggs, {} emerged, division of labour {:.2}",
-        s.food_delivered, s.failed_trips, s.deaths, s.deaths_predation, s.deaths_starvation, s.eggs, s.births,
+        "delivered {} loads, {} failed trips, {} deaths ({} predation, {} starvation, {} heat), {} eggs, {} emerged, division of labour {:.2}",
+        s.food_delivered, s.failed_trips, s.deaths, s.deaths_predation, s.deaths_starvation, s.deaths_heat, s.eggs, s.births,
         sim.division_of_labor()
     );
     println!(

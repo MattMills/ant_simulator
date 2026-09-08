@@ -567,6 +567,8 @@ pub struct Stats {
     pub deaths_predation: u64,
     /// Of which starved.
     pub deaths_starvation: u64,
+    /// Of which killed by heat outside the nest.
+    pub deaths_heat: u64,
     /// Eggs laid.
     pub eggs: u64,
     /// Workers that emerged.
@@ -717,6 +719,7 @@ pub struct SurfaceRow {
 enum Cause {
     Predation,
     Starvation,
+    Heat,
 }
 
 /// A running colony.
@@ -745,6 +748,8 @@ pub struct Simulation {
     persistence_cells: f64,
     decision_prob: f64,
     hazard_per_tick: f64,
+    /// Heat hazard per tick outside at the current temperature.
+    heat_hazard_per_tick: f64,
     excitation_retention: f64,
     log_every_ticks: u64,
     temperature_c: f64,
@@ -824,6 +829,7 @@ impl Simulation {
             persistence_cells: species.heading_persistence_cm / cell_cm.max(1e-9),
             decision_prob: (tick_s / species.decision_interval_s.max(1e-9)).min(1.0),
             hazard_per_tick: 1.0 - (-species.forager_hazard_per_s * tick_s).exp(),
+            heat_hazard_per_tick: 0.0,
             excitation_retention: 0.5f64.powf(tick_s / species.excitation_half_life_s.max(1e-9)),
             log_every_ticks: if config.nest.log_every_s > 0.0 {
                 (config.nest.log_every_s / tick_s).round().max(1.0) as u64
@@ -1148,6 +1154,7 @@ impl Simulation {
             return;
         }
         self.temperature_c = t;
+        self.heat_hazard_per_tick = 1.0 - (-self.species.heat_hazard_per_s(t) * self.tick_s).exp();
         self.speed_factor = self.species.speed_factor(t);
         self.activity_factor = self.species.activity_factor(t);
         self.metabolism_factor = self.species.metabolism_factor(t);
@@ -2220,6 +2227,11 @@ impl Simulation {
                 self.die(i, Cause::Predation);
                 return;
             }
+            // Heat: the risk of foraging near the thermal limit.
+            if mortality && self.rng.chance(self.heat_hazard_per_tick) {
+                self.die(i, Cause::Heat);
+                return;
+            }
         }
         if mortality && self.ants[i].energy <= 0.0 {
             self.die(i, Cause::Starvation);
@@ -2258,6 +2270,7 @@ impl Simulation {
         match cause {
             Cause::Predation => self.stats.deaths_predation += 1,
             Cause::Starvation => self.stats.deaths_starvation += 1,
+            Cause::Heat => self.stats.deaths_heat += 1,
         }
         let reward = self.config.reward.death;
         self.credit(leaf, reward, false);
@@ -2742,7 +2755,7 @@ mod tests {
         assert_eq!(sim.alive(), sim.living().count());
         let occupancy: u32 = sim.world().cells().iter().map(|c| c.occupancy as u32).sum();
         assert_eq!(occupancy as usize, sim.outside());
-        assert!(s.deaths_predation + s.deaths_starvation == s.deaths);
+        assert!(s.deaths_predation + s.deaths_starvation + s.deaths_heat == s.deaths);
     }
 
     #[test]
@@ -2903,6 +2916,31 @@ mod tests {
             "crop fills should even out: peak sd {peak:.3} → {sd_now:.3}"
         );
         assert!(sim.stats().trophallaxis_mg > 0.0);
+    }
+
+    #[test]
+    fn heat_kills_foragers_near_the_thermal_limit() {
+        // Cerdá, Retana & Cros 1998: mortality rises steeply towards the
+        // critical thermal maximum; well below it the heat takes nobody.
+        let run = |temperature: f64| {
+            let mut cfg = SimConfig::for_species(Species::cataglyphis());
+            cfg.ants = 60;
+            cfg.world = WorldConfig {
+                seed: Some(3),
+                ..WorldConfig::default()
+            };
+            cfg.nest.initial_satiation = 0.05;
+            cfg.nest.initial_brood_per_ant = 0.0;
+            cfg.environment.temperature_c = temperature;
+            let mut sim = Simulation::new(cfg, 3);
+            sim.run(1800);
+            sim.stats().clone()
+        };
+        let cool = run(38.0);
+        let hot = run(54.5);
+        assert_eq!(cool.deaths_heat, 0, "{cool:?}");
+        assert!(hot.deaths_heat > 3, "{hot:?}");
+        assert!(hot.food_delivered > 0, "the colony still forages: {hot:?}");
     }
 
     #[test]

@@ -158,6 +158,20 @@ fn main() {
         );
     }
 
+    println!("\n== desert ants against the heat (Cerdá, Retana & Cros 1998) ==");
+    for o in run_thermal_tradeoff(
+        &Species::cataglyphis(),
+        60,
+        &[30.0, 40.0, 48.0, 52.0, 54.0, 55.0],
+        seconds.min(1800.0),
+        1,
+    ) {
+        println!(
+            "   {:>4.0} °C: speed ×{:.2}, {:>4} loads, {:>3} killed by heat",
+            o.temperature_c, o.speed_factor, o.delivered, o.deaths_heat
+        );
+    }
+
     println!("\n== foraging activity against colony satiation (Mailleux et al. 2006) ==");
     for o in run_hunger_response(
         &Species::lasius_niger(),

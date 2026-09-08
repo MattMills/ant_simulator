@@ -255,8 +255,18 @@ pub struct Species {
     pub undertaking_gain: f64,
 
     // ---- survival ----
-    /// Hazard rate outside the nest, per second.
+    /// Hazard rate outside the nest, per second (predation and mishap).
     pub forager_hazard_per_s: f64,
+    /// Critical thermal maximum, °C: the temperature at which a worker
+    /// outside dies within minutes. Mortality rises steeply towards it,
+    /// so foraging near the limit trades speed against losses (Cerdá,
+    /// Retana & Cros 1998, *Funct. Ecol.* 12:45).
+    pub critical_thermal_max_c: f64,
+    /// Heat hazard rate at the critical thermal maximum, per second.
+    pub heat_hazard_at_max_per_s: f64,
+    /// Temperature interval over which the heat hazard falls by a factor
+    /// e below the maximum, °C.
+    pub heat_hazard_scale_c: f64,
     /// Time an ant survives away from food, seconds.
     pub starvation_s: f64,
 
@@ -464,6 +474,9 @@ impl Species {
             max_unloading_contacts: 30,
             sharing_interval_s: 20.0,
             forager_hazard_per_s: 1.0 / day,
+            critical_thermal_max_c: 44.0,
+            heat_hazard_at_max_per_s: 1.0 / 300.0,
+            heat_hazard_scale_c: 1.5,
             starvation_s: 8.0 * 3600.0,
             size_cv: 0.15,
             threshold_median: 0.5,
@@ -557,6 +570,9 @@ impl Species {
         s.speed_t_ref_c = 35.0;
         s.forage_min_c = 25.0;
         s.forage_max_c = 55.0;
+        // Forages within a degree or two of its thermal limit (Cerdá et al.
+        // 1998).
+        s.critical_thermal_max_c = 56.0;
         s.trail = PheromoneParams::inert();
         s.trail_deposit = 0.0;
         s.lay_max_probability = 0.0;
@@ -712,6 +728,14 @@ impl Species {
         q10_factor(self.q10_metabolism, temperature_c, Self::REFERENCE_C)
     }
 
+    /// Heat hazard rate outside the nest at a temperature, per second:
+    /// `rate_at_max × exp((T − CTmax) / scale)`, capped at ten times the
+    /// rate at the maximum.
+    pub fn heat_hazard_per_s(&self, temperature_c: f64) -> f64 {
+        let x = (temperature_c - self.critical_thermal_max_c) / self.heat_hazard_scale_c.max(1e-9);
+        (self.heat_hazard_at_max_per_s * x.exp()).min(10.0 * self.heat_hazard_at_max_per_s)
+    }
+
     /// Foraging activity window at a temperature: one well inside
     /// `forage_min_c..forage_max_c`, fading smoothly to zero over two
     /// degrees at each edge.
@@ -823,6 +847,11 @@ mod tests {
             "half at the half quality"
         );
         assert!(s.crop_sugar_capacity_mg() > 0.0);
+        assert!(
+            s.heat_hazard_per_s(s.critical_thermal_max_c)
+                > s.heat_hazard_per_s(s.critical_thermal_max_c - 5.0)
+        );
+        assert!(s.heat_hazard_per_s(s.critical_thermal_max_c - 15.0) < s.forager_hazard_per_s);
         assert!(s.site_fidelity(1.0) > 0.95 && s.site_fidelity(0.1) < 0.4);
         assert!((s.site_fidelity(0.15) - 0.5).abs() < 1e-9);
         assert!((s.load_fraction(0.0) - 0.3).abs() < 1e-12 && s.load_fraction(1.0) == 1.0);

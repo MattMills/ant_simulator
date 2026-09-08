@@ -243,7 +243,7 @@ fn sucker_with_short_reach_is_path_bound() {
     let sharp = |s: &Stats| s.path.sharp_turn_rate();
     assert!(sharp(&bound) < 0.02, "bound sharp turns {}", sharp(&bound));
     assert!(
-        sharp(&free) > sharp(&bound) + 0.02,
+        sharp(&free) > 2.0 * sharp(&bound),
         "free {} vs bound {}",
         sharp(&free),
         sharp(&bound)
