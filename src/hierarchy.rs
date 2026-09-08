@@ -16,7 +16,7 @@
 //! machinery reads and writes.
 
 use crate::ant::FEATURES;
-use crate::surface::{BehavioralSurface, SurfaceError, PARAM_LEN};
+use crate::surface::{BehavioralSurface, Deformation, SurfaceError, PARAM_LEN};
 use std::fmt::Write as _;
 use std::ops::Range;
 
@@ -115,6 +115,8 @@ pub struct EffectivePolicy {
     pub weights: [f64; FEATURES],
     /// Composed entropy fraction in `[0, 1]`.
     pub entropy_fraction: f64,
+    /// Sum of the raw deformation parameters along the path.
+    pub deformation: Deformation,
 }
 
 /// A tree of controllable nodes.
@@ -301,16 +303,21 @@ impl Hierarchy {
     pub fn effective(&self, id: NodeId) -> EffectivePolicy {
         let mut weights = [0.0; FEATURES];
         let mut fraction: Option<f64> = None;
+        let mut deformation = Deformation::none();
         for &n in &self.paths[id] {
             let s = &self.nodes[n].surface;
             for (w, x) in weights.iter_mut().zip(&s.weights) {
                 *w += x;
             }
             fraction = Some(s.entropy.effective(fraction));
+            deformation.smooth += s.deformation.smooth;
+            deformation.rough += s.deformation.rough;
+            deformation.reach += s.deformation.reach;
         }
         EffectivePolicy {
             weights,
             entropy_fraction: fraction.unwrap_or(0.0),
+            deformation,
         }
     }
 
@@ -357,15 +364,21 @@ impl Hierarchy {
         let mut out = String::new();
         for n in &self.nodes {
             let eff = self.effective(n.id);
+            let geometry = if eff.deformation.is_none() {
+                String::new()
+            } else {
+                format!(", {}", eff.deformation.describe())
+            };
             let _ = writeln!(
                 out,
-                "{}{} [{}] entropy: {} → effective {:.3}, |w| = {:.2}",
+                "{}{} [{}] entropy: {} → effective {:.3}, |w| = {:.2}{}",
                 "  ".repeat(n.depth),
                 n.name,
                 n.level,
                 n.surface.entropy.describe(),
                 eff.entropy_fraction,
-                eff.weights.iter().map(|w| w * w).sum::<f64>().sqrt()
+                eff.weights.iter().map(|w| w * w).sum::<f64>().sqrt(),
+                geometry
             );
         }
         out
@@ -424,6 +437,24 @@ mod tests {
         let compiled = h.compile();
         assert_eq!(compiled.len(), 6);
         assert_eq!(compiled[0], leaf);
+        assert!(leaf.deformation.is_none());
+    }
+
+    #[test]
+    fn deformation_composes_additively() {
+        let mut h = Hierarchy::default();
+        h.node_mut(0).surface.deformation.smooth = 0.5;
+        h.node_mut(1).surface.deformation.smooth = 0.25;
+        h.node_mut(1).surface.deformation.reach = 1.0;
+        h.node_mut(2).surface.deformation.rough = -0.75;
+        let leaf = h.effective(2);
+        assert!((leaf.deformation.smooth - 0.75).abs() < 1e-12);
+        assert!((leaf.deformation.rough + 0.75).abs() < 1e-12);
+        assert!((leaf.deformation.reach - 1.0).abs() < 1e-12);
+        let other = h.effective(5);
+        assert!((other.deformation.smooth - 0.5).abs() < 1e-12);
+        assert_eq!(other.deformation.rough, 0.0);
+        assert!(h.describe().contains("reach ×2.72"));
     }
 
     #[test]

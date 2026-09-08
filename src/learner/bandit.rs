@@ -1,37 +1,108 @@
-//! A bandit over the entropy dial alone.
+//! Bandits over the dials of a surface: entropy alone, or the geometry.
 
 use super::{Learner, LeverView, Outcome, RunningStats};
 use crate::rng::Rng;
-use crate::surface::ENTROPY_PARAM;
+use crate::surface::{ENTROPY_PARAM, REACH_PARAM, ROUGH_PARAM, SMOOTH_PARAM};
 
-/// UCB1 over a fixed grid of raw entropy settings.
+/// One arm of a [`DialBandit`]: the parameter indices it sets and the
+/// values it sets them to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arm {
+    /// `(parameter index, value)` pairs.
+    pub settings: Vec<(usize, f64)>,
+    /// Short label for reports.
+    pub label: String,
+}
+
+impl Arm {
+    /// An arm setting a single parameter.
+    pub fn single(index: usize, value: f64) -> Self {
+        Arm {
+            settings: vec![(index, value)],
+            label: format!("{value:+.1}"),
+        }
+    }
+
+    fn apply(&self, params: &mut [f64]) {
+        for &(index, value) in &self.settings {
+            if let Some(slot) = params.get_mut(index) {
+                *slot = value;
+            }
+        }
+    }
+}
+
+/// UCB1 over a fixed set of dial settings.
 ///
-/// This learner leaves the weights of whatever surface it holds untouched and
-/// only turns the entropy dial. It is the purest form of the crate's
-/// premise: an agent whose only lever is "how much disorder does the thing I
-/// am connected to have", learning which setting pays.
+/// The bandit leaves every parameter it does not own untouched and only sets
+/// the dials of its arms. [`DialBandit::entropy`] is the purest form of the
+/// crate's premise: an agent whose only lever is "how much disorder does the
+/// thing I am connected to have", learning which setting pays.
+/// [`DialBandit::geometry`] instead searches how that disorder is shaped
+/// (smoothing, roughening, and the sucker's reach).
 #[derive(Clone, Debug)]
-pub struct EntropyBandit {
-    arms: Vec<f64>,
+pub struct DialBandit {
+    arms: Vec<Arm>,
     stats: Vec<RunningStats>,
     global: RunningStats,
     exploration: f64,
     pending: Option<usize>,
+    name: String,
 }
 
-impl EntropyBandit {
-    /// Bandit over the given raw dial values (`sigmoid` for absolute dials,
-    /// `exp` for relative ones).
-    pub fn new(arms: Vec<f64>) -> Self {
-        assert!(!arms.is_empty(), "EntropyBandit needs at least one arm");
+/// The entropy-only bandit; see [`DialBandit::entropy`].
+pub type EntropyBandit = DialBandit;
+
+impl DialBandit {
+    /// Bandit over arbitrary arms.
+    pub fn new(arms: Vec<Arm>) -> Self {
+        assert!(!arms.is_empty(), "DialBandit needs at least one arm");
         let n = arms.len();
-        EntropyBandit {
+        DialBandit {
             arms,
             stats: vec![RunningStats::default(); n],
             global: RunningStats::default(),
             exploration: 1.0,
             pending: None,
+            name: "dial-bandit".to_string(),
         }
+    }
+
+    /// Seven arms on the entropy dial, from very ordered (`-2.5`) to very
+    /// disordered (`+2.5`), leaving everything else alone.
+    pub fn entropy() -> Self {
+        let mut b = DialBandit::new(
+            [-2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5]
+                .into_iter()
+                .map(|v| Arm::single(ENTROPY_PARAM, v))
+                .collect(),
+        );
+        b.name = "entropy-bandit".to_string();
+        b
+    }
+
+    /// Twelve arms over the geometry of disorder: smoothing off/on,
+    /// roughening off/on, and the sucker's reach at a quarter, once, or four
+    /// times its base value.
+    pub fn geometry() -> Self {
+        let mut arms = Vec::new();
+        for (smooth, s_label) in [(0.0, "flat"), (1.2, "smooth")] {
+            for (rough, r_label) in [(0.0, ""), (1.2, "+rough")] {
+                for (reach, k_label) in [(-1.386, "¼reach"), (0.0, "reach"), (1.386, "4×reach")] {
+                    arms.push(Arm {
+                        settings: vec![
+                            (SMOOTH_PARAM, smooth),
+                            (ROUGH_PARAM, rough),
+                            (REACH_PARAM, reach),
+                        ],
+                        label: format!("{s_label}{r_label}/{k_label}"),
+                    });
+                }
+            }
+        }
+        let mut b = DialBandit::new(arms);
+        b.name = "geometry-bandit".to_string();
+        b
     }
 
     /// Scale the exploration bonus.
@@ -40,8 +111,8 @@ impl EntropyBandit {
         self
     }
 
-    /// The arm values.
-    pub fn arms(&self) -> &[f64] {
+    /// The arms.
+    pub fn arms(&self) -> &[Arm] {
         &self.arms
     }
 
@@ -78,25 +149,23 @@ impl EntropyBandit {
     }
 }
 
-impl Default for EntropyBandit {
-    /// Seven arms spanning very ordered to very disordered.
+impl Default for DialBandit {
+    /// The entropy bandit.
     fn default() -> Self {
-        EntropyBandit::new(vec![-2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5])
+        DialBandit::entropy()
     }
 }
 
-impl Learner for EntropyBandit {
+impl Learner for DialBandit {
     fn name(&self) -> &str {
-        "entropy-bandit"
+        &self.name
     }
 
     fn act(&mut self, view: &LeverView<'_>, _rng: &mut Rng) -> Vec<f64> {
         let arm = self.choose();
         self.pending = Some(arm);
         let mut params = view.params.to_vec();
-        if let Some(slot) = params.get_mut(ENTROPY_PARAM.min(view.params.len().saturating_sub(1))) {
-            *slot = self.arms[arm];
-        }
+        self.arms[arm].apply(&mut params);
         params
     }
 
@@ -112,8 +181,7 @@ impl Learner for EntropyBandit {
             return None;
         }
         let mut params = view.params.to_vec();
-        let idx = ENTROPY_PARAM.min(params.len() - 1);
-        params[idx] = self.arms[self.best_arm()];
+        self.arms[self.best_arm()].apply(&mut params);
         Some(params)
     }
 
@@ -123,11 +191,12 @@ impl Learner for EntropyBandit {
             .stats
             .iter()
             .zip(&self.arms)
-            .map(|(s, a)| format!("{a:+.1}:{:.1}", s.mean()))
+            .map(|(s, a)| format!("{}:{:.1}", a.label, s.mean()))
             .collect();
         format!(
-            "entropy-bandit best raw {:+.1} ({} pulls) [{}]",
-            self.arms[best],
+            "{} best {} ({} pulls) [{}]",
+            self.name,
+            self.arms[best].label,
             self.stats[best].count(),
             means.join(" ")
         )
@@ -137,12 +206,24 @@ impl Learner for EntropyBandit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::surface::PARAM_LEN;
+
+    fn outcome(turn: u64, reward: f64) -> Outcome {
+        Outcome {
+            turn,
+            lever: 0,
+            reward,
+            score: None,
+            decisions: 0,
+            mean_entropy: 0.0,
+        }
+    }
 
     #[test]
     fn finds_the_paying_arm() {
         let mut rng = Rng::seed_from_u64(4);
-        let mut bandit = EntropyBandit::default();
-        let params = vec![0.0; 17];
+        let mut bandit = DialBandit::entropy();
+        let params = vec![0.0; PARAM_LEN];
         for turn in 0..300u64 {
             let view = LeverView {
                 turn,
@@ -152,22 +233,13 @@ mod tests {
                 revealed_node: None,
             };
             let p = bandit.act(&view, &mut rng);
-            assert_eq!(p.len(), 17);
+            assert_eq!(p.len(), PARAM_LEN);
             // Reward peaks when the raw dial is 0.5.
             let reward = -(p[ENTROPY_PARAM] - 0.5).abs() + rng.normal_with(0.0, 0.2);
-            bandit.feedback(
-                &Outcome {
-                    turn,
-                    lever: 0,
-                    reward,
-                    score: None,
-                    decisions: 0,
-                    mean_entropy: 0.0,
-                },
-                &mut rng,
-            );
+            bandit.feedback(&outcome(turn, reward), &mut rng);
         }
-        assert_eq!(bandit.arms()[bandit.best_arm()], 0.5);
+        let best = &bandit.arms()[bandit.best_arm()];
+        assert_eq!(best.settings, vec![(ENTROPY_PARAM, 0.5)]);
         let view = LeverView {
             turn: 300,
             lever: 0,
@@ -178,6 +250,28 @@ mod tests {
         let released = bandit.release(&view, &mut rng).unwrap();
         assert_eq!(released[ENTROPY_PARAM], 0.5);
         assert_eq!(released[..ENTROPY_PARAM], params[..ENTROPY_PARAM]);
-        assert!(bandit.summary().contains("best raw +0.5"));
+        assert!(bandit.summary().contains("best +0.5"));
+        assert_eq!(bandit.name(), "entropy-bandit");
+    }
+
+    #[test]
+    fn geometry_arms_set_only_geometry() {
+        let mut rng = Rng::seed_from_u64(5);
+        let mut bandit = DialBandit::geometry();
+        assert_eq!(bandit.arms().len(), 12);
+        let params: Vec<f64> = (0..PARAM_LEN).map(|i| i as f64).collect();
+        let view = LeverView {
+            turn: 0,
+            lever: 0,
+            params: &params,
+            last_reward: None,
+            revealed_node: None,
+        };
+        let p = bandit.act(&view, &mut rng);
+        assert_eq!(p[..SMOOTH_PARAM], params[..SMOOTH_PARAM]);
+        assert!(p[SMOOTH_PARAM] == 0.0 || p[SMOOTH_PARAM] == 1.2);
+        assert!(p[REACH_PARAM].abs() < 1.5);
+        bandit.feedback(&outcome(0, 1.0), &mut rng);
+        assert!(bandit.summary().starts_with("geometry-bandit"));
     }
 }

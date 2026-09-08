@@ -66,6 +66,8 @@ pub struct Ant {
     pub steps_since_food: u32,
     /// Completed food deliveries.
     pub deliveries: u32,
+    /// Where the food currently carried was picked up.
+    pub pickup: Option<Position>,
     memory: [Position; MEMORY_LEN],
     memory_cursor: usize,
 }
@@ -91,6 +93,7 @@ impl Ant {
             steps_since_nest: 0,
             steps_since_food: u32::MAX / 2,
             deliveries: 0,
+            pickup: None,
             memory: [position; MEMORY_LEN],
             memory_cursor: 0,
         }

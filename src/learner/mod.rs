@@ -23,7 +23,7 @@ pub mod phase_aware;
 pub mod policy_gradient;
 pub mod simple;
 
-pub use bandit::EntropyBandit;
+pub use bandit::{Arm, DialBandit, EntropyBandit};
 pub use cross_entropy::CrossEntropy;
 pub use hill_climb::{HillClimber, Mutation};
 pub use period::PeriodDetector;

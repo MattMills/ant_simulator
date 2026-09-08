@@ -28,6 +28,15 @@
 //!   root to a leaf, and entropy dials compose, so each level controls the
 //!   behaviour of every entity beneath it.
 //!
+//! * **Path surfaces and geometric selection** ([`landscape`]): the eight
+//!   candidate directions form a ring around the ant's heading, and the
+//!   scores on that ring are the deterministic information of the path.
+//!   The entropy budget deforms it through separable channels (tempering,
+//!   smoothing along the ring, a random roughening field), and a direction
+//!   is selected either by a global draw or by a *sucker* that crawls the
+//!   ring for a bounded reach. An entropy ledger says where each decision's
+//!   disorder came from, and path statistics say what it did to the paths.
+//!
 //! * **Learners and rotating levers** ([`learner`], [`rotation`], [`arena`]):
 //!   several learners each hold a lever. Each turn the arena connects the
 //!   levers to nodes of the hierarchy according to a [`rotation::Rotation`],
@@ -59,6 +68,24 @@
 //! ```
 //! use ant_simulator::prelude::*;
 //!
+//! // Spend the budget geometrically and select with a sucker of reach 4.
+//! let config = SimConfig {
+//!     selection: Selection::Sucker { reach: 4 },
+//!     instinct: BehavioralSurface::instinct()
+//!         .with_deformation(Deformation { smooth: 1.0, rough: 0.0, reach: 0.0 }),
+//!     record_surface: Some(0),
+//!     ..SimConfig::default()
+//! };
+//! let mut sim = Simulation::new(config, 3);
+//! sim.run(60);
+//! let c = sim.stats().path.ledger.contributions();
+//! assert!(c.smoothing > 0.0);
+//! println!("{}", render_surface(sim.surface_trace(), 8));
+//! ```
+//!
+//! ```
+//! use ant_simulator::prelude::*;
+//!
 //! // Several learners with hidden, rotating levers over the whole hierarchy.
 //! let learners: Vec<Box<dyn Learner>> = vec![
 //!     Box::new(PhaseAware::new(HillClimber::new(0.2), 8)),
@@ -83,6 +110,7 @@ pub mod colony;
 pub mod entropy;
 pub mod geometry;
 pub mod hierarchy;
+pub mod landscape;
 pub mod learner;
 pub mod render;
 pub mod rng;
@@ -98,20 +126,28 @@ pub mod prelude {
         TurnRecord,
     };
     pub use crate::colony::{
-        EnergyConfig, PheromoneConfig, RewardSpec, SimConfig, Simulation, Stats, Trace,
+        EnergyConfig, GeometryConfig, PathStats, PheromoneConfig, RewardSpec, Selection, SimConfig,
+        Simulation, Stats, SurfaceRow, Trace,
     };
     pub use crate::entropy::EntropyControl;
     pub use crate::geometry::{Direction, Position};
     pub use crate::hierarchy::{
         EffectivePolicy, Hierarchy, HierarchySpec, LevelSpec, Node, NodeId,
     };
-    pub use crate::learner::{
-        CrossEntropy, EntropyBandit, HillClimber, Learner, LeverView, Mutation, Outcome,
-        PeriodDetector, PhaseAware, PolicyGradient, RandomLearner, StaticLearner,
+    pub use crate::landscape::{
+        ring_index, world_direction, Contributions, EntropyLedger, Landscape, Sucker, Tempered,
+        DISPLAY_ORDER, RING, TURN_LABELS,
     };
-    pub use crate::render::render;
+    pub use crate::learner::{
+        Arm, CrossEntropy, DialBandit, EntropyBandit, HillClimber, Learner, LeverView, Mutation,
+        Outcome, PeriodDetector, PhaseAware, PolicyGradient, RandomLearner, StaticLearner,
+    };
+    pub use crate::render::{render, render_surface};
     pub use crate::rng::Rng;
     pub use crate::rotation::{Mapping, Rotation, RotationSchedule};
-    pub use crate::surface::{BehavioralSurface, ENTROPY_PARAM, PARAM_LEN};
+    pub use crate::surface::{
+        BehavioralSurface, Deformation, ENTROPY_PARAM, PARAM_LEN, REACH_PARAM, ROUGH_PARAM,
+        SMOOTH_PARAM,
+    };
     pub use crate::world::{FoodSource, RandomFood, Rect, Terrain, World, WorldConfig};
 }

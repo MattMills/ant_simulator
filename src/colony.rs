@@ -1,15 +1,18 @@
 //! The colony simulation: world, ants, and the hierarchy that governs them.
 //!
 //! Each tick every living ant senses its surroundings, scores the eight
-//! candidate directions through the effective policy of its category, draws a
-//! direction from the entropy-controlled distribution, moves, lays pheromone,
-//! and interacts with food or the nest. Then pheromones evaporate and diffuse
-//! and the colony spends stored food on new ants.
+//! candidate directions through the effective policy of its category, lays
+//! that ring out as a landscape in front of itself, deforms it with the
+//! entropy budget (smoothing, roughening, tempering), selects a direction
+//! (a global draw or a crawling sucker), moves, lays pheromone, and interacts
+//! with food or the nest. Then pheromones evaporate and diffuse and the
+//! colony spends stored food on new ants.
 
-use crate::ant::{observe, Ant, FEATURES};
-use crate::entropy::tempered_distribution;
-use crate::geometry::Direction;
+use crate::ant::{observe, Ant, AntId, FEATURES};
+use crate::entropy::entropy;
+use crate::geometry::{Direction, Position};
 use crate::hierarchy::{EffectivePolicy, Hierarchy, HierarchySpec, NodeId};
+use crate::landscape::{ring_index, world_direction, EntropyLedger, Landscape, Sucker, RING};
 use crate::rng::Rng;
 use crate::surface::{BehavioralSurface, SurfaceError, PARAM_LEN};
 use crate::world::{Terrain, World, WorldConfig};
@@ -86,6 +89,50 @@ impl Default for RewardSpec {
     }
 }
 
+/// How a direction is drawn from the deformed landscape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// A global draw from the tempered distribution.
+    Softmax,
+    /// A [`Sucker`] crawling from straight ahead. `reach` is the base number
+    /// of steps, scaled by the effective surface's reach parameter.
+    Sucker {
+        /// Base reach in proposal steps.
+        reach: usize,
+    },
+}
+
+/// Parameters of the geometric entropy channels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeometryConfig {
+    /// Smoothing scale, in ring steps, at full smoothing share and full
+    /// entropy budget.
+    pub smooth_max: f64,
+    /// Number of Fourier modes in the roughening field.
+    pub rough_modes: usize,
+    /// Upper bound on the sucker's reach.
+    pub max_reach: usize,
+    /// Whether to keep the entropy ledger (a little extra work per decision).
+    pub ledger: bool,
+    /// Extra random fields drawn per decision, when roughening is active and
+    /// the ledger is on, to estimate the entropy the field injects between
+    /// decisions (`Contributions::field`). Consumes randomness, so a run with
+    /// the ledger on differs from one with it off whenever roughening is on.
+    pub field_samples: usize,
+}
+
+impl Default for GeometryConfig {
+    fn default() -> Self {
+        GeometryConfig {
+            smooth_max: 2.0,
+            rough_modes: 3,
+            max_reach: 64,
+            ledger: true,
+            field_samples: 4,
+        }
+    }
+}
+
 /// Complete simulation configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SimConfig {
@@ -105,6 +152,14 @@ pub struct SimConfig {
     pub reward: RewardSpec,
     /// Whether to accumulate policy-gradient score sums per node.
     pub trace: bool,
+    /// How directions are selected from the landscape.
+    pub selection: Selection,
+    /// Geometric channel parameters.
+    pub geometry: GeometryConfig,
+    /// Record the path surface of this ant (see [`Simulation::surface_trace`]).
+    pub record_surface: Option<AntId>,
+    /// Maximum rows kept in the surface recording.
+    pub surface_rows: usize,
 }
 
 impl Default for SimConfig {
@@ -118,6 +173,110 @@ impl Default for SimConfig {
             pheromone: PheromoneConfig::default(),
             reward: RewardSpec::default(),
             trace: false,
+            selection: Selection::Softmax,
+            geometry: GeometryConfig::default(),
+            record_surface: None,
+            surface_rows: 256,
+        }
+    }
+}
+
+/// Geometry of the paths ants walked, plus the entropy ledger.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PathStats {
+    /// Moves made.
+    pub moves: u64,
+    /// Moves by ring position relative to the previous heading
+    /// (0 straight, 4 reverse; see [`crate::landscape::TURN_LABELS`]).
+    pub turns: [u64; RING],
+    /// Moves onto a cell the ant had visited recently.
+    pub revisits: u64,
+    /// Completed food-to-nest trips.
+    pub trips: u64,
+    /// Steps taken on those trips.
+    pub trip_steps: u64,
+    /// Straight-line (Chebyshev) distance those trips needed.
+    pub trip_direct: u64,
+    /// Where the decision entropy came from.
+    pub ledger: EntropyLedger,
+}
+
+impl PathStats {
+    fn record_move(&mut self, ring: usize, revisit: bool) {
+        self.moves += 1;
+        self.turns[ring] += 1;
+        if revisit {
+            self.revisits += 1;
+        }
+    }
+
+    fn record_trip(&mut self, steps: u64, direct: u64) {
+        self.trips += 1;
+        self.trip_steps += steps;
+        self.trip_direct += direct;
+    }
+
+    /// Add another record's counts.
+    pub fn merge(&mut self, other: &PathStats) {
+        self.moves += other.moves;
+        for (a, b) in self.turns.iter_mut().zip(&other.turns) {
+            *a += b;
+        }
+        self.revisits += other.revisits;
+        self.trips += other.trips;
+        self.trip_steps += other.trip_steps;
+        self.trip_direct += other.trip_direct;
+        self.ledger.merge(&other.ledger);
+    }
+
+    /// Entropy (nats) of the distribution of turns: the disorder of the path
+    /// itself rather than of the decisions that produced it.
+    pub fn turn_entropy(&self) -> f64 {
+        if self.moves == 0 {
+            return 0.0;
+        }
+        let probs: Vec<f64> = self
+            .turns
+            .iter()
+            .map(|&t| t as f64 / self.moves as f64)
+            .collect();
+        entropy(&probs)
+    }
+
+    /// Fraction of moves that kept the heading.
+    pub fn straight_rate(&self) -> f64 {
+        if self.moves == 0 {
+            0.0
+        } else {
+            self.turns[0] as f64 / self.moves as f64
+        }
+    }
+
+    /// Fraction of moves that reversed the heading.
+    pub fn reversal_rate(&self) -> f64 {
+        if self.moves == 0 {
+            0.0
+        } else {
+            self.turns[RING / 2] as f64 / self.moves as f64
+        }
+    }
+
+    /// Fraction of moves onto a recently visited cell.
+    pub fn revisit_rate(&self) -> f64 {
+        if self.moves == 0 {
+            0.0
+        } else {
+            self.revisits as f64 / self.moves as f64
+        }
+    }
+
+    /// Straight-line distance divided by steps taken, averaged over trips
+    /// (1 is a perfectly direct return; 0 if there were no trips).
+    pub fn trip_efficiency(&self) -> f64 {
+        if self.trip_steps == 0 {
+            0.0
+        } else {
+            self.trip_direct as f64 / self.trip_steps as f64
         }
     }
 }
@@ -139,12 +298,19 @@ pub struct Stats {
     pub reward: f64,
     /// Number of movement decisions made.
     pub decisions: u64,
-    /// Sum of realised decision entropies (nats).
+    /// Sum of the entropy targets met by tempering (nats).
     pub entropy_sum: f64,
+    /// Sum of entropies of the distributions directions were actually drawn
+    /// from (equal to `entropy_sum` under [`Selection::Softmax`]).
+    pub selected_entropy_sum: f64,
     /// Reward attributed to each node (every event credits the whole path).
     pub reward_by_node: Vec<f64>,
     /// Deliveries attributed to each node.
     pub delivered_by_node: Vec<u64>,
+    /// Path geometry and entropy ledger for the whole colony.
+    pub path: PathStats,
+    /// Path geometry and entropy ledger per node.
+    pub path_by_node: Vec<PathStats>,
     /// Living ants at the end of the last tick.
     pub alive: usize,
     /// Food currently stored in the nest.
@@ -156,11 +322,12 @@ impl Stats {
         Stats {
             reward_by_node: vec![0.0; nodes],
             delivered_by_node: vec![0; nodes],
+            path_by_node: vec![PathStats::default(); nodes],
             ..Stats::default()
         }
     }
 
-    /// Mean realised entropy per decision.
+    /// Mean entropy target per decision (what the dial asked for).
     pub fn mean_entropy(&self) -> f64 {
         if self.decisions == 0 {
             0.0
@@ -168,13 +335,23 @@ impl Stats {
             self.entropy_sum / self.decisions as f64
         }
     }
+
+    /// Mean entropy of the distributions directions were drawn from.
+    pub fn mean_selected_entropy(&self) -> f64 {
+        if self.decisions == 0 {
+            0.0
+        } else {
+            self.selected_entropy_sum / self.decisions as f64
+        }
+    }
 }
 
 /// Policy-gradient bookkeeping: for every node, the sum over decisions made
 /// beneath it of `∇ log π(a)` with respect to that node's parameters.
 ///
-/// The gradient treats the solved temperature as a constant. The entropy
-/// parameter's entry is always zero.
+/// The gradient is that of the tempered distribution, treating the solved
+/// temperature as a constant; under [`Selection::Sucker`] it is an
+/// approximation. Only the weight entries are non-zero.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Trace {
     /// Score-function sums, one `PARAM_LEN` vector per node.
@@ -192,6 +369,36 @@ impl Trace {
     }
 }
 
+/// One decision of the recorded ant: its landscape at every stage, laid out
+/// egocentrically (index 0 straight ahead).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRow {
+    /// Tick of the decision.
+    pub tick: u64,
+    /// Where the ant stood.
+    pub position: Position,
+    /// Its heading (ring index 0 in world terms).
+    pub heading: Direction,
+    /// Whether it carried food.
+    pub carrying: bool,
+    /// Enterable ring positions.
+    pub valid: [bool; RING],
+    /// The deterministic information: scores from the effective surface.
+    pub base: [f64; RING],
+    /// Scores after smoothing and roughening.
+    pub deformed: [f64; RING],
+    /// The tempered distribution.
+    pub probs: [f64; RING],
+    /// The distribution the direction was actually drawn from.
+    pub selected: [f64; RING],
+    /// The chosen ring position.
+    pub chosen: usize,
+    /// The sucker's trail (empty under [`Selection::Softmax`]).
+    pub walk: Vec<u8>,
+    /// Solved temperature.
+    pub temperature: f64,
+}
+
 /// A running colony.
 #[derive(Clone, Debug)]
 pub struct Simulation {
@@ -205,6 +412,7 @@ pub struct Simulation {
     dirty: bool,
     stats: Stats,
     trace: Trace,
+    surface: Vec<SurfaceRow>,
     food_store: u64,
     alive: usize,
     next_leaf: usize,
@@ -239,6 +447,7 @@ impl Simulation {
             dirty: false,
             stats: Stats::new(nodes),
             trace: Trace::new(nodes),
+            surface: Vec::new(),
             food_store: 0,
             alive: 0,
             next_leaf: 0,
@@ -331,6 +540,17 @@ impl Simulation {
         &self.trace
     }
 
+    /// The recorded path surface of the ant named by
+    /// [`SimConfig::record_surface`], oldest row first.
+    pub fn surface_trace(&self) -> &[SurfaceRow] {
+        &self.surface
+    }
+
+    /// Forget the recorded path surface.
+    pub fn clear_surface_trace(&mut self) {
+        self.surface.clear();
+    }
+
     /// Zero the counters and trace without touching the colony state.
     pub fn reset_stats(&mut self) {
         let nodes = self.hierarchy.len();
@@ -353,6 +573,19 @@ impl Simulation {
     /// Number of living ants.
     pub fn alive(&self) -> usize {
         self.alive
+    }
+
+    /// The sucker reach an effective policy implies under the current config
+    /// (`None` under [`Selection::Softmax`]).
+    pub fn effective_reach(&self, policy: &EffectivePolicy) -> Option<usize> {
+        match self.config.selection {
+            Selection::Softmax => None,
+            Selection::Sucker { reach } => Some(
+                (reach as f64 * policy.deformation.reach_scale())
+                    .round()
+                    .clamp(0.0, self.config.geometry.max_reach as f64) as usize,
+            ),
+        }
     }
 
     /// Advance the colony by one tick.
@@ -382,38 +615,131 @@ impl Simulation {
     }
 
     fn decide(&mut self, i: usize) -> Option<Direction> {
-        let ant = &self.ants[i];
-        let policy = &self.policies[ant.leaf];
-        let obs = observe(ant, &self.world);
-        let mut logits = [f64::NEG_INFINITY; Direction::COUNT];
+        let (heading, leaf, id, position, carrying) = {
+            let a = &self.ants[i];
+            (a.heading, a.leaf, a.id, a.position, a.carrying)
+        };
+        let obs = observe(&self.ants[i], &self.world);
+        let policy = self.policies[leaf].clone();
+
+        // The deterministic information of the path: scores per direction.
+        let mut scores = [f64::NEG_INFINITY; RING];
         let mut any = false;
-        for ((logit, valid), features) in logits.iter_mut().zip(&obs.valid).zip(&obs.features) {
+        for ((score, valid), features) in scores.iter_mut().zip(&obs.valid).zip(&obs.features) {
             if *valid {
-                *logit = crate::surface::dot(&policy.weights, features);
+                *score = crate::surface::dot(&policy.weights, features);
                 any = true;
             }
         }
         if !any {
             return None;
         }
-        let mut probs = [0.0; Direction::COUNT];
-        let (temperature, h) = tempered_distribution(&logits, policy.entropy_fraction, &mut probs);
-        let choice = self.rng.choose_weighted(&probs);
+        let base = Landscape::from_world(&scores, &obs.valid, heading);
+
+        // Geometric deformation with the entropy budget.
+        let h = policy.entropy_fraction;
+        let smooth_scale = policy.deformation.smooth_share() * h * self.config.geometry.smooth_max;
+        let smoothed = base.smoothed(smooth_scale);
+        let rough_amplitude = policy.deformation.rough_share() * h * base.range().max(1.0);
+        let deformed = smoothed.roughened(
+            rough_amplitude,
+            self.config.geometry.rough_modes,
+            &mut self.rng,
+        );
+        let tempered = deformed.temper(h);
+
+        // Selection.
+        let start = base.nearest_valid(0).expect("at least one valid direction");
+        let recording = self.config.record_surface == Some(id);
+        let keep = self.config.geometry.ledger || recording;
+        let (chosen, walk, selected) = match self.config.selection {
+            Selection::Softmax => (
+                self.rng.choose_weighted(&tempered.probs),
+                Vec::new(),
+                tempered.probs,
+            ),
+            Selection::Sucker { .. } => {
+                let reach = self.effective_reach(&policy).unwrap_or(0);
+                let sucker = Sucker { reach };
+                let (j, walk) = sucker.walk(&tempered.scaled, start, &mut self.rng);
+                let dist = if keep {
+                    sucker.distribution(&tempered.scaled, start)
+                } else {
+                    tempered.probs
+                };
+                (j, walk, dist)
+            }
+        };
+
+        // Accounting.
         self.stats.decisions += 1;
-        self.stats.entropy_sum += h;
+        self.stats.entropy_sum += tempered.entropy;
+        let selected_entropy = if keep {
+            entropy(&selected)
+        } else {
+            tempered.entropy
+        };
+        self.stats.selected_entropy_sum += selected_entropy;
+        if self.config.geometry.ledger {
+            let t = tempered.temperature;
+            let base_h = base.entropy_at(t);
+            let smooth_h = smoothed.entropy_at(t);
+            let samples = self.config.geometry.field_samples;
+            let mixture_h = if rough_amplitude > 0.0 && samples > 0 {
+                // Every roughened landscape is tempered to the same target,
+                // so the entropy of their mixture exceeds the target by
+                // exactly the disorder the field carries between decisions.
+                let mut mixture = tempered.probs;
+                for _ in 0..samples {
+                    let other = smoothed
+                        .roughened(
+                            rough_amplitude,
+                            self.config.geometry.rough_modes,
+                            &mut self.rng,
+                        )
+                        .temper(h);
+                    for (m, p) in mixture.iter_mut().zip(&other.probs) {
+                        *m += p;
+                    }
+                }
+                for m in mixture.iter_mut() {
+                    *m /= (samples + 1) as f64;
+                }
+                entropy(&mixture)
+            } else {
+                tempered.entropy
+            };
+            self.stats.path.ledger.record(
+                base_h,
+                smooth_h,
+                tempered.entropy,
+                mixture_h,
+                selected_entropy,
+            );
+            for &node in &self.leaf_paths[leaf] {
+                self.stats.path_by_node[node].ledger.record(
+                    base_h,
+                    smooth_h,
+                    tempered.entropy,
+                    mixture_h,
+                    selected_entropy,
+                );
+            }
+        }
         if self.config.trace {
             let mut score = [0.0; FEATURES];
-            for (p, features) in probs.iter().zip(&obs.features) {
-                if *p > 0.0 {
-                    for (s, f) in score.iter_mut().zip(features) {
+            for (d, dir) in Direction::ALL.iter().enumerate() {
+                let p = tempered.probs[ring_index(*dir, heading)];
+                if p > 0.0 {
+                    for (s, f) in score.iter_mut().zip(&obs.features[d]) {
                         *s -= p * f;
                     }
                 }
             }
-            for (s, f) in score.iter_mut().zip(&obs.features[choice]) {
-                *s = (*s + f) / temperature;
+            let chosen_world = world_direction(chosen, heading).index();
+            for (s, f) in score.iter_mut().zip(&obs.features[chosen_world]) {
+                *s = (*s + f) / tempered.temperature;
             }
-            let leaf = ant.leaf;
             for &node in &self.leaf_paths[leaf] {
                 let acc = &mut self.trace.score_by_node[node];
                 for (a, s) in acc.iter_mut().zip(&score) {
@@ -422,7 +748,28 @@ impl Simulation {
                 self.trace.decisions_by_node[node] += 1;
             }
         }
-        Some(Direction::from_index(choice))
+        if recording {
+            self.surface.push(SurfaceRow {
+                tick: self.tick,
+                position,
+                heading,
+                carrying,
+                valid: base.valid,
+                base: base.values,
+                deformed: deformed.values,
+                probs: tempered.probs,
+                selected,
+                chosen,
+                walk,
+                temperature: tempered.temperature,
+            });
+            let cap = self.config.surface_rows.max(1);
+            if self.surface.len() > cap {
+                let excess = self.surface.len() - cap;
+                self.surface.drain(..excess);
+            }
+        }
+        Some(world_direction(chosen, heading))
     }
 
     fn credit(&mut self, leaf: usize, reward: f64, delivered: bool) {
@@ -436,9 +783,16 @@ impl Simulation {
     }
 
     fn step_ant(&mut self, i: usize) {
+        let leaf = self.ants[i].leaf;
         if let Some(dir) = self.decide(i) {
             let from = self.ants[i].position;
             let to = from.step(dir);
+            let ring = ring_index(dir, self.ants[i].heading);
+            let revisit = self.ants[i].recently_visited(to);
+            self.stats.path.record_move(ring, revisit);
+            for &node in &self.leaf_paths[leaf] {
+                self.stats.path_by_node[node].record_move(ring, revisit);
+            }
             if let Some(c) = self.world.cell_mut(from) {
                 c.occupancy = c.occupancy.saturating_sub(1);
             }
@@ -468,9 +822,10 @@ impl Simulation {
         self.world.deposit(pos, home_amt, food_amt);
 
         // Interact with the cell.
-        let leaf = self.ants[i].leaf;
         let reward = self.config.reward.clone();
-        let mut delivered = false;
+        let nest = self.world.nest();
+        let nest_radius = self.config.world.nest_radius.max(0);
+        let mut delivered: Option<(u64, u64)> = None;
         let mut picked = false;
         let mut at_nest = false;
         if let Some(cell) = self.world.cell_mut(pos) {
@@ -480,22 +835,34 @@ impl Simulation {
                 cell.food -= 1;
                 ant.carrying = true;
                 ant.steps_since_food = 0;
+                ant.pickup = Some(pos);
                 ant.heading = ant.heading.opposite();
                 picked = true;
             } else if ant.carrying && at_nest {
                 ant.carrying = false;
                 ant.deliveries += 1;
                 ant.heading = ant.heading.opposite();
-                delivered = true;
+                // Straight-line distance to the nearest nest cell, so a
+                // perfectly direct return scores exactly 1.
+                let direct = ant
+                    .pickup
+                    .take()
+                    .map(|p| (p.chebyshev(nest) - nest_radius).max(0))
+                    .unwrap_or(0) as u64;
+                delivered = Some((ant.steps_since_food as u64, direct));
             }
         }
         if picked {
             self.stats.food_picked += 1;
             self.credit(leaf, reward.food_picked, false);
         }
-        if delivered {
+        if let Some((steps, direct)) = delivered {
             self.food_store += 1;
             self.stats.food_delivered += 1;
+            self.stats.path.record_trip(steps, direct);
+            for &node in &self.leaf_paths[leaf] {
+                self.stats.path_by_node[node].record_trip(steps, direct);
+            }
             self.credit(leaf, reward.food_delivered, true);
         }
 
@@ -542,7 +909,7 @@ impl Simulation {
 mod tests {
     use super::*;
     use crate::entropy::EntropyControl;
-    use crate::geometry::Position;
+    use crate::surface::Deformation;
 
     fn quick_config() -> SimConfig {
         SimConfig {
@@ -567,6 +934,7 @@ mod tests {
         assert!(s.food_delivered > 0, "ants should bring food home: {s:?}");
         assert!(s.decisions >= s.ticks * 30 - s.deaths * s.ticks);
         assert!(s.mean_entropy() > 0.0);
+        assert!((s.mean_selected_entropy() - s.mean_entropy()).abs() < 1e-9);
         let total: u64 = sim
             .hierarchy()
             .leaves()
@@ -575,6 +943,19 @@ mod tests {
             .sum();
         assert_eq!(total, s.food_delivered);
         assert_eq!(s.delivered_by_node[0], s.food_delivered);
+        // Path statistics are consistent.
+        assert_eq!(s.path.moves, s.path.turns.iter().sum::<u64>());
+        assert_eq!(s.path.trips, s.food_delivered);
+        assert!(s.path.trip_efficiency() > 0.0 && s.path.trip_efficiency() <= 1.0);
+        assert!(s.path.turn_entropy() > 0.0);
+        assert_eq!(s.path_by_node[0], s.path);
+        let leaf_moves: u64 = sim
+            .hierarchy()
+            .leaves()
+            .iter()
+            .map(|&l| s.path_by_node[l].moves)
+            .sum();
+        assert_eq!(leaf_moves, s.path.moves);
     }
 
     #[test]
@@ -635,7 +1016,7 @@ mod tests {
         let t = on.trace();
         assert_eq!(t.decisions_by_node[0], on.stats().decisions);
         assert!(t.score_by_node[0].iter().any(|x| x.abs() > 0.0));
-        assert_eq!(t.score_by_node[0][PARAM_LEN - 1], 0.0);
+        assert!(t.score_by_node[0][FEATURES..].iter().all(|x| *x == 0.0));
         let leaf_total: u64 = on
             .hierarchy()
             .leaves()
@@ -679,5 +1060,147 @@ mod tests {
         sim.step();
         assert_eq!(sim.policies()[0].weights[0], 9.0);
         assert!(sim.set_params(&p[..5]).is_err());
+    }
+
+    #[test]
+    fn ledger_decomposes_without_deformation() {
+        let mut sim = Simulation::new(quick_config(), 9);
+        sim.run(60);
+        let c = sim.stats().path.ledger.contributions();
+        assert_eq!(sim.stats().path.ledger.decisions, sim.stats().decisions);
+        assert!(c.smoothing.abs() < 1e-9, "no smoothing configured: {c:?}");
+        assert!(c.roughening.abs() < 1e-9, "no roughening configured: {c:?}");
+        assert!(c.field.abs() < 1e-9, "no field without roughening: {c:?}");
+        assert!(c.selection.abs() < 1e-9, "global draw loses nothing: {c:?}");
+        assert!((c.tempering - sim.stats().mean_entropy()).abs() < 1e-6);
+        let off = SimConfig {
+            geometry: GeometryConfig {
+                ledger: false,
+                ..GeometryConfig::default()
+            },
+            ..quick_config()
+        };
+        let mut sim = Simulation::new(off, 9);
+        sim.run(10);
+        assert_eq!(sim.stats().path.ledger.decisions, 0);
+    }
+
+    #[test]
+    fn smoothing_and_roughening_show_up_in_the_ledger() {
+        let mut smooth = Simulation::new(quick_config(), 10);
+        smooth.hierarchy_mut().node_mut(0).surface.deformation = Deformation {
+            smooth: 2.0,
+            rough: 0.0,
+            reach: 0.0,
+        };
+        smooth.run(60);
+        let c = smooth.stats().path.ledger.contributions();
+        assert!(c.smoothing > 0.05, "smoothing adds entropy: {c:?}");
+        assert!(c.roughening.abs() < 1e-9);
+        assert!((c.selected - smooth.stats().mean_entropy()).abs() < 1e-6);
+
+        let mut rough = Simulation::new(quick_config(), 10);
+        rough.hierarchy_mut().node_mut(0).surface.deformation = Deformation {
+            smooth: 0.0,
+            rough: 2.0,
+            reach: 0.0,
+        };
+        rough.run(60);
+        let c = rough.stats().path.ledger.contributions();
+        assert!(
+            c.roughening.abs() > 0.05,
+            "roughening changes the landscape: {c:?}"
+        );
+        assert!(c.smoothing.abs() < 1e-9);
+        assert!(
+            c.field > 0.05,
+            "the field randomises across decisions: {c:?}"
+        );
+        assert!((c.selected - rough.stats().mean_entropy()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sucker_selection_runs_and_loses_entropy() {
+        let cfg = SimConfig {
+            selection: Selection::Sucker { reach: 8 },
+            ..quick_config()
+        };
+        let mut sim = Simulation::new(cfg, 11);
+        sim.run(300);
+        let s = sim.stats();
+        assert!(s.food_delivered > 0, "the sucker still forages: {s:?}");
+        // A bounded walk realises a different entropy than the target it
+        // crawls on (lower when the peak is ahead, higher while in transit
+        // to an off-axis peak); the ledger accounts for the difference.
+        let gap = s.mean_selected_entropy() - s.mean_entropy();
+        assert!(
+            gap.abs() > 1e-3,
+            "sucker should change the realised entropy: {gap}"
+        );
+        let c = s.path.ledger.contributions();
+        assert!((c.selection - gap).abs() < 1e-6);
+        assert!((c.selected - s.mean_selected_entropy()).abs() < 1e-6);
+        let policy = sim.policies()[0].clone();
+        assert_eq!(sim.effective_reach(&policy), Some(8));
+    }
+
+    #[test]
+    fn reach_parameter_scales_and_clamps() {
+        let cfg = SimConfig {
+            selection: Selection::Sucker { reach: 8 },
+            ..quick_config()
+        };
+        let mut sim = Simulation::new(cfg, 12);
+        sim.hierarchy_mut().node_mut(0).surface.deformation.reach = (4f64).ln();
+        sim.recompile();
+        let p = sim.policies()[0].clone();
+        assert_eq!(sim.effective_reach(&p), Some(32));
+        sim.hierarchy_mut().node_mut(0).surface.deformation.reach = 10.0;
+        sim.recompile();
+        let p = sim.policies()[0].clone();
+        assert_eq!(sim.effective_reach(&p), Some(64));
+        sim.hierarchy_mut().node_mut(0).surface.deformation.reach = -10.0;
+        sim.recompile();
+        let p = sim.policies()[0].clone();
+        assert_eq!(sim.effective_reach(&p), Some(0));
+        // Zero reach: always straight ahead when possible.
+        sim.reset_stats();
+        sim.run(40);
+        let s = sim.stats();
+        assert!(
+            s.path.straight_rate() > 0.9,
+            "reach 0 keeps heading: {}",
+            s.path.straight_rate()
+        );
+        let plain = Simulation::new(quick_config(), 12);
+        assert_eq!(plain.effective_reach(&plain.policies()[0].clone()), None);
+    }
+
+    #[test]
+    fn surface_recording_keeps_the_last_rows() {
+        let cfg = SimConfig {
+            selection: Selection::Sucker { reach: 4 },
+            record_surface: Some(3),
+            surface_rows: 10,
+            ..quick_config()
+        };
+        let mut sim = Simulation::new(cfg, 13);
+        sim.run(30);
+        let rows = sim.surface_trace();
+        assert_eq!(rows.len(), 10);
+        assert!(rows.windows(2).all(|w| w[0].tick < w[1].tick));
+        for row in rows {
+            assert!(row.valid[row.chosen]);
+            assert_eq!(row.walk.len(), 5);
+            assert_eq!(row.walk[row.walk.len() - 1] as usize, row.chosen);
+            assert!((row.probs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!((row.selected.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!(row.temperature > 0.0);
+        }
+        sim.clear_surface_trace();
+        assert!(sim.surface_trace().is_empty());
+        let mut plain = Simulation::new(quick_config(), 13);
+        plain.run(5);
+        assert!(plain.surface_trace().is_empty());
     }
 }

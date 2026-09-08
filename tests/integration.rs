@@ -160,3 +160,98 @@ fn fresh_rotation_is_unlearnable_but_runs() {
     assert!(text.contains("rotation-search"));
     assert!(text.contains("none (fresh every turn)"));
 }
+
+fn geometry_run(deformation: Deformation, selection: Selection, seed: u64) -> Stats {
+    let config = SimConfig {
+        world: world(),
+        ants: 40,
+        selection,
+        instinct: BehavioralSurface::instinct().with_deformation(deformation),
+        ..SimConfig::default()
+    };
+    let mut sim = Simulation::new(config, seed);
+    sim.run(300);
+    sim.stats().clone()
+}
+
+#[test]
+fn same_entropy_budget_different_path_topology() {
+    let flat = geometry_run(Deformation::none(), Selection::Softmax, 4);
+    let rough = geometry_run(
+        Deformation {
+            rough: 1.5,
+            ..Deformation::none()
+        },
+        Selection::Softmax,
+        4,
+    );
+    // Both decision streams carry the same per-decision entropy target...
+    assert!((flat.mean_entropy() - rough.mean_entropy()).abs() < 0.08);
+    // ...but the paths look nothing alike.
+    assert!(
+        rough.path.turn_entropy() > flat.path.turn_entropy() + 0.3,
+        "rough {} vs flat {}",
+        rough.path.turn_entropy(),
+        flat.path.turn_entropy()
+    );
+    assert!(rough.path.straight_rate() < flat.path.straight_rate() - 0.15);
+    // The ledger shows where the disorder went: displaced tempering within
+    // the decision, and randomness between decisions.
+    let c = rough.path.ledger.contributions();
+    assert!(c.roughening < -0.05, "{c:?}");
+    assert!(c.field > 0.1, "{c:?}");
+    let f = flat.path.ledger.contributions();
+    assert_eq!(f.field, 0.0);
+}
+
+#[test]
+fn smoothing_keeps_paths_coherent() {
+    let flat = geometry_run(Deformation::none(), Selection::Softmax, 5);
+    let smooth = geometry_run(
+        Deformation {
+            smooth: 1.5,
+            ..Deformation::none()
+        },
+        Selection::Softmax,
+        5,
+    );
+    let c = smooth.path.ledger.contributions();
+    assert!(c.smoothing > 0.05, "{c:?}");
+    assert_eq!(c.field, 0.0);
+    assert!((smooth.path.turn_entropy() - flat.path.turn_entropy()).abs() < 0.25);
+    assert!(smooth.path.trip_efficiency() > 0.8);
+}
+
+#[test]
+fn sucker_with_short_reach_is_path_bound() {
+    let free = geometry_run(Deformation::none(), Selection::Softmax, 6);
+    let bound = geometry_run(Deformation::none(), Selection::Sucker { reach: 1 }, 6);
+    assert!(bound.path.straight_rate() > free.path.straight_rate() + 0.1);
+    assert!(bound.mean_selected_entropy() < bound.mean_entropy() - 0.05);
+    let c = bound.path.ledger.contributions();
+    assert!(c.selection < -0.05, "{c:?}");
+}
+
+#[test]
+fn geometry_bandit_learns_in_a_sucker_arena() {
+    let config = ArenaConfig {
+        sim: SimConfig {
+            world: world(),
+            ants: 24,
+            selection: Selection::Sucker { reach: 8 },
+            ..SimConfig::default()
+        },
+        steps_per_turn: 40,
+        targets: ControlTargets::Nodes(vec![0]),
+        schedule: RotationSchedule::Fixed,
+        ..ArenaConfig::default()
+    };
+    let learners: Vec<Box<dyn Learner>> = vec![Box::new(DialBandit::geometry())];
+    let mut arena = Arena::new(config, learners, 3).unwrap();
+    let report = arena.run(14);
+    assert_eq!(report.learners[0].turns_connected, 14);
+    let root = &arena.hierarchy().root().surface;
+    assert_eq!(root.weights, BehavioralSurface::instinct().weights);
+    assert!(report.learners[0].summary.starts_with("geometry-bandit"));
+    assert_eq!(arena.hierarchy().param_len(), 10 * PARAM_LEN);
+}

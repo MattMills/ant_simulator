@@ -1,7 +1,10 @@
 //! Several learners hold levers into the hierarchy; the levers are rotated
 //! through a random sequence they never see but can learn.
 //!
-//!     cargo run --release --example arena [turns] [period]
+//!     cargo run --release --example arena [turns] [period] [sucker]
+//!
+//! Pass `sucker` as the third argument to select directions with a crawling
+//! sucker instead of a global draw.
 
 use ant_simulator::prelude::*;
 
@@ -9,6 +12,10 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let turns: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(150);
     let period: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let selection = match args.next().as_deref() {
+        Some("sucker") => Selection::Sucker { reach: 8 },
+        _ => Selection::Softmax,
+    };
 
     let config = ArenaConfig {
         sim: SimConfig {
@@ -17,6 +24,7 @@ fn main() {
                 ..WorldConfig::default()
             },
             trace: true,
+            selection,
             ..SimConfig::default()
         },
         steps_per_turn: 300,
@@ -31,7 +39,8 @@ fn main() {
     let learners: Vec<Box<dyn Learner>> = vec![
         Box::new(PhaseAware::new(HillClimber::new(0.2), 8)),
         Box::new(HillClimber::new(0.2)),
-        Box::new(PhaseAware::new(EntropyBandit::default(), 8)),
+        Box::new(PhaseAware::new(DialBandit::entropy(), 8)),
+        Box::new(PhaseAware::new(DialBandit::geometry(), 8)),
         Box::new(PolicyGradient::new(0.02)),
         Box::new(CrossEntropy::new(8, 3).with_init_std(0.2)),
         Box::new(StaticLearner),
@@ -39,10 +48,11 @@ fn main() {
 
     let mut arena = Arena::new(config, learners, 7).expect("valid arena");
     println!(
-        "{} learners, {} controllable surfaces, rotation period {:?}",
+        "{} learners, {} controllable surfaces, rotation period {:?}, selection {:?}",
         arena.learners().len(),
         arena.targets().len(),
-        arena.rotation().period()
+        arena.rotation().period(),
+        selection
     );
     for t in 0..period as u64 {
         let m = arena.rotation().mapping_at(t).unwrap().clone();

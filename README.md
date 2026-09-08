@@ -22,6 +22,10 @@ reproduction). The control system on top of it is the point.
 | Multiple learners | [`Learner`](src/learner/mod.rs) implementations: hill climbing, rotation search, cross-entropy method, policy gradient, an entropy-only bandit, plus static and random baselines. |
 | Randomly rotated in a sequence | [`Rotation`](src/rotation.rs): each turn maps levers to nodes. `RandomStatic { period }` draws `period` random permutations once and replays them forever. |
 | Learning to interact with an unknown connection | [`PhaseAware`](src/learner/phase_aware.rs) wraps any learner, infers the rotation period from the pattern of its own rewards, and keeps a separate copy of the learner per phase. |
+| The path as a surface flat in front of you | [`Landscape`](src/landscape.rs): the eight candidate directions as a ring around the ant's heading, scored by the effective surface; stacked along a trajectory they are the path's surface (`Simulation::surface_trace`, `render_surface`). |
+| Deformation over the deterministic information | The scores are the deterministic information. The entropy budget is spent on them through separable geometric channels: tempering, smoothing along the ring, and a random roughening field ([`Deformation`](src/surface.rs)). |
+| Geometric selection, like a sucker | [`Sucker`](src/landscape.rs): a walker that starts straight ahead and crawls the ring by local Metropolis moves for a bounded reach, settling in the basin it can get to (`Selection::Sucker`). |
+| Behaviour as separable entropy | The [`EntropyLedger`](src/landscape.rs) decomposes every decision's entropy into tempering, smoothing, roughening, selection, and the disorder the field injects between decisions; [`PathStats`](src/colony.rs) measures what that does to the paths. |
 
 A learner never sees the hierarchy. It gets a [`LeverView`](src/learner/mod.rs):
 the parameter vector at the far end of its lever, the turn number, and the
@@ -54,6 +58,23 @@ let scouts = sim.hierarchy().find("caste-0").unwrap();
 sim.hierarchy_mut().node_mut(scouts).surface.entropy = EntropyControl::relative(3.0);
 sim.reset_stats();
 sim.run(500);
+
+// Spend the budget geometrically instead, and select with a sucker.
+let config = SimConfig {
+    selection: Selection::Sucker { reach: 8 },
+    instinct: BehavioralSurface::instinct().with_deformation(Deformation {
+        smooth: 1.0,
+        rough: 0.5,
+        reach: 0.0,
+    }),
+    record_surface: Some(0),
+    ..SimConfig::default()
+};
+let mut sim = Simulation::new(config, 7);
+sim.run(200);
+println!("{}", render_surface(sim.surface_trace(), 16));
+println!("{:?}", sim.stats().path.ledger.contributions());
+println!("turn entropy {:.3}", sim.stats().path.turn_entropy());
 ```
 
 ```rust
@@ -79,11 +100,70 @@ println!("{report}");
 println!("{}", arena.hierarchy().describe());
 ```
 
+## Path surfaces: separable entropy, deformation, and geometric selection
+
+Every decision runs through a short geometric pipeline:
+
+1. **Deterministic information.** The effective surface scores the eight
+   walkable directions. Laid out as a ring around the heading (straight
+   ahead in the middle) this is the landscape in front of the ant.
+2. **Deformation with the entropy budget** `h` (the node's dial):
+   * *smoothing* blurs the landscape along the ring with a circular
+     Gaussian of scale `h × share × 2` ring steps: preference leaks to
+     neighbouring directions (angular disorder, path-coherent);
+   * *roughening* adds a random field of a few low Fourier modes with
+     amplitude `h × share × range`: random basins (landscape disorder,
+     path-incoherent);
+   * *tempering* solves the temperature so the deformed landscape's
+     distribution has exactly `h` of the maximum entropy.
+   The shares are per node (`Deformation { smooth, rough, reach }`, three
+   more parameters learners can move) and compose down the hierarchy like
+   the weights.
+3. **Selection.** `Selection::Softmax` draws globally from the tempered
+   distribution. `Selection::Sucker { reach }` starts a walker straight
+   ahead and lets it crawl the ring for `reach × exp(node reach)` local
+   Metropolis steps; it goes where it can get to. Reach 0 never turns, reach
+   1 turns at most 45°, and by reach 8 the walker is nearly a global draw
+   unless the landscape has a valley between it and the peak.
+
+`cargo run --release --example surface` shows one ant's surface scrolling
+past under the sucker (`[..]` is the choice, the trail is the walk):
+
+```
+ tick  position    L135L90 L45  ^  R45 R90 R135rev   trail
+  146 ( 52, 23)                 ** [::]              0→0→0→0→0→0→0→1→1
+  147 ( 53, 23)             .. [**] ..               0→0→0→1→0→0→0→0→0
+  157 ( 63, 23)                 xx  xx  xx [@@]      2→2→2→2→2→2→2→2→2
+```
+
+and then holds the budget fixed at 0.35 of maximum entropy while changing
+its shape (400 ticks, mean of 3 seeds):
+
+```
+setting          target  drawn | temper smooth  rough  field select |  turnH  str%   eff | deliv
+flat / softmax    0.703  0.703 |  0.703 +0.000 +0.000 +0.000 +0.000 |  1.197  54.4  0.96 |   421
+smooth / softmax  0.705  0.705 |  0.579 +0.126 +0.000 +0.000 +0.000 |  1.163  55.5  0.97 |   415
+rough / softmax   0.707  0.707 |  1.025 +0.000 -0.319 +0.629 +0.000 |  1.775  29.4  0.69 |   102
+reach 1 / sucker  0.684  0.542 |  0.684 +0.000 +0.000 +0.000 -0.142 |  0.839  72.8  0.87 |   208
+```
+
+Same per-decision entropy, different paths. Smoothing spends a fifth of the
+budget on angular blur and the paths stay as straight and efficient as
+before. Roughening looks *sharper* inside each decision (a random spike is a
+confident choice, so it displaces 0.32 nats of tempering) but the ledger's
+`field` column shows the 0.63 nats it injects *between* decisions, and the
+paths turn twice as much and deliver a quarter of the food. The entropy of
+behaviour is separable, and the split between within-decision and
+between-decision disorder is what the path's topology responds to. A short
+sucker reach cuts the realised entropy below the target and binds the ant
+to its heading; a long one converges back to the global draw.
+
 ## Examples
 
 ```
-cargo run --release --example colony [ticks]
-cargo run --release --example arena  [turns] [period]
+cargo run --release --example colony  [ticks]
+cargo run --release --example arena   [turns] [period] [sucker]
+cargo run --release --example surface [ticks] [seeds]
 ```
 
 `colony` renders the world as ASCII, sweeps the colony-wide entropy dial, and
@@ -153,7 +233,7 @@ permutation every turn, unlearnable by construction), and `Explicit`.
 | `HillClimber` | (1+1) evolution strategy on displacements with adaptive step size. When the surface it is handed is not the one it left, it spends a turn feeling it out before probing. `Mutation::Rotation` rotates the weight vector in a random plane instead of adding noise. |
 | `CrossEntropy` | Probes Gaussian displacements, applies the mean of the elite displacements once per generation, refits the spread. |
 | `PolicyGradient` | REINFORCE using the traced score, with a normalised advantage and a unit gradient direction so the step size is independent of reward scale and temperature. |
-| `EntropyBandit` | UCB1 over a grid of dial settings only; leaves the weights alone. |
+| `DialBandit` | UCB1 over dial settings only, leaving the weights alone. `DialBandit::entropy()` (alias `EntropyBandit`) searches the entropy dial; `DialBandit::geometry()` searches smoothing, roughening and reach. |
 | `PhaseAware<L>` | Infers the rotation period (BIC over candidate periods, from rewards and parameter fingerprints) and runs one `L` per phase. |
 | `StaticLearner`, `RandomLearner` | Controls. |
 
