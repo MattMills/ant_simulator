@@ -25,8 +25,8 @@ that biology sits one idea:
 | Deformation over the deterministic information | The scores are the deterministic information; the entropy budget is spent through separable geometric channels: tempering, smoothing along the ring, a random roughening field ([`Deformation`](src/surface.rs)). |
 | Geometric selection, like a sucker | [`Sucker`](src/landscape.rs): a walker that starts straight ahead and crawls the ring by local Metropolis moves for a bounded reach (`Selection::Sucker`). |
 | Behaviour as separable entropy | The [`EntropyLedger`](src/landscape.rs) decomposes each decision's entropy into tempering, smoothing, roughening, selection and between-decision field terms; [`PathStats`](src/colony.rs) measures what that does to the paths. |
-| Pheromonally styled | Five [`Pheromone`](src/pheromone.rs) channels with literature half-lives, temperature-dependent evaporation, saturation and a saturating perception through a forward antennal probe; four [`Species`](src/species.rs) profiles. |
-| Emergent behaviour | Trail formation, shortest-path selection, symmetry breaking, traffic sharing under crowding, choice of the richer or the more productive source, hunger-driven and larva-driven foraging, division of labour and cemetery formation all arise from individual rules; the [`experiments`](src/experiments.rs) module reproduces the published setups. |
+| Pheromonally styled | Six [`Pheromone`](src/pheromone.rs) channels (five signals and the smell of food) with literature half-lives, temperature-dependent evaporation, saturation and a saturating perception through a forward antennal probe; four [`Species`](src/species.rs) profiles. |
+| Emergent behaviour | Trail formation, shortest-path selection, symmetry breaking, traffic sharing under crowding, choice of the richer or the more productive source, hunger-driven and larva-driven foraging, foraging that winds down as crops fill, division of labour and cemetery formation all arise from individual rules; the [`experiments`](src/experiments.rs) module reproduces the published setups. |
 
 A learner never sees the hierarchy. It gets a [`LeverView`](src/learner/mod.rs):
 the parameter vector at the far end of its lever, the turn number, and the
@@ -95,25 +95,29 @@ Units are physical: cells of `cell_cm` centimetres (2 by default), ticks of
 `tick_s` seconds (1 by default); species parameters are in centimetres,
 seconds, microlitres, milligrams, degrees Celsius and pheromone "marks", and
 are converted on the way in. Ants have a continuous position and heading;
-the grid only carries the substrate (terrain, food, marks, corpses).
+the grid only carries the substrate (terrain, food, marks, corpses,
+landmarks).
 
-**Pheromones.** Every cell carries five channels: the recruitment *trail*,
-an optional outbound *home* trail (for bidirectional-trail models), colony
-*territory* marking (Devigne & Detrain 2002), the Pharaoh ant's repellent
-*no entry* marking (Robinson et al. 2005), and volatile *alarm* released at a
-worker's death. Each channel decays by first-order kinetics from its
-half-life, scaled by a Q10 with temperature, spreads conservatively to
-orthogonal neighbours (the trail hardly at all: it is a substrate deposit),
-and saturates on the substrate. Marks are laid per centimetre walked, fewer
-on a crowded patch (Czaczkes, Grüter & Ratnieks 2013). Perception is
-`ln(1 + C/k)`; a weight `n` on that feature makes the movement softmax
-exactly Deneubourg's choice function `(k + C₁)ⁿ / Σ (k + Cⱼ)ⁿ` with `k = 20`
-marks and `n = 2` (Deneubourg, Aron, Goss & Pasteels 1990), extended from two
-branches to sixteen headings.
+**Pheromones and smells.** Every cell carries six channels: the
+recruitment *trail*, an optional outbound *home* trail (for
+bidirectional-trail models), colony *territory* marking (Devigne & Detrain
+2002), the Pharaoh ant's repellent *no entry* marking (Robinson et al.
+2005), volatile *alarm* released at a worker's death, and the *smell of
+food*, given off weakly by sugar solution and strongly by prey, spreading
+through the air and gone within minutes (Buehlmann, Graham, Hansson &
+Knaden 2014: ants locate food by its odour). Each channel decays by
+first-order kinetics from its half-life, scaled by a Q10 with temperature,
+spreads conservatively to orthogonal neighbours (the trail hardly at all: it
+is a substrate deposit), and saturates on the substrate. Marks are laid per
+centimetre walked, fewer on a crowded patch (Czaczkes, Grüter & Ratnieks
+2013). Perception is `ln(1 + C/k)`; a weight `n` on that feature makes the
+movement softmax exactly Deneubourg's choice function `(k + C₁)ⁿ / Σ (k +
+Cⱼ)ⁿ` with `k = 20` marks and `n = 2` (Deneubourg, Aron, Goss & Pasteels
+1990), extended from two branches to sixteen headings.
 
-**Senses and movement.** An ant scores sixteen headings on fourteen
+**Senses and movement.** An ant scores sixteen headings on fifteen
 features, with a separate weight block for outbound and inbound movement:
-the five channels read patch by patch along an antennal probe one and two
+the six channels read patch by patch along an antennal probe one and two
 cells ahead that stops at walls (nothing is sensed behind, so a strong trail
 behind never pulls an ant round and U-turns arise from losing the trail
 ahead, as in Beckers, Deneubourg & Goss 1992); food and nest ahead; a
@@ -129,46 +133,68 @@ capacity (a narrow bridge holds fewer ants): beyond it ants slow down, lay
 less, and steer away, which is what pushes a crowded colony onto both
 branches of a bridge (Dussutour, Fourcassié, Helbing & Deneubourg 2004).
 
+**Navigation.** An ant navigates by path integration with odometric and
+heading noise (Müller & Wehner 1988) and searches around the fictive
+location when its estimate runs out (Wehner & Srinivasan 1981). It learns
+one-way routes: at each familiar place, the direction it walked from there
+on the way home and on the way out (Collett, Collett, Bisch & Wehner 1998;
+Wehner et al. 2006), together with the path-integration estimate it had
+there, which recalibrates the integrator on recognition. Worlds can carry
+landmarks that ants see from a species distance: on leaving the nest and on
+finding food an ant takes a view (which landmark, and where it stands
+relative to the place), and when that landmark comes into sight again it
+fixes its position from it (Wehner & Räber 1979; Collett 1992).
+
 **Foraging.** Food is a volume of sucrose solution of some molarity, or a
 heap of protein prey. Intake rate falls with concentration (viscosity) and
-crop load rises with quality (Josens, Farina & Roces 1998); a load delivers
-its sugar in milligrams; prey is cut over a handling time and carried in
-the mandibles. A source may refill at a rate (a drop fed by a syringe, an
-aphid colony); a forager waits at a slow drip for a species patience and
-leaves with what it has. On the way home it lays trail with a probability
-that rises with quality (Beckers, Deneubourg & Goss 1993) and with how full
-its crop is (Mailleux, Deneubourg & Detrain 2000), at an intensity that
-rises with quality. It navigates by path integration with odometric and
-heading noise (Müller & Wehner 1988), searches around the fictive location
-when its estimate runs out (Wehner & Srinivasan 1981), and learns one-way
-routes: at each familiar place, the direction it walked from there on the
-way home and on the way out (Collett, Collett, Bisch & Wehner 1998; Wehner
-et al. 2006), together with the path-integration estimate it had there,
-which recalibrates the integrator on recognition. It remembers a rewarding
-site and returns to it, but abandons poor or meagre sites with a
+crop load rises with quality (Josens, Farina & Roces 1998); prey is cut
+over a handling time and carried in the mandibles. A source may refill at
+a rate (a drop fed by a syringe, an aphid colony); a forager waits at a
+slow drip for a species patience and leaves with what it has. On the way
+home it lays trail with a probability that rises with quality (Beckers,
+Deneubourg & Goss 1993) and with how full its crop is (Mailleux, Deneubourg
+& Detrain 2000), at an intensity that rises with quality. It remembers a
+rewarding site and returns to it, but abandons poor or meagre sites with a
 quality-dependent probability (Mailleux, Deneubourg & Detrain 2000).
 Unsuccessful trips are given up after a species-specific time; Pharaoh's
 ants then mark the route as unrewarding.
 
-**Colony.** Loads are handed over by trophallaxis into a sugar store,
-slower in a satiated nest; prey goes to a protein store. Hunger alone sends
-out a trickle of scouts; the foraging force builds up sigmoidally through
-the excitation that returning foragers spread by contact (Mailleux, Detrain
-& Deneubourg 2006), and a known source counts only while the colony can
-still take food. Each trip is a sugar trip or a protein trip, decided on
-leaving the nest from the colony's protein demand: workers alone rarely take
-prey, a colony with larvae turns to it (Dussutour & Simpson 2009, 2012).
-Every worker engages by a response threshold `sⁿ / (sⁿ + θⁿ)` (Bonabeau,
-Theraulaz & Deneubourg 1996) drawn from a broad log-normal distribution,
-high in young workers (temporal polyethism), and reinforced while a task is
-performed (Theraulaz, Bonabeau & Deneubourg 1998). Nursing competes for the
-same workers, with a stimulus that falls as nurses are recruited; larvae
-need both sugar and protein to pupate and starve if unfed. Inside workers
-consume the store at a Q10-scaled metabolic rate that scales with body mass
-to the 0.75; a queen lays eggs when the colony is fed; brood passes through
-egg, larva and pupa with Q10-scaled development, and workers emerge from
-pupae. Foragers face a predation hazard and starve without food. The dead
-leave corpses: undertakers carry those inside the nest out past a refuse
+**Crops and trophallaxis.** Every worker carries its own crop of sugar and
+lives off it; metabolism, scaled by body mass to the 0.75 and by
+temperature, drains it, and the starvation clock runs only while it is
+empty. A returning forager unloads by contacts every few seconds: each
+receiver takes a share of its own empty crop space (Greenwald, Baltiansky &
+Feinerman 2018), and the food carries the recruitment signal, so a contact
+that passes little excites little. The forager stops at a residual or gives
+up after too many contacts and keeps its load. Inside the nest, crops even
+out by pairwise sharing between nestmates and with a reserve standing for
+the queen, brood and nestmates not simulated (Buffin et al. 2009; Greenwald,
+Segre & Feinerman 2015). Prey goes to a protein store.
+
+**Colony.** Departure is gated by the worker's own crop, amplified by the
+hunger it reads off its nestmates: a forager that could not unload stays
+in, which is how foraging winds down as the colony fills (Greenwald et al.
+2018; Mailleux, Detrain & Deneubourg 2006), while a starving individual
+goes out even among replete nestmates (Mailleux et al. 2011). Hunger alone
+sends out a trickle of scouts; the foraging force builds up sigmoidally
+through the excitation spread by returning foragers, and a known source
+counts only while the colony can still take food. Each trip is a sugar trip
+or a protein trip, decided on leaving the nest from the colony's protein
+demand: workers alone rarely take prey, a colony with larvae turns to it
+(Dussutour & Simpson 2009, 2012). Every worker engages by a response
+threshold `sⁿ / (sⁿ + θⁿ)` (Bonabeau, Theraulaz & Deneubourg 1996) drawn
+from a broad log-normal distribution, high in young workers (temporal
+polyethism), and reinforced while a task is performed (Theraulaz, Bonabeau
+& Deneubourg 1998); nutritional state adds to the specialisation, as the
+fuller workers stay in (Robinson et al. 2009). Nursing competes for the
+same workers, with a stimulus that falls as nurses are recruited; nurses
+feed larvae from their own crops, larvae need both sugar and protein to
+pupate and starve if unfed. A queen lays eggs when the colony is fed; brood
+passes through egg, larva and pupa with Q10-scaled development, and
+workers emerge from pupae. Foragers face a predation hazard, a heat hazard
+that rises exponentially towards the species' critical thermal maximum
+(Cerdá, Retana & Cros 1998), and starve without food. The dead leave
+corpses: undertakers carry those inside the nest out past a refuse
 distance, and any explorer drops a corpse where corpses lie and picks one
 up the less readily the bigger the pile it lies in (Deneubourg et al. 1991),
 so cemeteries form (Theraulaz et al. 2002). The environment has a
@@ -183,7 +209,8 @@ while exploring too and relies on the trail far more than on memory: Aron
 et al. 1993; the double-bridge species), *Monomorium pharaonis* (adds the
 no-entry marking), and *Cataglyphis* (no trail at all; fast, hot-habitat,
 size-polymorphic, path-integrating solitary foragers with strong route
-memory). Workers vary in body mass around the species' typical worker.
+memory, long sight and a thermal limit near 56 °C that they forage right
+up to). Workers vary in body mass around the species' typical worker.
 `SimConfig::for_species` holds the world at the species' reference
 temperature. `Species::compressed` shortens life-history clocks
 (maturation, development, egg laying) for demonstrations without touching
@@ -192,19 +219,23 @@ behavioural clocks.
 ## Validation against the classic experiments
 
 `cargo run --release --example experiments` runs each setup in replicate;
-`tests/experiments.rs` asserts the same outcomes at smaller size.
+`tests/experiments.rs` asserts the same outcomes at smaller size, and the
+unit tests in `src/colony.rs` cover the trophallaxis and heat mechanisms.
 
 | Experiment | Published finding | Here (80 ants unless stated, 30 min, 4 replicates) |
 | --- | --- | --- |
-| Double bridge, long branch 2× short (Goss et al. 1989; Beckers et al. 1992) | traffic concentrates on the short branch | short branch carries 93% ± 2% of late traffic (Argentine) and 87% ± 12% (*Lasius*), majority in every run |
-| Equal branches (Deneubourg et al. 1990) | most colonies end up with one branch carrying over 80% | after 60 min the favoured branch carries 70% ± 10% with the full model and 69% ± 28% under the 1990 model's assumptions; one branch exceeds 80% in a quarter and a half of the runs respectively |
-| Crowding on a narrow bridge (Dussutour et al. 2004) | one trail at low density; at high density on a narrow bridge both branches, without loss of throughput | 400 ants: mean deviation from an even split 0.30 on the wide bridge, 0.02 on the narrow one, at 229 and 216 crossings/min; 80 ants: 0.25 and 0.10 |
-| Two sources at equal distance, 1.0 vs 0.1 M (Beckers et al. 1990) | the colony focuses on the richer source | 95% ± 1% of the solution taken from the rich source, majority in every run |
-| A dripping source, 0.02 to 10 µl/min (Mailleux et al. 2003) | foraging effort and recruitment match the source's productivity | ants at the source 6.7 → 21.5, mean load 0.05 → 0.49 µl, recruiting returns 16% → 77% |
-| Colony satiation 0.05 → 1.0 (Mailleux et al. 2006) | starved colonies forage and recruit more | ant-time outside falls monotonically from 67% to 0% |
-| Sugar or prey, with and without larvae (Dussutour & Simpson 2009) | larvae turn the colony to protein | protein share of what is collected 0.05 without larvae, 0.50 with |
-| 300 scattered corpses, 60 workers (Theraulaz et al. 2002) | corpses are gathered into a few piles | piles fall from about 120 to about 30 within the hour; the largest grows two- to fourfold |
-| Threshold reinforcement (Theraulaz et al. 1998) | specialisation | division-of-labour index 0.49 with reinforcement, 0.29 without |
+| Double bridge, long branch 2× short (Goss et al. 1989; Beckers et al. 1992) | traffic concentrates on the short branch | short branch carries 97% ± 1% of late traffic (Argentine) and 84% ± 17% (*Lasius*), majority in every run |
+| Equal branches (Deneubourg et al. 1990) | most colonies end up with one branch carrying over 80% | after 60 min the favoured branch carries 69% ± 31% with the full model and 70% ± 30% under the 1990 model's assumptions; one branch exceeds 80% in all and half of the runs |
+| Crowding on a narrow bridge (Dussutour et al. 2004) | one trail at low density; at high density on a narrow bridge both branches, without loss of throughput | 400 ants: mean deviation from an even split 0.22 on the wide bridge, 0.04 on the narrow one, at 219 and 183 crossings/min; 80 ants: 0.27 and 0.09 |
+| Two sources at equal distance, 1.0 vs 0.1 M (Beckers et al. 1990) | the colony focuses on the richer source | 94% ± 1% of the solution taken from the rich source, majority in every run |
+| A dripping source, 0.02 to 10 µl/min (Mailleux et al. 2003) | foraging effort and recruitment match the source's productivity | ants at the source 6.0 → 20.9, mean load 0.06 → 0.41 µl, recruiting returns 11% → 79% |
+| A hidden pool, with and without its smell (Buehlmann et al. 2014) | ants find food by its odour | first find after 101 s without odour, 42 s with |
+| Colony satiation 0.05 → 1.0 (Mailleux et al. 2006) | starved colonies forage and recruit more | ant-time outside falls monotonically from 47% to 0% |
+| Unloading as the colony fills (Greenwald et al. 2018) | receivers take less as their crops fill; foragers that cannot unload stop | unit test: contacts per return rise, foraging falls by more than half, no hungry worker left inside; crop loads even out by sharing |
+| Sugar or prey, with and without larvae (Dussutour & Simpson 2009) | larvae turn the colony to protein | protein share of what is collected 0.08 without larvae, 0.47 with |
+| Desert ants against the heat (Cerdá et al. 1998) | mortality rises steeply towards the thermal limit while speed still rises | 60 *Cataglyphis*, 30 min: at 40 °C speed ×1.25, 267 loads, nobody killed; at 52 °C ×1.85, 254 loads, 14 killed; at 54 °C ×1.95, 98 loads, 26 killed; at 55 °C the colony stays in |
+| 300 scattered corpses, 60 workers (Theraulaz et al. 2002) | corpses are gathered into a few piles | piles fall from about 120 to 25 to 33 within the hour; the largest grows two- to threefold |
+| Threshold reinforcement (Theraulaz et al. 1998) | specialisation | division-of-labour index 0.77 with reinforcement, 0.53 without |
 
 Symmetry breaking on equal branches is a marginal instability, and getting
 it out of an individual-based model says a good deal about what real ants
@@ -215,12 +246,13 @@ sensed round a corner. Private route memory can kill it outright, by
 splitting the colony into individuals each faithful to their own first
 choice; Aron, Beckers, Deneubourg & Pasteels (1993) found precisely that
 Argentine ants orient by the trail while *Lasius niger* relies on memory,
-and the two profiles differ accordingly. Since the foraging force now
-builds up by recruitment rather than leaving all at once, the decision is
-made by the first cohorts and takes longer to show in the traffic.
-`pure_pheromone_feedback` reduces a configuration to the assumptions of the
-1990 model (no evaporation on the experiment's timescale, no crowding or
-recency terms, no route memory) for comparison.
+and the two profiles differ accordingly. Since the foraging force builds up
+by recruitment and every forager's departures are gated by its own crop,
+the decision is made by the first cohorts and takes longer to show in the
+traffic. `pure_pheromone_feedback` reduces a configuration to the
+assumptions of the 1990 model (no evaporation on the experiment's
+timescale, no crowding, recency or odour terms, no route memory) for
+comparison.
 
 ## Path surfaces: separable entropy, deformation, and geometric selection
 
@@ -307,19 +339,21 @@ seeds.
 
 ## What is simplified
 
-Space is a plane with a 2-cm substrate grid: there is no vision, no
-landmark recognition beyond place memory keyed to substrate cells, and no
-nest architecture (the nest interior is a well-mixed chamber: stores,
-brood, corpses and workers inside have no positions). Trails are laid on
-the substrate and sensed as patches within antennal reach; there is no
-airborne plume model, and the death cue of a corpse is not modelled
+Space is a plane with a 2-cm substrate grid. Vision is limited to point
+landmarks seen within a species distance; there are no panoramic views,
+no walls that block sight, and no sun compass. The nest interior is a
+well-mixed chamber: workers, brood, stores and corpses inside have no
+positions, and trophallaxis meets nestmates at random. Trails are laid on
+the substrate and sensed as patches within antennal reach; smells spread
+by diffusion without wind, and the death cue of a corpse is not modelled
 chemically. Prey is dead insects, not hunted. There is one colony: no
 neighbours, fights or territory contests. Brood has three stages but no
 cohort structure; there is no queen pheromone, no male or gyne production,
 and a single worker caste per species (body mass varies continuously).
-Temperature acts through Q10 factors, speed and an activity window,
-without humidity or microclimate. Parameters are representative values from
-the cited studies rather than fits to any one dataset.
+Temperature acts through Q10 factors, speed, an activity window and a
+thermal limit, without humidity or microclimate. Parameters are
+representative values from the cited studies rather than fits to any one
+dataset.
 
 ## Reproducibility and tests
 

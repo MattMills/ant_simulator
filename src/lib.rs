@@ -9,20 +9,23 @@
 //! * **Colony simulation** ([`colony`], [`world`], [`ant`], [`pheromone`],
 //!   [`species`]): a world in physical units, with ants moving continuously
 //!   over a substrate grid that carries a nest, sucrose solutions of varying
-//!   molarity (some refilling), heaps of prey, corpses, and five pheromone
-//!   channels with literature kinetics under a temperature that may cycle
-//!   through the day. Cells have a capacity, so traffic crowds, slows and
-//!   spreads. Workers rest, nurse, forage, feed, return, search, unload and
-//!   carry out the dead through an activity state machine; they navigate by
-//!   path integration and one-way route memory, follow trails through
-//!   Deneubourg's choice function sensed by a forward antennal probe, lay
-//!   trail in proportion to food quality and crop load, recruit by contact,
-//!   collect sugar or protein as the larvae demand, and engage in tasks by
-//!   reinforced response thresholds. The nest stores sugar and protein,
-//!   gets hungry, lays eggs and raises brood through egg, larva and pupa.
-//!   The [`experiments`] module reproduces the classic double-bridge,
-//!   equal-bridge, crowded-bridge, two-source, dripping-source, hunger,
-//!   communal-nutrition, cemetery and division-of-labour setups.
+//!   molarity (some refilling), heaps of prey, corpses, landmarks, and six
+//!   chemical channels (five signals and the smell of food) with literature
+//!   kinetics under a temperature that may cycle through the day. Cells
+//!   have a capacity, so traffic crowds, slows and spreads. Workers rest,
+//!   nurse, forage, feed, return, search, unload and carry out the dead
+//!   through an activity state machine; they navigate by path integration,
+//!   one-way route memory and views of landmarks, follow trails through
+//!   Deneubourg's choice function sensed by a forward antennal probe, find
+//!   food by its smell, lay trail in proportion to food quality and crop
+//!   load, collect sugar or protein as the larvae demand, and engage in
+//!   tasks by reinforced response thresholds. Every worker carries its own
+//!   crop; food spreads by trophallaxis, and a forager whose nestmates will
+//!   not take its load stays in. The nest keeps a protein store, lays eggs
+//!   and raises brood through egg, larva and pupa. The [`experiments`]
+//!   module reproduces the classic double-bridge, equal-bridge,
+//!   crowded-bridge, two-source, dripping-source, odour, hunger,
+//!   communal-nutrition, thermal, cemetery and division-of-labour setups.
 //!
 //! * **Entropic behavioral surface** ([`surface`], [`entropy`]): the general
 //!   object that controls behaviour. It is a weight vector over the sensory
