@@ -1,0 +1,18 @@
+[package]
+name = "ant_simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Ant colony simulation with a hierarchy of entropically controlled behavioral surfaces, learned through hidden, rotating control levers."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["simulation", "ants", "entropy", "reinforcement-learning", "stigmergy"]
+categories = ["simulation", "science"]
+
+[dependencies]
+
+[[bench]]
+name = "scale"
+harness = false
+
+[profile.release]
+opt-level = 3
