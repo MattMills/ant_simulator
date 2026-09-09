@@ -314,6 +314,27 @@ are predicted with an MRR of 0.895 and hits@1 of 0.80 by rules and
 geometry together, against 0.011 before. The design, the numbers and
 where it stops are in [`docs/holonomy.md`](docs/holonomy.md).
 
+## The bridge
+
+The colony's forward and backward filters, made explicit. A thought's
+walk conditioned on where its trips end is a Schrödinger bridge, the
+product of a function running forward from the nest and one running
+backward from the outcome, and its drift is the log-gradient of the
+backward one, Doob's h-transform. The colony computes that pair
+implicitly, the outbound walks sampling the forward filter and the
+trail laid home accumulating the backward one. `bridge.rs` solves both
+on a coarse graph of the medium every epoch, at a temperature that is
+the forcing pressure, and measures the surprise of the colony's flows
+against their product, the trail's agreement with it, and the corridor
+the product predicts; the queen reads the surprise, and the thoughts
+may follow the model's drift. On the maze round a wall a small drift
+gain is worth a quarter more deliveries, the corridor narrows from 147
+to 44 effective blocks as the temperature falls from 64 to 1, and the
+trail correlates with the predicted density at 0.37. Symbols can be
+weighed by their sector partition functions at a temperature, and a
+practice can be conditioned on survival. The design, the numbers and
+where it stops are in [`docs/bridge.md`](docs/bridge.md).
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -344,6 +365,12 @@ where it stops are in [`docs/holonomy.md`](docs/holonomy.md).
   score beside it. What is learned is which classes yield, which
   punctures matter, and the glyph of each class; what is inferred is
   the class of any route; what is generated is a route of any class.
+* **The trail is the product, not the backward filter.** Laid along
+  successful routes on the way home, the trail estimates the bridge
+  density, forward times backward, and correlates with it at 0.37
+  where it correlates with the desirability alone at 0.1. Following
+  the explicit desirability's drift at a small gain helps because it
+  breaks the ties the product leaves; at a large gain it traps.
 * **A translation is a coarse transport.** The holonomy embedding's
   transports are exact (zero spread) and the planted rules close, yet
   the geometry alone predicts poorly, because a symmetric relation can
@@ -368,6 +395,9 @@ extras/src/practice.rs    Practice, PracticeConfig, PracticeReport, Targets, Tur
 extras/src/topos.rs       Word, Route, Rays, SymbolField, Symbol, PathNet, Label, SymbolConfig
 extras/src/problems/relations.rs  Relations, Node, Triple, Evaluation (the knowledge graph)
 extras/docs/holonomy.md   the holonomy embedding: proposal, build, numbers, limits
+extras/src/bridge.rs      Bridge, BridgeConfig (the forward and backward filters on the grain)
+extras/docs/bridge.md     the bridge: claim, build, numbers, limits
+extras/examples/bridge.rs the bridge observing, forcing, drifting; sector weights; survival
 extras/examples/relations.rs  the family graph learned by walking
 extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems

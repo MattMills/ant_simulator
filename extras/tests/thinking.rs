@@ -727,3 +727,164 @@ fn walking_queries_learns_rules_transports_and_a_geometry_that_predicts() {
     assert_eq!(path.len(), 3);
     assert_eq!(path.last().unwrap().at, tail);
 }
+
+// ---------------------------------------------------------------------
+// The bridge
+
+use ant_extras::bridge::BridgeConfig;
+
+#[test]
+fn the_bridge_predicts_the_corridor_the_trail_approximates_its_desirability_and_the_queen_reads_the_surprise(
+) {
+    let problem = Maze::around_a_wall(48, 32);
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_bridge(BridgeConfig::default())
+    .with_queen(QueenPolicy {
+        epoch_ticks: 150,
+        warmup_ticks: 300,
+        ..QueenPolicy::default()
+    });
+    let mut mind = Mind::new(problem.clone(), cfg);
+    mind.run(3000);
+    let b = mind.bridge().expect("a bridge");
+    assert!(b.has_findings(), "the colony's findings are the sinks");
+    assert!(b.epochs() >= 20);
+    assert!(b.mass() > 0.0);
+    // The predicted density runs through the gap above the wall (the
+    // short way) more than below it.
+    let above = b.block_of(Position::new(24, 1)).unwrap();
+    let below = b.block_of(Position::new(24, 30)).unwrap();
+    assert!(
+        b.density()[above] > b.density()[below],
+        "above {} > below {}",
+        b.density()[above],
+        b.density()[below]
+    );
+    let wall = b.block_of(Position::new(24, 16)).unwrap();
+    assert!(b.density()[wall] <= b.density()[above]);
+    // The trail is the colony's implicit backward filter: it
+    // correlates with the explicit desirability.
+    assert!(b.correlation() > 0.3, "r = {}", b.correlation());
+    // The surprise is a number in (0, 1), and the queen read it.
+    let surprise = b.surprise();
+    assert!(surprise > 0.0 && surprise < 1.0, "surprise {surprise}");
+    assert!(mind.queen().is_some());
+    assert!(mind.stats().deliveries > 20);
+    // The drift points along the corridor at the start: eastwards.
+    let (dx, _) = b
+        .drift(Point::center_of(problem.start()))
+        .expect("a drift at the start");
+    assert!(dx > 0.0, "drift {dx}");
+    // Colder is narrower.
+    let warm = b.effective_blocks();
+    let world = mind.world().clone();
+    let b = mind.bridge_mut().unwrap();
+    b.set_temperature(5.0);
+    b.relax(&world);
+    assert!(
+        b.effective_blocks() < warm,
+        "{} < {warm}",
+        b.effective_blocks()
+    );
+}
+
+/// The drift is a bias, not a controller: at a small gain it shortens
+/// the trips, at a large one the block-level field traps the thoughts
+/// (the example shows the curve).
+#[test]
+fn following_the_drift_does_not_cost_deliveries() {
+    let problem = Maze::around_a_wall(48, 32);
+    let plain = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    };
+    let mut without = Mind::new(problem.clone(), plain.clone());
+    let mut with = Mind::new(
+        problem,
+        plain.with_bridge(BridgeConfig {
+            gain: 0.5,
+            ..BridgeConfig::default()
+        }),
+    );
+    without.run(3000);
+    with.run(3000);
+    assert!(
+        with.stats().deliveries as f64 >= 0.85 * without.stats().deliveries as f64,
+        "with the drift {} vs without {}",
+        with.stats().deliveries,
+        without.stats().deliveries
+    );
+}
+
+#[test]
+fn sector_weights_at_a_temperature_favour_the_short_class_and_sharpen_as_it_falls() {
+    let problem = Maze::around_a_wall(48, 32);
+    let gap = |temperature: f64| -> (f64, f64) {
+        let cfg = MindConfig {
+            thoughts: 32,
+            trip_budget: 200,
+            ..MindConfig::default()
+        }
+        .with_symbols(SymbolConfig {
+            temperature: Some(temperature),
+            ..SymbolConfig::default()
+        });
+        let mut mind = Mind::new(problem.clone(), cfg);
+        mind.run(3000);
+        let net = mind.net().unwrap();
+        let mut top = net.living();
+        top.sort_by_key(|&k| std::cmp::Reverse(net.symbols()[k].support));
+        assert!(top.len() >= 2, "{}", net.report());
+        let (a, b) = (&net.symbols()[top[0]], &net.symbols()[top[1]]);
+        let (short, long) = if a.length < b.length { (a, b) } else { (b, a) };
+        assert!(short.share > long.share, "{}", net.report());
+        assert!(short.weight > long.weight);
+        let total: f64 = net.living().iter().map(|&k| net.symbols()[k].share).sum();
+        assert!((total - 1.0).abs() < 1e-6, "shares sum to one: {total}");
+        (short.share, long.share)
+    };
+    let (short_warm, long_warm) = gap(100.0);
+    let (short_cold, long_cold) = gap(10.0);
+    assert!(
+        short_cold / long_cold.max(1e-9) > short_warm / long_warm.max(1e-9),
+        "colder sharpens: {short_cold}/{long_cold} vs {short_warm}/{long_warm}"
+    );
+}
+
+#[test]
+fn a_practice_conditioned_on_survival_rewards_only_survival() {
+    let cfg = PracticeConfig {
+        mind: MindConfig {
+            thoughts: 24,
+            trip_budget: 150,
+            ..MindConfig::default()
+        },
+        ticks_per_turn: 800,
+        targets: Targets::Depth(1),
+        schedule: RotationSchedule::RandomStatic { period: 2 },
+        survival: Some(1.0),
+        ..PracticeConfig::default()
+    };
+    let learners: Vec<Box<dyn Learner>> =
+        vec![Box::new(HillClimber::new(0.2)), Box::new(StaticLearner)];
+    let mut practice = Practice::new(Maze::around_a_wall(40, 28), cfg, learners, 3).unwrap();
+    let report = practice.run(3);
+    for t in practice.history() {
+        assert!(
+            t.reward == 0.0 || t.reward == 1.0,
+            "an indicator: {}",
+            t.reward
+        );
+        assert_eq!(t.survived, t.yield_ >= 1.0);
+        assert_eq!(t.reward, if t.survived { 1.0 } else { 0.0 });
+    }
+    assert_eq!(
+        report.survived,
+        practice.history().iter().filter(|t| t.survived).count()
+    );
+}

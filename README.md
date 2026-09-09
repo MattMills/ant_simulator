@@ -959,13 +959,18 @@ high-dimensional state through the moves and portals they cross, the
 transport of a class of routes is its vector, and a knowledge graph
 walked as queries yields rules as words, relation vectors that close
 along them, and predictions of held-out facts by geometry, rules and
-both (`extras/docs/holonomy.md`). What the exploration found, and
-where the ants' way stops, is in the crate's README.
+both (`extras/docs/holonomy.md`). And the colony's forward and
+backward filters are made explicit as a bridge on the grain, the
+predicted corridor of successful trips, the surprise of the flows
+against it, and a drift the thoughts can follow
+(`extras/docs/bridge.md`). What the exploration found, and where the
+ants' way stops, is in the crate's README.
 
 ```text
 cargo run --release -p ant_extras --example think
 cargo run --release -p ant_extras --example symbols
 cargo run --release -p ant_extras --example relations
+cargo run --release -p ant_extras --example bridge
 cargo test --release -p ant_extras
 ```
 

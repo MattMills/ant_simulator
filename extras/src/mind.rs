@@ -36,6 +36,7 @@
 //! search or follow what they know, bring a solution home laying trail,
 //! rest, and go out again with site fidelity and a route memory.
 
+use crate::bridge::{Bridge, BridgeConfig};
 use crate::problem::{Moves, Problem};
 use crate::sense::{clear_ahead, features, Body, Candidate, Senses, Sight};
 use crate::thought::{unit, Activity, Site, Target, Thought};
@@ -209,6 +210,10 @@ pub struct MindConfig {
     /// The path-topological network: the variable surface of learned
     /// symbols (see [`crate::topos`]).
     pub symbols: Option<SymbolConfig>,
+    /// The bridge: the colony's forward and backward filters made
+    /// explicit on a coarse graph of the medium (see [`crate::bridge`]);
+    /// kept for problems walked freely.
+    pub bridge: Option<BridgeConfig>,
     /// Kinetics of the medium's channels.
     pub pheromones: PheromoneSet,
     /// Seconds per tick.
@@ -249,6 +254,7 @@ impl Default for MindConfig {
             foresight: None,
             queen: None,
             symbols: None,
+            bridge: None,
             pheromones: MindConfig::pheromones(),
             tick_s: 1.0,
             ledger: true,
@@ -335,6 +341,15 @@ impl MindConfig {
     /// their own, and the thoughts sense them with learned weights.
     pub fn with_symbols(mut self, symbols: SymbolConfig) -> MindConfig {
         self.symbols = Some(symbols);
+        self
+    }
+
+    /// A mind with a bridge: its forward and backward filters solved
+    /// explicitly every epoch, the surprise of its flows against them
+    /// read by the queen, and the desirability's gradient followed
+    /// with the configured gain.
+    pub fn with_bridge(mut self, bridge: BridgeConfig) -> MindConfig {
+        self.bridge = Some(bridge);
         self
     }
 
@@ -475,6 +490,7 @@ pub struct Mind<P: Problem> {
     memo: Option<Memo>,
     queen: Option<Queen>,
     net: Option<PathNet>,
+    bridge: Option<Bridge>,
     rng: Rng,
     tick: u64,
     stats: MindStats,
@@ -570,6 +586,14 @@ impl<P: Problem> Mind<P> {
             net
         });
 
+        let bridge = if free.is_some() {
+            cfg.bridge
+                .clone()
+                .map(|c| Bridge::new(&world, origin_place.cell(), c))
+        } else {
+            None
+        };
+
         Mind {
             problem,
             cfg,
@@ -585,6 +609,7 @@ impl<P: Problem> Mind<P> {
             memo,
             queen,
             net,
+            bridge,
             rng,
             tick: 0,
             stats: MindStats::default(),
@@ -692,6 +717,21 @@ impl<P: Problem> Mind<P> {
     /// The network, to name, attend to or express its symbols.
     pub fn net_mut(&mut self) -> Option<&mut PathNet> {
         self.net.as_mut()
+    }
+
+    /// The bridge, if the mind keeps one.
+    pub fn bridge(&self) -> Option<&Bridge> {
+        self.bridge.as_ref()
+    }
+
+    /// The bridge, to set its temperature.
+    pub fn bridge_mut(&mut self) -> Option<&mut Bridge> {
+        self.bridge.as_mut()
+    }
+
+    /// The bridge's predicted density drawn over the medium.
+    pub fn render_bridge(&self) -> Option<String> {
+        self.bridge.as_ref().map(|b| b.render(&self.world))
     }
 
     /// What class a route of places is, by the network (its moves no
@@ -904,6 +944,17 @@ impl<P: Problem> Mind<P> {
                 }
             }
         }
+        if let Some(b) = &mut self.bridge {
+            for t in &self.thoughts {
+                if t.activity.is_out() {
+                    b.count(t.cell());
+                }
+            }
+            let epoch = b.config().epoch_ticks.max(1);
+            if self.tick > 0 && self.tick.is_multiple_of(epoch) {
+                b.relax(&self.world);
+            }
+        }
         self.tick += 1;
         self.stats.ticks += 1;
     }
@@ -1056,6 +1107,9 @@ impl<P: Problem> Mind<P> {
             let t = &self.thoughts[i];
             (t.cell(), t.place)
         };
+        if let Some(b) = &mut self.bridge {
+            b.record_finding(cell);
+        }
         let release = self.cfg.odour_release * quality;
         if release > 0.0 {
             self.world.deposit(cell, Pheromone::Odour, release);
@@ -1489,11 +1543,19 @@ impl<P: Problem> Mind<P> {
                 offset,
                 &mut feat,
             );
-            let extra = self
+            let mut extra = self
                 .net
                 .as_ref()
                 .map(|n| n.extra(place, u, c.len))
                 .unwrap_or(0.0);
+            if let (Some(b), true) = (&self.bridge, free) {
+                let gain = b.config().gain;
+                if gain > 0.0 {
+                    if let Some(g) = b.drift(place) {
+                        extra += gain * (g.0 * u.0 + g.1 * u.1);
+                    }
+                }
+            }
             let logit = dot(&weights, &feat) + extra;
             if !senses.valid[c.ring] || logit > best[c.ring] {
                 senses.valid[c.ring] = true;
@@ -2265,6 +2327,9 @@ impl<P: Problem> Mind<P> {
         if !due {
             return;
         }
+        // With a bridge, the surprise of the flows against the colony's
+        // own model drives the scouts as stagnation does.
+        let surprise = self.bridge.as_ref().map(|b| b.surprise()).unwrap_or(0.0);
         let (Some(queen), Some(history)) = (&mut self.queen, &self.history) else {
             return;
         };
@@ -2288,7 +2353,9 @@ impl<P: Problem> Mind<P> {
         } else {
             self.epochs_since_peak += 1;
         }
-        let stagnation = (self.epochs_since_peak as f64 / patience as f64).min(1.0);
+        let stagnation = (self.epochs_since_peak as f64 / patience as f64)
+            .min(1.0)
+            .max(surprise);
         // Organisation: the axial order of the invariant flow, weighted
         // by how much flows where (two-way traffic on a trail scores
         // high, wandering low).
@@ -2409,6 +2476,9 @@ impl<P: Problem> Mind<P> {
         }
         if let Some(n) = &self.net {
             out.push_str(&n.report());
+        }
+        if let Some(b) = &self.bridge {
+            out.push_str(&b.report());
         }
         if let Some(q) = &self.queen {
             let dials = self.dials();

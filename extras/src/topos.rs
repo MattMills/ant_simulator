@@ -557,6 +557,13 @@ pub struct Symbol {
     /// Quality per length against the shortest class: how the class
     /// yields.
     pub yield_: f64,
+    /// The mean of quality times `exp(-length / temperature)` over the
+    /// class's trips (exponentially weighted), when a temperature is
+    /// set: with the support, the class's sector partition function.
+    pub partition: f64,
+    /// The class's share of the exponentiated-cost measure over the
+    /// living classes, when a temperature is set.
+    pub share: f64,
     /// The learned weight the thoughts sense the channel with: logits
     /// per unit of perceived level, from the yield against the others.
     pub weight: f64,
@@ -635,6 +642,11 @@ pub struct SymbolConfig {
     pub gain: f64,
     /// Rate of the exponentially weighted means.
     pub rate: f64,
+    /// A temperature: with one, a class's weight is the log of its
+    /// share of the exponentiated-cost measure over the classes, its
+    /// sector partition function (trips times the mean of quality
+    /// times `exp(-length / temperature)`), rather than its yield.
+    pub temperature: Option<f64>,
     /// Longest word kept; a route with a longer word is not a class.
     pub max_word: usize,
     /// Routes kept per symbol as exemplars.
@@ -669,6 +681,7 @@ impl Default for SymbolConfig {
             deposit: 20.0,
             gain: 3.0,
             rate: 0.1,
+            temperature: None,
             max_word: 12,
             exemplars: 8,
             expression: 10.0,
@@ -870,6 +883,10 @@ impl PathNet {
                 s.support += 1;
                 s.quality += rate * (quality - s.quality);
                 s.length += rate * (length - s.length);
+                if let Some(t) = self.cfg.temperature {
+                    let boltzmann = quality * (-length / t.max(1e-9)).exp();
+                    s.partition += rate * (boltzmann - s.partition);
+                }
                 s.last_seen = tick;
                 if s.vector.len() == x.len() && !x.is_empty() {
                     let dist2: f64 = s.vector.iter().zip(x).map(|(m, v)| (v - m) * (v - m)).sum();
@@ -961,6 +978,12 @@ impl PathNet {
             quality: pending.quality,
             length: pending.length,
             yield_: 0.0,
+            partition: self
+                .cfg
+                .temperature
+                .map(|t| pending.quality * (-pending.length / t.max(1e-9)).exp())
+                .unwrap_or(0.0),
+            share: 0.0,
             weight: 0.0,
             vector: x.to_vec(),
             spread: 0.0,
@@ -1018,6 +1041,29 @@ impl PathNet {
         let mean = total / living.len().max(1) as f64;
         self.mean_yield = mean;
         let gain = self.cfg.gain;
+        if self.cfg.temperature.is_some() {
+            // Sector partition functions: a class's weight is the log of
+            // its share against an even share.
+            let z: f64 = living
+                .iter()
+                .map(|&k| self.symbols[k].support as f64 * self.symbols[k].partition)
+                .sum();
+            let n = living.len().max(1) as f64;
+            for &k in &living {
+                let s = &mut self.symbols[k];
+                s.share = if z > 0.0 {
+                    s.support as f64 * s.partition / z
+                } else {
+                    0.0
+                };
+                s.weight = if s.share > 0.0 {
+                    (gain * (s.share * n).ln()).clamp(-gain, gain)
+                } else {
+                    -gain
+                };
+            }
+            return;
+        }
         for &k in &living {
             let s = &mut self.symbols[k];
             s.weight = if mean > 1e-12 {
@@ -1465,9 +1511,14 @@ impl PathNet {
                 let norm: f64 = s.vector.iter().map(|v| v * v).sum::<f64>().sqrt();
                 format!(" |vector| {:.2} spread {:.3}", norm, s.spread)
             };
+            let share = if self.cfg.temperature.is_some() {
+                format!(" share {:.3}", s.share)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "    #{k} [{}]{} support {}{} quality {:.3} length {:.0} yield {:.3} weight {:+.2}{}{}",
+                "    #{k} [{}]{} support {}{} quality {:.3} length {:.0} yield {:.3}{} weight {:+.2}{}{}",
                 self.show(&s.word),
                 s.name
                     .as_ref()
@@ -1482,6 +1533,7 @@ impl PathNet {
                 s.quality,
                 s.length,
                 s.yield_,
+                share,
                 s.weight,
                 vector,
                 if self.attention[k].abs() > 1e-9 {

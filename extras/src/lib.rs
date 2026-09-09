@@ -33,6 +33,7 @@
 //! | [`practice`] | learners, levers, the arena | learners tune the surfaces through a hidden, rotating connection, rewarded by what comes home |
 //! | [`topos`] | the six pheromone channels | a variable surface: a channel per learned symbol, each a class of routes (its word round the punctures), registered, weighed, labelled and generated, with a transport as its vector |
 //! | [`problems::Relations`] | path integration | the holonomy embedding: thoughts integrate a D-dimensional state through the relations they follow, the words of their trips are rules, and the geometry learns to close along them |
+//! | [`bridge`] | the outbound walk and the trail laid home | the forward and backward filters solved explicitly on the grain: the predicted corridor, the surprise of the flows against it, the drift of the conditioned walk |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -87,6 +88,20 @@
 //! vectors learn to close along them, and held-out facts are predicted
 //! by the geometry, by the rules and by both.
 //!
+//! ## The bridge
+//!
+//! The walk conditioned on where its trips end is a Schrödinger
+//! bridge: forward filter times backward filter, with the log-gradient
+//! of the backward one as drift. The colony computes the pair
+//! implicitly, the outbound walks sampling the forward filter and the
+//! trail laid home accumulating the backward one; [`bridge`] computes
+//! both explicitly on a coarse graph of the medium at a temperature
+//! that is the forcing pressure, measures the surprise of the flows
+//! against their product, lets the queen read it and the thoughts
+//! follow the drift, weighs the symbols by their sector partition
+//! functions, and conditions a practice on survival
+//! (`extras/docs/bridge.md`).
+//!
 //! ## Where the ants' way stops
 //!
 //! Habits and foresight belong to the walk between decisions, so they
@@ -99,6 +114,7 @@
 //! ant_extras --example think` runs the three problems, and the
 //! practice module is how a surface is tuned to one.
 
+pub mod bridge;
 pub mod mind;
 pub mod practice;
 pub mod problem;
@@ -109,6 +125,7 @@ pub mod topos;
 
 /// Everything commonly needed.
 pub mod prelude {
+    pub use crate::bridge::{Bridge, BridgeConfig};
     pub use crate::mind::{Choice, Finding, Geometry, Mind, MindConfig, MindStats, QueenPolicy};
     pub use crate::practice::{Practice, PracticeConfig, PracticeReport, Targets, Turn};
     pub use crate::problem::{embedding, Layered, Moves, Problem};

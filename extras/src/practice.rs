@@ -47,6 +47,11 @@ pub struct PracticeConfig {
     pub fresh_seeds: bool,
     /// Tell the learners which node they hold.
     pub reveal_mapping: bool,
+    /// A survival threshold: with one, a turn's reward is 1 where the
+    /// quality brought home per thought reaches it and 0 where not, so
+    /// that the learners are conditioned on the colony's survival (the
+    /// Q-process) rather than on its mean yield.
+    pub survival: Option<f64>,
 }
 
 impl Default for PracticeConfig {
@@ -59,6 +64,7 @@ impl Default for PracticeConfig {
             persistent: false,
             fresh_seeds: false,
             reveal_mapping: false,
+            survival: None,
         }
     }
 }
@@ -110,6 +116,12 @@ pub struct Turn {
     pub best: f64,
     /// Mean realised entropy per decision.
     pub mean_entropy: f64,
+    /// The quality brought home per thought, before any survival
+    /// threshold.
+    pub yield_: f64,
+    /// Whether the colony survived the turn (always, without a
+    /// threshold).
+    pub survived: bool,
 }
 
 /// A summary of a practice.
@@ -123,6 +135,8 @@ pub struct PracticeReport {
     pub late_reward: f64,
     /// The best turn's reward.
     pub best_reward: f64,
+    /// Turns the colony survived.
+    pub survived: usize,
     /// Each learner's name and state.
     pub learners: Vec<(String, String, Option<usize>)>,
 }
@@ -131,8 +145,8 @@ impl fmt::Display for PracticeReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "{} turns: reward {:.3} early, {:.3} late, {:.3} best",
-            self.turns, self.early_reward, self.late_reward, self.best_reward
+            "{} turns: reward {:.3} early, {:.3} late, {:.3} best, {} survived",
+            self.turns, self.early_reward, self.late_reward, self.best_reward, self.survived
         )?;
         for (name, summary, period) in &self.learners {
             match period {
@@ -347,6 +361,18 @@ impl<P: Problem + Clone> Practice<P> {
             }
         };
 
+        let yield_ = reward;
+        let survived = self.cfg.survival.map(|t| yield_ >= t).unwrap_or(true);
+        let reward = match self.cfg.survival {
+            Some(_) => {
+                if survived {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            None => reward,
+        };
         for (lever, node) in nodes.iter().enumerate() {
             let Some(node) = *node else { continue };
             let outcome = Outcome {
@@ -390,6 +416,8 @@ impl<P: Problem + Clone> Practice<P> {
             deliveries,
             best,
             mean_entropy,
+            yield_,
+            survived,
         });
         self.turn += 1;
         self.history.last().expect("just pushed")
@@ -421,6 +449,7 @@ impl<P: Problem + Clone> Practice<P> {
             early_reward: early,
             late_reward: late,
             best_reward: self.best.as_ref().map(|(r, _)| *r).unwrap_or(0.0),
+            survived: self.history.iter().filter(|t| t.survived).count(),
             learners: self
                 .learners
                 .iter()

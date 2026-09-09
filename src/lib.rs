@@ -115,7 +115,8 @@
 //!   routes and generate them, and a holonomy embedding in which the
 //!   thoughts integrate a high-dimensional state through the moves
 //!   they make and a knowledge graph is learned by walking its
-//!   queries.
+//!   queries; and a bridge that makes the colony's forward and
+//!   backward filters explicit.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
