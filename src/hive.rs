@@ -645,26 +645,41 @@ impl MovementHistory {
         out
     }
 
+    /// The invariant skeleton's cells, row by row: those with enough
+    /// steady flow and enough axial order to count as a channel.
+    pub fn channel_mask(&self) -> Vec<bool> {
+        self.flow_mask(self.cfg.channel_rate, self.cfg.channel_alignment)
+    }
+
+    /// The cells, row by row, with a steady flow of at least `rate`
+    /// moves per tick and an axial order of at least `alignment` (0
+    /// for any order): with a low rate and no order, where the colony
+    /// steadily walks at all.
+    pub fn flow_mask(&self, rate: f64, alignment: f64) -> Vec<bool> {
+        let scale = self.slow_scale();
+        let mut mask = vec![false; self.width * self.height];
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                if let Some(k) = self.slow.leaf(Position::new(x, y)) {
+                    let f = &self.slow.get(k).flow;
+                    mask[(y as usize) * self.width + x as usize] =
+                        f.weight * scale >= rate && f.nematic() >= alignment;
+                }
+            }
+        }
+        mask
+    }
+
     /// Topology of the invariant skeleton: channel cells are those with
     /// enough steady flow and enough axial order; channels are their
     /// eight-connected groups; loops are the four-connected regions of
     /// other cells that channels enclose (regions not reaching the edge
     /// of the world).
     pub fn topology(&self) -> Topology {
-        let scale = self.slow_scale();
         let w = self.width as i32;
         let h = self.height as i32;
         let idx = |x: i32, y: i32| (y as usize) * self.width + x as usize;
-        let mut channel = vec![false; self.width * self.height];
-        for y in 0..h {
-            for x in 0..w {
-                if let Some(k) = self.slow.leaf(Position::new(x, y)) {
-                    let f = &self.slow.get(k).flow;
-                    channel[idx(x, y)] = f.weight * scale >= self.cfg.channel_rate
-                        && f.nematic() >= self.cfg.channel_alignment;
-                }
-            }
-        }
+        let channel = self.channel_mask();
         let cells = channel.iter().filter(|&&c| c).count();
         // Channels: eight-connected components of channel cells.
         let mut seen = vec![false; channel.len()];

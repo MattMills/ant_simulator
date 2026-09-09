@@ -108,7 +108,11 @@
 //!   component above re-leveraged as a general-purpose architecture
 //!   that thinks in the style of ants, where a problem is embedded on
 //!   a surface and walked by a colony of thoughts whose trails become
-//!   the solution: a maze, a tour of cities, a graph colouring.
+//!   the solution: a maze, a tour of cities, a graph colouring; and a
+//!   path-topological network that makes the pheromone surface
+//!   variable, registering the classes of routes walked (their words
+//!   round the embedding's punctures) as learned symbols that label
+//!   routes and generate them.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`

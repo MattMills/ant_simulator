@@ -946,11 +946,20 @@ than the nearest-neighbour tour (a mean of 0.98 and a best of 1.05 of
 it, against 0.63 for the best of two thousand random tours); and a
 graph colouring laid out layer by layer, where dead ends are marked
 no-entry and retreated from and the trail selects the colourings with
-fewer colours. What the exploration found, and where the ants' way
-stops, is in the crate's README.
+fewer colours. The pheromone surface is made variable as well: a
+path-topological network classes every route by its word (the rays it
+crosses from the embedding's punctures, freely reduced, which is its
+homotopy class), registers the classes walked home as symbols with
+channels of their own and weights learned from their yields, labels any
+route by its class (with a name given after the fact), generates a
+route of any class by search or by expressing the symbol for the colony
+to walk, and learns its punctures from the holes the walks enclose.
+What the exploration found, and where the ants' way stops, is in the
+crate's README.
 
 ```text
 cargo run --release -p ant_extras --example think
+cargo run --release -p ant_extras --example symbols
 cargo test --release -p ant_extras
 ```
 

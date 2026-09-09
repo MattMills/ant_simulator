@@ -52,6 +52,9 @@ pub struct Senses {
     pub valid: [bool; RING],
     /// The candidate at each ring position (meaningless where invalid).
     pub slot: [usize; RING],
+    /// What the learned symbols add to the score at each ring position
+    /// (see [`crate::topos`]).
+    pub extra: [f64; RING],
 }
 
 impl Default for Senses {
@@ -60,6 +63,7 @@ impl Default for Senses {
             features: [[0.0; FEATURES]; RING],
             valid: [false; RING],
             slot: [usize::MAX; RING],
+            extra: [0.0; RING],
         }
     }
 }

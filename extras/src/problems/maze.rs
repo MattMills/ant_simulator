@@ -135,6 +135,20 @@ impl Problem for Maze {
         self.passable(cell).then_some(cell)
     }
 
+    /// The centre of each wall.
+    fn punctures(&self) -> Vec<Point> {
+        self.config
+            .walls
+            .iter()
+            .map(|r| {
+                Point::new(
+                    (r.min.x + r.max.x + 1) as f64 / 2.0,
+                    (r.min.y + r.max.y + 1) as f64 / 2.0,
+                )
+            })
+            .collect()
+    }
+
     fn describe(&self, state: &Position) -> String {
         format!("({}, {})", state.x, state.y)
     }

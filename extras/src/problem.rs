@@ -62,6 +62,14 @@ pub trait Problem {
         None
     }
 
+    /// The punctures of the embedding a path-topological network starts
+    /// with (see [`crate::topos`]): points routes wind around, such as
+    /// the walls of a maze or the cities of a tour. More are learned
+    /// from the holes the thoughts' walks enclose.
+    fn punctures(&self) -> Vec<Point> {
+        Vec::new()
+    }
+
     /// A short description of a state.
     fn describe(&self, state: &Self::State) -> String;
 

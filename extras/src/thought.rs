@@ -120,6 +120,9 @@ pub struct Thought<S> {
     pub retreat: bool,
     /// The state just retreated from, not to be tried again at once.
     pub avoid: Option<S>,
+    /// The class of the trip's route, once a solution was found (see
+    /// [`crate::topos`]).
+    pub symbol: Option<usize>,
     /// The turn of the last decision, for the movement history.
     pub last_turn: f64,
     /// Tick at which a rest ends.
@@ -177,6 +180,7 @@ impl<S: Clone> Thought<S> {
             retreats: 0,
             retreat: false,
             avoid: None,
+            symbol: None,
             last_turn: 0.0,
             rest_until: 0,
             hold_until: 0,
@@ -306,6 +310,7 @@ impl<S: Clone> Thought<S> {
         self.retreats = 0;
         self.retreat = false;
         self.avoid = None;
+        self.symbol = None;
         self.last_turn = 0.0;
         self.hold_until = 0;
         self.deadline = 0;

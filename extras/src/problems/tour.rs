@@ -254,6 +254,16 @@ impl Problem for Tour {
         }
     }
 
+    /// The cities themselves, each a little off its centre so that no
+    /// route point lies on a ray: a tour's class is how it winds round
+    /// them.
+    fn punctures(&self) -> Vec<Point> {
+        self.cities
+            .iter()
+            .map(|c| Point::new(c.x + 0.3, c.y + 0.3))
+            .collect()
+    }
+
     fn describe(&self, state: &TourState) -> String {
         format!(
             "{} of {} cities seen, {:.1} cells walked",

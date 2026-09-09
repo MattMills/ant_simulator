@@ -277,3 +277,207 @@ fn the_layered_embedding_places_layers_along_the_width() {
     assert_eq!(cfg.nest, o.cell());
     assert!(cfg.random_food.is_none());
 }
+
+// ---------------------------------------------------------------------
+// The path-topological network
+
+use ant_extras::topos::{SymbolConfig, Word};
+use ant_simulator::geometry::Point;
+
+#[test]
+fn the_classes_of_routes_round_a_wall_register_themselves_and_are_named_inferred_and_generated() {
+    let problem = Maze::around_a_wall(48, 32);
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default());
+    let mut mind = Mind::new(problem.clone(), cfg);
+    mind.run(3000);
+    let net = mind.net().expect("a network");
+    assert!(
+        net.punctures()[0].x > 20.0 && net.punctures()[0].x < 28.0,
+        "the wall's centre"
+    );
+    let living = net.living();
+    assert!(
+        living.len() >= 2,
+        "both ways round the wall: {}",
+        net.report()
+    );
+    // The two classes most walked: one crosses the wall's ray (over),
+    // the other does not (under).
+    let mut top = living.clone();
+    top.sort_by_key(|&k| std::cmp::Reverse(net.symbols()[k].support));
+    let crosses = |k: usize| net.symbols()[k].word.letters().iter().any(|l| l.abs() == 1);
+    let (over, under) = if crosses(top[0]) {
+        (top[0], top[1])
+    } else {
+        (top[1], top[0])
+    };
+    assert!(crosses(over) && !crosses(under), "{}", net.report());
+    // The over class is the short way (the start and goal sit in the
+    // upper third): it yields more and weighs more.
+    let (so, su) = (&net.symbols()[over], &net.symbols()[under]);
+    assert!(
+        so.length < su.length,
+        "over {:.0} under {:.0}",
+        so.length,
+        su.length
+    );
+    assert!(
+        so.weight > su.weight,
+        "over {:+.2} under {:+.2}",
+        so.weight,
+        su.weight
+    );
+    assert!(so.support >= 3 && su.support >= 3);
+    assert!(!so.glyph.is_empty() && net.field().total(so.channel) > 0.0);
+    let (over_word, under_word) = (so.word.clone(), su.word.clone());
+
+    // Names after the fact, and inference on routes nobody walked.
+    mind.net_mut().unwrap().name(over, "over the wall");
+    mind.net_mut().unwrap().name(under, "under the wall");
+    let high = vec![
+        Point::new(4.5, 10.5),
+        Point::new(24.5, 1.5),
+        Point::new(43.5, 10.5),
+    ];
+    let low = vec![
+        Point::new(4.5, 10.5),
+        Point::new(24.5, 30.5),
+        Point::new(43.5, 10.5),
+    ];
+    let label = mind.label(&high).unwrap();
+    assert_eq!(label.name.as_deref(), Some("over the wall"), "{label:?}");
+    let label = mind.label(&low).unwrap();
+    assert_eq!(label.name.as_deref(), Some("under the wall"), "{label:?}");
+    let twice: Vec<Point> = high
+        .iter()
+        .chain(low.iter().rev())
+        .chain(high.iter())
+        .copied()
+        .collect();
+    let label = mind.label(&twice).unwrap();
+    assert!(label.symbol.is_none(), "not a class walked: {label:?}");
+    assert!(label.nearest.is_some());
+
+    // Generation by search: a route of each class from the origin to
+    // the goal, on passable ground, of the class asked for.
+    for (word, name) in [(over_word, "over the wall"), (under_word, "under the wall")] {
+        let route = mind
+            .generate(&word, problem.goal())
+            .expect("a route of the class");
+        assert_eq!(route[0].cell(), problem.start());
+        assert_eq!(route.last().unwrap().cell(), problem.goal());
+        assert!(route.iter().all(|p| problem.passable(p.cell())));
+        let label = mind.label(&route).unwrap();
+        assert_eq!(
+            label.name.as_deref(),
+            Some(name),
+            "generated {word}: {label:?}"
+        );
+    }
+    // A word nobody could walk within the longest word: none.
+    let long = Word::from_letters(&[1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2]);
+    assert!(mind.generate(&long, problem.goal()).is_none());
+}
+
+#[test]
+fn expressing_a_symbol_makes_the_thoughts_walk_its_class() {
+    let problem = Maze::around_a_wall(48, 32);
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default());
+    let mut mind = Mind::new(problem, cfg);
+    mind.run(3000);
+    let net = mind.net().expect("a network");
+    let living = net.living();
+    assert!(living.len() >= 2);
+    // Of the two classes most walked, the one walked less.
+    let mut top = living.clone();
+    top.sort_by_key(|&k| std::cmp::Reverse(net.symbols()[k].support));
+    let weaker = top[1];
+    let share = |mind: &Mind<Maze>, before: &[u32]| {
+        let net = mind.net().unwrap();
+        let after: Vec<u32> = living.iter().map(|&k| net.symbols()[k].support).collect();
+        let total: u32 = after.iter().zip(before).map(|(a, b)| a - b).sum();
+        let idx = living.iter().position(|&k| k == weaker).unwrap();
+        (
+            (after[idx] - before[idx]) as f64 / total.max(1) as f64,
+            after,
+        )
+    };
+    let start: Vec<u32> = living.iter().map(|&k| net.symbols()[k].support).collect();
+    mind.run(1500);
+    let (before, mid) = share(&mind, &start);
+    mind.express(weaker, 6.0);
+    mind.run(1500);
+    let (during, _) = share(&mind, &mid);
+    assert!(
+        during > before + 0.05,
+        "the class's share of trips rises when expressed: {before:.2} -> {during:.2}\n{}",
+        mind.net().unwrap().report()
+    );
+    mind.release(weaker);
+}
+
+#[test]
+fn tours_fall_into_classes_by_how_they_wind_round_the_cities() {
+    let problem = Tour::random(8, 40, 32, 5);
+    let cfg = MindConfig {
+        thoughts: 24,
+        speed: 2.0,
+        trip_budget: 24,
+        odour_release: 0.0,
+        recruitment: 8.0,
+        ..MindConfig::default()
+    }
+    .with_trail_half_life(150.0)
+    .with_weight(F_HEADING, 0.0)
+    .with_weight(F_ODOUR, 8.0)
+    .with_weight(F_ROUTE, 3.0)
+    .with_symbols(SymbolConfig {
+        max_word: 24,
+        learn_punctures: false,
+        ..SymbolConfig::default()
+    });
+    let mut mind = Mind::new(problem.clone(), cfg);
+    mind.run(3000);
+    let net = mind.net().expect("a network");
+    assert_eq!(
+        net.punctures().len(),
+        problem.len(),
+        "the cities are the punctures"
+    );
+    let living = net.living();
+    assert!(!living.is_empty(), "{}", net.report());
+    // Every class's glyph is a closed tour of its word, and the best
+    // finding's route is of a registered class.
+    for &k in &living {
+        let s = &net.symbols()[k];
+        assert_eq!(net.word(&s.glyph), s.word);
+        assert!(s.support >= 3);
+    }
+    let best = mind.best().unwrap();
+    let label = net.label(&best.places);
+    assert!(label.symbol.is_some(), "{label:?}");
+    // The classes are weighed by their yield: the best-yielding class
+    // has the largest weight.
+    let top = living
+        .iter()
+        .max_by(|&&a, &&b| {
+            net.symbols()[a]
+                .yield_
+                .partial_cmp(&net.symbols()[b].yield_)
+                .unwrap()
+        })
+        .unwrap();
+    assert!(living
+        .iter()
+        .all(|&k| net.symbols()[k].weight <= net.symbols()[*top].weight + 1e-9));
+}

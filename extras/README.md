@@ -210,6 +210,86 @@ turns to 8.4 over the last, against 4.9 for the untouched instinct: the
 learners find surfaces that think better than the ant's, mostly by
 turning the followers' disorder down.
 
+## Symbols: the pheromone surface made variable
+
+The ants' surface has six channels with fixed meanings. The
+path-topological network (`topos`) lets the surface grow: a channel is
+registered for every *kind of route* the thoughts keep walking home,
+and the kind is a topological invariant of the route.
+
+**Words.** Given a set of *punctures* in the embedding, a ray runs up
+from each. A route's *word* is the sequence of rays it crosses, each
+crossing a letter signed by its direction, freely reduced (a crossing
+followed by its reverse cancels): `b a` crosses the second ray, then
+the first; `1` crosses nothing. Two routes with the same endpoints have
+the same word if and only if one can be deformed into the other without
+passing through a puncture: the word is the route's homotopy class, its
+h-signature (Bhattacharya, Likhachev & Kumar 2012). It is a label
+nobody gave; the pattern names itself.
+
+**Registration.** A word walked home on enough trips (`support`, three
+by default) is registered as a *symbol*: a channel of its own in the
+symbol field, where the trips of that class lay their trail on the way
+home; a *glyph*, the best route of the class; statistics (support, mean
+quality, mean length); and a *weight*, learned from how the class
+yields (quality per length, against the shortest class, relative to the
+mean over classes), which the thoughts sense along a move as they sense
+a pheromone and add to their scores. The symbols are the units of a
+network whose wiring is the topology of the routes.
+
+**Inference and generation.** A route, walked or not, is labelled by
+its word: the symbol of that class if there is one, else the nearest by
+edit distance, and its name if a name was attached after the fact
+(`Mind::label`, `PathNet::name`). A route of a class is produced again
+two ways: by a breadth-first search over cells and the words of the
+ways to them, which returns a shortest route of exactly that class
+(`Mind::generate`); or by expressing the symbol, laying its glyph into
+its channel strongly and attending to it, so that the thoughts walk the
+class again and bring it home (`Mind::express`), which the labels of
+what comes home then confirm.
+
+**Learned punctures.** The alphabet grows too. Where the walks steadily
+go (the history's `flow_mask` at a low rate) encloses holes; a hole
+large enough, persisting for enough epochs, that would tell apart the
+exemplars of one class (routes of one word now falling into two words
+with it, both walked) becomes a puncture, and every symbol's word is
+refined under the new alphabet, coinciding classes merged. A hole every
+route passes the same side of teaches nothing.
+
+`cargo run --release -p ant_extras --example symbols`:
+
+* **Round a wall** (the wall's centre the given puncture): after 4 000
+  ticks, 739 routes home fall into two classes, `a` over the wall (637,
+  mean length 82, weight +0.54) and `1` under it (102, length 119,
+  weight −0.54). Named after the fact, a route nobody walked high over
+  the wall is labelled "over the wall", one low "under the wall", and
+  one that goes over, comes back under and goes over again (`a a`) is
+  no class walked, nearest "over the wall" at one letter. Generation by
+  search gives a 66-cell route over and a 76-cell route under, each
+  labelled as asked. Expressing "under the wall" raises its share of
+  the trips brought home from 21 % to 47 % while expressed, back to
+  20 % after release: a thought that departs while a symbol is
+  expressed sets out the way its glyph goes, since the sucker that
+  selects its moves climbs from straight ahead and looks where it
+  starts.
+* **Round a pillar nobody declared**: with no puncture given, all
+  routes are one class (`1`) until the walks round the pillar enclose
+  it; the hole persists (seen at every look from tick 1 500 on), the
+  puncture is learned at tick 3 000 once it tells the class's exemplars
+  apart, and the routes fall into `a` (1 055) and `1` (663), the two
+  ways round it, of equal yield.
+* **Tours of ten cities** (the cities the punctures): 1 437 tours home
+  fall into seven classes by how they wind round the cities; the best
+  class (`g d c' d' j' e' g' a'`, quality 1.248, 1 197 tours) weighs
+  +0.87 and the worst (`a g d c' d' j' e j c d c' d' j' g' a'`, quality
+  0.957) −0.73.
+
+Where it stops: the invariant is exact only for routes with the same
+endpoints, so a trip's class is its class from the origin; a word is
+kept to twelve letters (a route winding more is noise, not a class);
+and a puncture is a point, so the class of a route round a long wall is
+one letter whatever its shape, which is what a homotopy class is.
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -233,6 +313,13 @@ turning the followers' disorder down.
   dropped and the scent raised, and the sucker, which is the ant's
   geometry of choice, replaced by a draw; the colouring runs on it as
   it is. The practice module is the way from a start to a fit.
+* **A route's class is a label nobody gave.** The word of a route
+  round the punctures is exact, cheap, and grows with the alphabet;
+  registering words as channels makes the pheromone surface variable
+  without touching the fixed sensorium, since the symbols add to the
+  score beside it. What is learned is which classes yield, which
+  punctures matter, and the glyph of each class; what is inferred is
+  the class of any route; what is generated is a route of any class.
 * **The queen is a policy over two numbers.** Given stagnation and
   organisation she has a sensible thing to do with the castes' dials;
   what she cannot do is tell a saturating quality from a stagnant one,
@@ -248,6 +335,8 @@ extras/src/sense.rs       Candidate, Senses, Body, Sight, features, read_along
 extras/src/thought.rs     Thought, Activity, Site, Target
 extras/src/mind.rs        Mind, MindConfig, MindStats, Finding, Choice, Geometry, QueenPolicy
 extras/src/practice.rs    Practice, PracticeConfig, PracticeReport, Targets, Turn
+extras/src/topos.rs       Word, Rays, SymbolField, Symbol, PathNet, Label, SymbolConfig
+extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems
 extras/tests/thinking.rs  what the tests check
 ```

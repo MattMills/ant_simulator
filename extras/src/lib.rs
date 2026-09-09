@@ -31,6 +31,7 @@
 //! | pipeline ([`ant_simulator::pipeline`]) | horizons and the frame budget | a heading held where the decision would have been the same |
 //! | the queen ([`ant_simulator::hive::Queen`]) | the queen's mind | stagnation heats the scouts, organisation cools the followers |
 //! | [`practice`] | learners, levers, the arena | learners tune the surfaces through a hidden, rotating connection, rewarded by what comes home |
+//! | [`topos`] | the six pheromone channels | a variable surface: a channel per learned symbol, each a class of routes (its word round the punctures), registered, weighed, labelled and generated |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -45,6 +46,24 @@
 //! * [`problems::Colouring`]: a graph colouring laid out layer by layer,
 //!   nodes along the width and colours along the height, with dead ends
 //!   where no colour is left, marked no-entry and retreated from.
+//!
+//! ## Symbols: the surface that grows
+//!
+//! The ants' surface has six channels with fixed meanings. The
+//! path-topological network ([`topos`]) lets it grow: a route's
+//! **word** is the sequence of rays it crosses, one ray running up from
+//! each **puncture** of the embedding (a wall, a city, or a hole the
+//! walks turn out to enclose), freely reduced; two routes have the same
+//! word exactly when one can be deformed into the other without
+//! crossing a puncture. A word walked home often enough is registered
+//! as a **symbol** with a channel of its own, a glyph, and a weight
+//! learned from how its class yields, which the thoughts sense as they
+//! sense a pheromone. The label is blind: nobody gave it. A name can be
+//! attached after the fact, a new route is labelled by its word
+//! (inference), and a route of a class is produced again, by a search
+//! over cells and words or by expressing the symbol into its channel
+//! for the colony to walk (generation). Punctures themselves are
+//! learned where the walks go round something both ways.
 //!
 //! ## Where the ants' way stops
 //!
@@ -64,6 +83,7 @@ pub mod problem;
 pub mod problems;
 pub mod sense;
 pub mod thought;
+pub mod topos;
 
 /// Everything commonly needed.
 pub mod prelude {
@@ -73,4 +93,5 @@ pub mod prelude {
     pub use crate::problems::{ColourState, Colouring, Maze, Tour, TourState};
     pub use crate::sense::{Body, Candidate, Senses, Sight};
     pub use crate::thought::{Activity, Site, Target, Thought};
+    pub use crate::topos::{Label, PathNet, Rays, Symbol, SymbolConfig, SymbolField, Word};
 }

@@ -39,6 +39,7 @@
 use crate::problem::{Moves, Problem};
 use crate::sense::{clear_ahead, features, Body, Candidate, Senses, Sight};
 use crate::thought::{unit, Activity, Site, Target, Thought};
+use crate::topos::{Label, PathNet, SymbolConfig, Word};
 use ant_simulator::ant::{Mode, FEATURES};
 use ant_simulator::entropy::{entropy, EntropyControl, Tempering};
 use ant_simulator::geometry::{angle_of, wrap_angle, Point, Position};
@@ -204,6 +205,9 @@ pub struct MindConfig {
     pub foresight: Option<f64>,
     /// The queen.
     pub queen: Option<QueenPolicy>,
+    /// The path-topological network: the variable surface of learned
+    /// symbols (see [`crate::topos`]).
+    pub symbols: Option<SymbolConfig>,
     /// Kinetics of the medium's channels.
     pub pheromones: PheromoneSet,
     /// Seconds per tick.
@@ -243,6 +247,7 @@ impl Default for MindConfig {
             pipeline: None,
             foresight: None,
             queen: None,
+            symbols: None,
             pheromones: MindConfig::pheromones(),
             tick_s: 1.0,
             ledger: true,
@@ -321,6 +326,14 @@ impl MindConfig {
     /// A mind with a queen.
     pub fn with_queen(mut self, queen: QueenPolicy) -> MindConfig {
         self.queen = Some(queen);
+        self
+    }
+
+    /// A mind with a path-topological network: routes are classed by
+    /// their words, classes are registered as symbols with channels of
+    /// their own, and the thoughts sense them with learned weights.
+    pub fn with_symbols(mut self, symbols: SymbolConfig) -> MindConfig {
+        self.symbols = Some(symbols);
         self
     }
 
@@ -454,6 +467,7 @@ pub struct Mind<P: Problem> {
     history: Option<MovementHistory>,
     memo: Option<Memo>,
     queen: Option<Queen>,
+    net: Option<PathNet>,
     rng: Rng,
     tick: u64,
     stats: MindStats,
@@ -541,6 +555,11 @@ impl<P: Problem> Mind<P> {
             )
         });
 
+        let net = cfg
+            .symbols
+            .clone()
+            .map(|c| PathNet::new(w, h, tick_s, problem.punctures(), c));
+
         Mind {
             problem,
             cfg,
@@ -555,6 +574,7 @@ impl<P: Problem> Mind<P> {
             history,
             memo,
             queen,
+            net,
             rng,
             tick: 0,
             stats: MindStats::default(),
@@ -654,6 +674,54 @@ impl<P: Problem> Mind<P> {
         self.queen.as_ref()
     }
 
+    /// The path-topological network, if the mind keeps one.
+    pub fn net(&self) -> Option<&PathNet> {
+        self.net.as_ref()
+    }
+
+    /// The network, to name, attend to or express its symbols.
+    pub fn net_mut(&mut self) -> Option<&mut PathNet> {
+        self.net.as_mut()
+    }
+
+    /// What class a route is, by the network.
+    pub fn label(&self, route: &[Point]) -> Option<Label> {
+        self.net.as_ref().map(|n| n.label(route))
+    }
+
+    /// A route of a class from the origin to a cell, by the network's
+    /// search over the medium's passable ground.
+    pub fn generate(&self, word: &Word, to: Position) -> Option<Vec<Point>> {
+        let net = self.net.as_ref()?;
+        let world = &self.world;
+        net.generate(word, self.origin_place.cell(), to, &|p| {
+            world.is_passable(p)
+        })
+    }
+
+    /// Express a symbol: its glyph is laid into its channel and the
+    /// thoughts attend to it with the given gain until released, so
+    /// that they walk its class again.
+    pub fn express(&mut self, k: usize, gain: f64) {
+        let deposit = self
+            .cfg
+            .symbols
+            .as_ref()
+            .map(|c| c.deposit * c.expression)
+            .unwrap_or(0.0);
+        if let Some(net) = &mut self.net {
+            net.express(k, deposit);
+            net.attend(k, gain);
+        }
+    }
+
+    /// Let a symbol go.
+    pub fn release(&mut self, k: usize) {
+        if let Some(net) = &mut self.net {
+            net.release(k);
+        }
+    }
+
     /// The origin's place.
     pub fn origin_place(&self) -> Point {
         self.origin_place
@@ -694,6 +762,22 @@ impl<P: Problem> Mind<P> {
             m.step();
         }
         self.queen_epoch();
+        if let Some(net) = &mut self.net {
+            net.step();
+            let epoch = net.config().epoch_ticks.max(1);
+            if self.tick > 0 && self.tick.is_multiple_of(epoch) {
+                if let Some(h) = &self.history {
+                    let walked = h.flow_mask(net.config().hole_rate, 0.0);
+                    if net.learn_punctures(&walked) > 0 {
+                        // The alphabet grew: the classes of trips under
+                        // way are named anew when they come home.
+                        for t in self.thoughts.iter_mut() {
+                            t.symbol = None;
+                        }
+                    }
+                }
+            }
+        }
         self.tick += 1;
         self.stats.ticks += 1;
     }
@@ -726,13 +810,21 @@ impl<P: Problem> Mind<P> {
     fn depart(&mut self, i: usize) {
         let origin = self.origin.clone();
         let place = self.origin_place;
-        let heading = self.rng.range(0.0, std::f64::consts::TAU);
+        let random = self.rng.range(0.0, std::f64::consts::TAU);
         let site_fidelity = self.cfg.site_fidelity;
         let free = self.free.is_some();
         let foresight = self.cfg.foresight;
+        // A thought sets out any way at all, unless a symbol is being
+        // expressed: then it sets out with the symbol in mind, the way
+        // its glyph goes (the sucker that selects its moves climbs from
+        // straight ahead, so where it starts is where it looks).
+        let attended = self.net.as_ref().and_then(|n| n.attended());
         let t = &mut self.thoughts[i];
         t.reset_trip(origin, place);
-        t.heading = heading;
+        t.heading = match attended {
+            Some((_, heading)) => heading,
+            None => random,
+        };
         t.activity = if site_fidelity && t.site.is_some() {
             Activity::Outbound
         } else {
@@ -842,7 +934,12 @@ impl<P: Problem> Mind<P> {
         let origin_place = self.origin_place;
         let recruitment = self.cfg.recruitment.max(0.0);
         let colony_best = self.best.as_ref().map(|b| b.quality).unwrap_or(0.0);
+        let symbol = self
+            .net
+            .as_ref()
+            .and_then(|n| n.find(&n.word(&self.thoughts[i].places)));
         let t = &mut self.thoughts[i];
+        t.symbol = symbol;
         t.load = Some(quality);
         // Recruitment is judged against the best the thought knows and
         // the best the mind has brought home.
@@ -948,6 +1045,9 @@ impl<P: Problem> Mind<P> {
             self.stats.deliveries += 1;
             self.stats.quality_sum += q;
             t.findings += 1;
+            if let Some(net) = &mut self.net {
+                net.observe(&t.places, q, tick);
+            }
             // The route is remembered when it led to the best the
             // thought knows (its site was set on finding it).
             if t.site.map(|s| q >= s.quality).unwrap_or(true) {
@@ -1207,11 +1307,17 @@ impl<P: Problem> Mind<P> {
                 offset,
                 &mut feat,
             );
-            let logit = dot(&weights, &feat);
+            let extra = self
+                .net
+                .as_ref()
+                .map(|n| n.extra(place, u, c.len))
+                .unwrap_or(0.0);
+            let logit = dot(&weights, &feat) + extra;
             if !senses.valid[c.ring] || logit > best[c.ring] {
                 senses.valid[c.ring] = true;
                 senses.slot[c.ring] = j;
                 senses.features[c.ring] = feat;
+                senses.extra[c.ring] = extra;
                 best[c.ring] = logit;
             }
         }
@@ -1233,11 +1339,14 @@ impl<P: Problem> Mind<P> {
         let policy = self.policies[leaf].clone();
         let mut scores = [f64::NEG_INFINITY; RING];
         let mut any = false;
-        for ((score, &valid), features) in
-            scores.iter_mut().zip(&senses.valid).zip(&senses.features)
+        for (((score, &valid), features), &extra) in scores
+            .iter_mut()
+            .zip(&senses.valid)
+            .zip(&senses.features)
+            .zip(&senses.extra)
         {
             if valid {
-                *score = dot(&policy.weights, features);
+                *score = dot(&policy.weights, features) + extra;
                 any = true;
             }
         }
@@ -1386,13 +1495,17 @@ impl<P: Problem> Mind<P> {
             m.record_move(to_cell, walked);
         }
         // What is laid along the way.
-        let (activity, load, no_entry_left, recruit) = {
+        let (activity, load, no_entry_left, recruit, symbol) = {
             let t = &self.thoughts[i];
-            (t.activity, t.load, t.no_entry_left, t.recruit)
+            (t.activity, t.load, t.no_entry_left, t.recruit, t.symbol)
         };
         if let Some(q) = load {
             let per_cell = self.cfg.trail_deposit * q * recruit;
             self.lay_along(i, place, pre, Pheromone::Trail, per_cell);
+            if let (Some(net), Some(k)) = (&mut self.net, symbol) {
+                let per_cell = net.config().deposit * q * recruit;
+                net.lay(k, place, pre, per_cell);
+            }
         }
         if no_entry_left > 0.0 && self.cfg.no_entry_deposit > 0.0 {
             let per_cell = 0.25 * self.cfg.no_entry_deposit;
@@ -2084,6 +2197,9 @@ impl<P: Problem> Mind<P> {
                 topo.channels, topo.loops, summary.alignment, summary.spatial_entropy
             );
         }
+        if let Some(n) = &self.net {
+            out.push_str(&n.report());
+        }
         if let Some(q) = &self.queen {
             let dials = self.dials();
             let temps = self.temperatures();
@@ -2145,6 +2261,51 @@ impl<P: Problem> Mind<P> {
             out.push('\n');
         }
         out
+    }
+}
+
+impl<P: Problem> Mind<P> {
+    /// A symbol's channel drawn like [`render`](Self::render), with the
+    /// symbol's glyph marked `+` and the punctures `x`.
+    pub fn render_symbol(&self, k: usize) -> Option<String> {
+        let net = self.net.as_ref()?;
+        let s = net.symbol(k)?;
+        let (w, h) = (self.world.width(), self.world.height());
+        let shades: &[u8] = b" .:-=+*#%";
+        let key = net.field().k;
+        let mut grid: Vec<Vec<char>> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        let p = Position::new(x as i32, y as i32);
+                        if !self.world.is_passable(p) {
+                            return '#';
+                        }
+                        let v = (net.field().level(p, s.channel) / key).ln_1p();
+                        let idx = ((v / 4.0) * (shades.len() - 1) as f64).round() as usize;
+                        shades[idx.min(shades.len() - 1)] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let mark = |grid: &mut Vec<Vec<char>>, p: Point, ch: char| {
+            let c = p.cell();
+            if c.x >= 0 && c.y >= 0 && (c.x as usize) < w && (c.y as usize) < h {
+                grid[c.y as usize][c.x as usize] = ch;
+            }
+        };
+        for p in &s.glyph {
+            mark(&mut grid, *p, '+');
+        }
+        for p in net.punctures() {
+            mark(&mut grid, *p, 'x');
+        }
+        let mut out = String::with_capacity((w + 1) * h);
+        for row in grid {
+            out.extend(row);
+            out.push('\n');
+        }
+        Some(out)
     }
 }
 
