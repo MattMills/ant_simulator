@@ -954,12 +954,18 @@ channels of their own and weights learned from their yields, labels any
 route by its class (with a name given after the fact), generates a
 route of any class by search or by expressing the symbol for the colony
 to walk, and learns its punctures from the holes the walks enclose.
-What the exploration found, and where the ants' way stops, is in the
-crate's README.
+On that network stands a *holonomy embedding*: thoughts integrate a
+high-dimensional state through the moves and portals they cross, the
+transport of a class of routes is its vector, and a knowledge graph
+walked as queries yields rules as words, relation vectors that close
+along them, and predictions of held-out facts by geometry, rules and
+both (`extras/docs/holonomy.md`). What the exploration found, and
+where the ants' way stops, is in the crate's README.
 
 ```text
 cargo run --release -p ant_extras --example think
 cargo run --release -p ant_extras --example symbols
+cargo run --release -p ant_extras --example relations
 cargo test --release -p ant_extras
 ```
 

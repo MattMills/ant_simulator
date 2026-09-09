@@ -290,6 +290,30 @@ kept to twelve letters (a route winding more is noise, not a class);
 and a puncture is a point, so the class of a route round a long wall is
 one letter whatever its shape, which is what a homotopy class is.
 
+## The holonomy embedding
+
+The symbols carry vectors as well. A problem may give its thoughts an
+integrative capacity, a state in D dimensions that a free walk develops
+step by step through the turns of the folds it crosses and a walk of
+states integrates move by move (a relation followed adds its vector).
+On a flat connection what a route integrates depends only on its word,
+so a symbol's *transport*, the mean of what its routes integrate, is
+the class's vector and the spread of those integrals its curvature.
+Moves and portals are decidable gates, admitting a thought by its state
+and its word so far. Learning is local: a trip brought home credits the
+residual between what it integrated and its target back to the moves
+it made, and arrival near a target vector is food.
+
+Round a cylinder (`tests/thinking.rs`) the classes are the windings and
+their transports circumferences. On a knowledge graph of families
+(`cargo run --release -p ant_extras --example relations`) queries are
+trips, the words of the trips brought home are rules such as
+`grandparent: parent parent`, the relations' vectors learn to close
+along them (the planted rules close to 0.01), and 293 held-out facts
+are predicted with an MRR of 0.895 and hits@1 of 0.80 by rules and
+geometry together, against 0.011 before. The design, the numbers and
+where it stops are in [`docs/holonomy.md`](docs/holonomy.md).
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -320,6 +344,12 @@ one letter whatever its shape, which is what a homotopy class is.
   score beside it. What is learned is which classes yield, which
   punctures matter, and the glyph of each class; what is inferred is
   the class of any route; what is generated is a route of any class.
+* **A translation is a coarse transport.** The holonomy embedding's
+  transports are exact (zero spread) and the planted rules close, yet
+  the geometry alone predicts poorly, because a symmetric relation can
+  only close at zero and then tells nothing apart; the words carry
+  what the translation cannot. The affine transport the design allows
+  is the next step.
 * **The queen is a policy over two numbers.** Given stagnation and
   organisation she has a sensible thing to do with the castes' dials;
   what she cannot do is tell a saturating quality from a stagnant one,
@@ -335,7 +365,10 @@ extras/src/sense.rs       Candidate, Senses, Body, Sight, features, read_along
 extras/src/thought.rs     Thought, Activity, Site, Target
 extras/src/mind.rs        Mind, MindConfig, MindStats, Finding, Choice, Geometry, QueenPolicy
 extras/src/practice.rs    Practice, PracticeConfig, PracticeReport, Targets, Turn
-extras/src/topos.rs       Word, Rays, SymbolField, Symbol, PathNet, Label, SymbolConfig
+extras/src/topos.rs       Word, Route, Rays, SymbolField, Symbol, PathNet, Label, SymbolConfig
+extras/src/problems/relations.rs  Relations, Node, Triple, Evaluation (the knowledge graph)
+extras/docs/holonomy.md   the holonomy embedding: proposal, build, numbers, limits
+extras/examples/relations.rs  the family graph learned by walking
 extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems
 extras/tests/thinking.rs  what the tests check

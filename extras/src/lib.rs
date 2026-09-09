@@ -31,7 +31,8 @@
 //! | pipeline ([`ant_simulator::pipeline`]) | horizons and the frame budget | a heading held where the decision would have been the same |
 //! | the queen ([`ant_simulator::hive::Queen`]) | the queen's mind | stagnation heats the scouts, organisation cools the followers |
 //! | [`practice`] | learners, levers, the arena | learners tune the surfaces through a hidden, rotating connection, rewarded by what comes home |
-//! | [`topos`] | the six pheromone channels | a variable surface: a channel per learned symbol, each a class of routes (its word round the punctures), registered, weighed, labelled and generated |
+//! | [`topos`] | the six pheromone channels | a variable surface: a channel per learned symbol, each a class of routes (its word round the punctures), registered, weighed, labelled and generated, with a transport as its vector |
+//! | [`problems::Relations`] | path integration | the holonomy embedding: thoughts integrate a D-dimensional state through the relations they follow, the words of their trips are rules, and the geometry learns to close along them |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -65,6 +66,27 @@
 //! for the colony to walk (generation). Punctures themselves are
 //! learned where the walks go round something both ways.
 //!
+//! ## The holonomy embedding
+//!
+//! A thought's home vector is the integral of its displacement; the
+//! holonomy embedding generalises that integral to D dimensions and
+//! makes it the representation (`extras/docs/holonomy.md`). A problem
+//! may give its thoughts an integrative capacity: on a free walk the
+//! state develops the steps through the turns of the folds crossed,
+//! on a walk of states each move adds its transport. A route's word is
+//! its class, and on a flat connection what a route integrates depends
+//! only on its word, so a symbol's transport, the mean of what its
+//! routes integrate, is the class's vector and the spread the
+//! curvature. Portals and moves are decidable gates, admitting a
+//! thought by its state and its word, so a walk is a typed computation
+//! and generation over places, words and gates terminates. Learning is
+//! local and gradient-free: closure credit on the way home, arrival
+//! near a target vector as food. Round a cylinder the classes are the
+//! windings and their transports circumferences; on a knowledge graph
+//! of families the words of the trips are rules, the relations'
+//! vectors learn to close along them, and held-out facts are predicted
+//! by the geometry, by the rules and by both.
+//!
 //! ## Where the ants' way stops
 //!
 //! Habits and foresight belong to the walk between decisions, so they
@@ -90,8 +112,13 @@ pub mod prelude {
     pub use crate::mind::{Choice, Finding, Geometry, Mind, MindConfig, MindStats, QueenPolicy};
     pub use crate::practice::{Practice, PracticeConfig, PracticeReport, Targets, Turn};
     pub use crate::problem::{embedding, Layered, Moves, Problem};
-    pub use crate::problems::{ColourState, Colouring, Maze, Tour, TourState};
+    pub use crate::problems::{
+        ColourState, Colouring, Evaluation, Maze, Node, Relations, Tour, TourState, Triple,
+    };
     pub use crate::sense::{Body, Candidate, Senses, Sight};
     pub use crate::thought::{Activity, Site, Target, Thought};
-    pub use crate::topos::{Label, PathNet, Rays, Symbol, SymbolConfig, SymbolField, Word};
+    pub use crate::topos::{
+        link_letter, link_of, move_letter, prefix_letter, Label, Letter, PathNet, Rays, Route,
+        Symbol, SymbolConfig, SymbolField, Word,
+    };
 }

@@ -7,6 +7,7 @@
 //! route it took there, keeps the transit records the habits need, and
 //! carries the horizon and deadline the decision pipeline gives it.
 
+use crate::topos::Letter;
 use ant_simulator::geometry::{Point, Position};
 use ant_simulator::memo::{Transit, TransitRecord, MAX_TRANSIT_LEVELS};
 
@@ -123,6 +124,17 @@ pub struct Thought<S> {
     /// The class of the trip's route, once a solution was found (see
     /// [`crate::topos`]).
     pub symbol: Option<usize>,
+    /// The letters of the moves of the trip out, one per move after
+    /// the origin (0 where a move is no letter).
+    pub letters: Vec<Letter>,
+    /// The letters the trip's word begins with.
+    pub prefix: Vec<Letter>,
+    /// The integrated state: what the trip has transported, or the
+    /// developed displacement of a free walk.
+    pub x: Vec<f64>,
+    /// The turn accumulated through folds, so that a free walk develops
+    /// in the frame it set out in.
+    pub phi: f64,
     /// The turn of the last decision, for the movement history.
     pub last_turn: f64,
     /// Tick at which a rest ends.
@@ -181,6 +193,10 @@ impl<S: Clone> Thought<S> {
             retreat: false,
             avoid: None,
             symbol: None,
+            letters: Vec::new(),
+            prefix: Vec::new(),
+            x: Vec::new(),
+            phi: 0.0,
             last_turn: 0.0,
             rest_until: 0,
             hold_until: 0,
@@ -242,6 +258,19 @@ impl<S: Clone> Thought<S> {
         let (s, c) = turn.sin_cos();
         let v = self.home_vector;
         self.home_vector = (c * v.0 - s * v.1, s * v.0 + c * v.1);
+        self.phi += turn;
+    }
+
+    /// Develop a step of a free walk into the frame the trip set out
+    /// in: the step turned back by the turns accumulated, added to the
+    /// first two components of the integrated state.
+    pub fn develop(&mut self, dx: f64, dy: f64) {
+        if self.x.len() < 2 {
+            return;
+        }
+        let (s, c) = (-self.phi).sin_cos();
+        self.x[0] += c * dx - s * dy;
+        self.x[1] += s * dx + c * dy;
     }
 
     /// The direction home by path integration, if any way has been
@@ -311,6 +340,10 @@ impl<S: Clone> Thought<S> {
         self.retreat = false;
         self.avoid = None;
         self.symbol = None;
+        self.letters.clear();
+        self.prefix.clear();
+        self.x.clear();
+        self.phi = 0.0;
         self.last_turn = 0.0;
         self.hold_until = 0;
         self.deadline = 0;

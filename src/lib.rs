@@ -112,7 +112,10 @@
 //!   path-topological network that makes the pheromone surface
 //!   variable, registering the classes of routes walked (their words
 //!   round the embedding's punctures) as learned symbols that label
-//!   routes and generate them.
+//!   routes and generate them, and a holonomy embedding in which the
+//!   thoughts integrate a high-dimensional state through the moves
+//!   they make and a knowledge graph is learned by walking its
+//!   queries.
 //!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`

@@ -4,8 +4,10 @@
 
 pub mod colouring;
 pub mod maze;
+pub mod relations;
 pub mod tour;
 
 pub use colouring::{ColourState, Colouring};
 pub use maze::Maze;
+pub use relations::{Evaluation, Node, Relations, Triple};
 pub use tour::{Tour, TourState};

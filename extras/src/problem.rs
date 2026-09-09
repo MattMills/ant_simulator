@@ -11,6 +11,7 @@
 //! goes in: states that are alike should lie close, so that what the
 //! thoughts lay down about one is read about the others.
 
+use crate::topos::Letter;
 use ant_simulator::geometry::{Point, Position};
 use ant_simulator::world::WorldConfig;
 
@@ -69,6 +70,74 @@ pub trait Problem {
     fn punctures(&self) -> Vec<Point> {
         Vec::new()
     }
+
+    // -----------------------------------------------------------------
+    // The holonomy embedding: letters, integration, targets, learning
+    // (see `extras/docs/holonomy.md`). Everything here has a default
+    // that leaves a problem as it was.
+
+    /// Where the trip numbered `trip` begins: the origin by default, or
+    /// a different state per trip (a query of a relational problem).
+    fn depart(&self, _trip: u64) -> Self::State {
+        self.origin()
+    }
+
+    /// The letters a trip from this state begins its word with (a
+    /// query relation, say), so that its class is a class of that
+    /// query's routes. Use [`crate::topos::prefix_letter`].
+    fn prefix(&self, _origin: &Self::State) -> Vec<Letter> {
+        Vec::new()
+    }
+
+    /// The letter of a move between states, if the move is a letter of
+    /// the route's word (a relation of a graph, signed by direction).
+    /// Use [`crate::topos::move_letter`].
+    fn letter(&self, _from: &Self::State, _to: &Self::State) -> Option<Letter> {
+        None
+    }
+
+    /// Names for the letters of moves and prefixes, for showing words.
+    fn letter_names(&self) -> Vec<(Letter, String)> {
+        Vec::new()
+    }
+
+    /// The dimension of the integrated state a thought carries on a
+    /// trip, or 0 for none. On a walk of states it is integrated move
+    /// by move; on a free walk it is the developed displacement.
+    fn capacity(&self) -> usize {
+        0
+    }
+
+    /// The integrated state a trip from this state starts with.
+    fn departure(&self, _origin: &Self::State) -> Vec<f64> {
+        vec![0.0; self.capacity()]
+    }
+
+    /// Integrate a move into the state: the move's transport.
+    fn integrate(&self, _from: &Self::State, _to: &Self::State, _x: &mut [f64]) {}
+
+    /// The vector a trip from this state should land on, if there is
+    /// one.
+    fn target(&self, _origin: &Self::State) -> Option<Vec<f64>> {
+        None
+    }
+
+    /// The quality of a state reached with an integrated state: by
+    /// default the state's own quality.
+    fn quality_at(&self, state: &Self::State, _x: &[f64]) -> Option<f64> {
+        self.quality(state)
+    }
+
+    /// The scent of a move given the integrated state: by default the
+    /// move's scent.
+    fn scent_at(&self, from: &Self::State, to: &Self::State, _x: &[f64]) -> f64 {
+        self.scent(from, to)
+    }
+
+    /// Learn from a trip: its origin, its route out (the origin first),
+    /// the integrated state at its end, and the quality it brought
+    /// home (0 for a trip that came home with nothing).
+    fn learn(&mut self, _origin: &Self::State, _route: &[Self::State], _x: &[f64], _quality: f64) {}
 
     /// A short description of a state.
     fn describe(&self, state: &Self::State) -> String;

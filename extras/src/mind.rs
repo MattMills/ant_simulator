@@ -39,7 +39,7 @@
 use crate::problem::{Moves, Problem};
 use crate::sense::{clear_ahead, features, Body, Candidate, Senses, Sight};
 use crate::thought::{unit, Activity, Site, Target, Thought};
-use crate::topos::{Label, PathNet, SymbolConfig, Word};
+use crate::topos::{move_letter, Label, Letter, PathNet, Route, SymbolConfig, Word};
 use ant_simulator::ant::{Mode, FEATURES};
 use ant_simulator::entropy::{entropy, EntropyControl, Tempering};
 use ant_simulator::geometry::{angle_of, wrap_angle, Point, Position};
@@ -61,6 +61,7 @@ use ant_simulator::species::Species;
 use ant_simulator::surface::{dot, BehavioralSurface};
 use ant_simulator::world::World;
 use std::fmt::Write as _;
+use std::hash::Hash;
 
 /// How decisions are deformed and selected (see
 /// [`ant_simulator::colony::GeometryConfig`]).
@@ -371,6 +372,12 @@ pub struct Finding<S> {
     pub tick: u64,
     /// Which thought brought it.
     pub thought: usize,
+    /// The letters of its moves (see [`crate::topos`]).
+    pub letters: Vec<Letter>,
+    /// The letters its word begins with.
+    pub prefix: Vec<Letter>,
+    /// The integrated state it arrived with.
+    pub x: Vec<f64>,
 }
 
 /// Counters of a mind.
@@ -555,10 +562,13 @@ impl<P: Problem> Mind<P> {
             )
         });
 
-        let net = cfg
-            .symbols
-            .clone()
-            .map(|c| PathNet::new(w, h, tick_s, problem.punctures(), c));
+        let net = cfg.symbols.clone().map(|c| {
+            let mut net = PathNet::new(w, h, tick_s, problem.punctures(), c);
+            for (letter, name) in problem.letter_names() {
+                net.set_name(letter, &name);
+            }
+            net
+        });
 
         Mind {
             problem,
@@ -684,19 +694,135 @@ impl<P: Problem> Mind<P> {
         self.net.as_mut()
     }
 
-    /// What class a route is, by the network.
+    /// What class a route of places is, by the network (its moves no
+    /// letters, its word without a prefix).
     pub fn label(&self, route: &[Point]) -> Option<Label> {
-        self.net.as_ref().map(|n| n.label(route))
+        self.net
+            .as_ref()
+            .map(|n| n.label(&Route::of(route.to_vec()), &[]))
+    }
+
+    /// What class a route with the letters of its moves and a prefix
+    /// is, by the network.
+    pub fn label_route(&self, route: &Route, prefix: &[Letter]) -> Option<Label> {
+        self.net.as_ref().map(|n| n.label(route, prefix))
     }
 
     /// A route of a class from the origin to a cell, by the network's
-    /// search over the medium's passable ground.
+    /// search over the medium's passable ground, through its portals
+    /// (a portal crossed is a letter of the move).
     pub fn generate(&self, word: &Word, to: Position) -> Option<Vec<Point>> {
         let net = self.net.as_ref()?;
         let world = &self.world;
-        net.generate(word, self.origin_place.cell(), to, &|p| {
-            world.is_passable(p)
-        })
+        let neighbours = |cell: Position| -> Vec<(Position, Letter)> {
+            let mut out = Vec::with_capacity(8);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let next = Position::new(cell.x + dx, cell.y + dy);
+                    if world.is_passable(next) {
+                        if dx != 0
+                            && dy != 0
+                            && !(world.is_passable(Position::new(cell.x + dx, cell.y))
+                                && world.is_passable(Position::new(cell.x, cell.y + dy)))
+                        {
+                            continue;
+                        }
+                        out.push((next, 0));
+                    } else if dx == 0 || dy == 0 {
+                        if let Some(w) = world.warp(Point::center_of(next)) {
+                            let landing = w.point.cell();
+                            if world.is_passable(landing) {
+                                out.push((landing, move_letter(w.portal, w.forward)));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        if !world.is_passable(to) {
+            return None;
+        }
+        net.generate_with(word, self.origin_place.cell(), to, &neighbours)
+    }
+
+    /// A route of a class over the problem's states from a state, by
+    /// search over states and the words of the ways to them, ending at
+    /// a state `done` accepts; none within `max_moves` moves or the
+    /// longest word. The word begins with the state's prefix.
+    pub fn generate_states(
+        &self,
+        word: &Word,
+        from: P::State,
+        done: &dyn Fn(&P::State) -> bool,
+        max_moves: usize,
+    ) -> Option<Vec<P::State>>
+    where
+        P::State: Hash + Eq,
+    {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let net = self.net.as_ref()?;
+        let max_word = net.config().max_word.max(word.len());
+        let start_word = Word::from_letters(&self.problem.prefix(&from));
+        let start = (from, start_word);
+        let mut parent: HashMap<(P::State, Word), (P::State, Word)> = HashMap::new();
+        let mut depth: HashMap<(P::State, Word), usize> = HashMap::new();
+        let mut seen: HashSet<(P::State, Word)> = HashSet::new();
+        let mut queue = VecDeque::new();
+        seen.insert(start.clone());
+        depth.insert(start.clone(), 0);
+        queue.push_back(start);
+        while let Some(state) = queue.pop_front() {
+            if state.1 == *word && done(&state.0) {
+                let mut path = vec![state.0.clone()];
+                let mut cur = state;
+                while let Some(p) = parent.get(&cur) {
+                    path.push(p.0.clone());
+                    cur = p.clone();
+                }
+                path.reverse();
+                return Some(path);
+            }
+            let d = depth.get(&state).copied().unwrap_or(0);
+            if d >= max_moves {
+                continue;
+            }
+            let (here, w) = state;
+            let Moves::States(successors) = self.problem.moves(&here) else {
+                continue;
+            };
+            for next in successors {
+                let mut nw = w.clone();
+                net.rays().step(
+                    self.problem.place(&here),
+                    self.problem.place(&next),
+                    &mut nw,
+                );
+                if let Some(l) = self.problem.letter(&here, &next) {
+                    nw.push(l);
+                }
+                if nw.len() > max_word {
+                    continue;
+                }
+                let key = (next, nw);
+                if seen.insert(key.clone()) {
+                    parent.insert(key.clone(), (here.clone(), w.clone()));
+                    depth.insert(key.clone(), d + 1);
+                    queue.push_back(key);
+                }
+            }
+        }
+        None
+    }
+
+    /// The route of a trip as the network sees it: its places with the
+    /// letters of its moves.
+    fn route_of(&self, i: usize) -> Route {
+        let t = &self.thoughts[i];
+        Route::with_letters(t.places.clone(), t.letters.clone())
     }
 
     /// Express a symbol: its glyph is laid into its channel and the
@@ -808,8 +934,10 @@ impl<P: Problem> Mind<P> {
     // The trip
 
     fn depart(&mut self, i: usize) {
-        let origin = self.origin.clone();
-        let place = self.origin_place;
+        let origin = self.problem.depart(self.stats.trips);
+        let place = self.problem.place(&origin);
+        let prefix = self.problem.prefix(&origin);
+        let x = self.problem.departure(&origin);
         let random = self.rng.range(0.0, std::f64::consts::TAU);
         let site_fidelity = self.cfg.site_fidelity;
         let free = self.free.is_some();
@@ -821,6 +949,8 @@ impl<P: Problem> Mind<P> {
         let attended = self.net.as_ref().and_then(|n| n.attended());
         let t = &mut self.thoughts[i];
         t.reset_trip(origin, place);
+        t.prefix = prefix;
+        t.x = x;
         t.heading = match attended {
             Some((_, heading)) => heading,
             None => random,
@@ -848,7 +978,10 @@ impl<P: Problem> Mind<P> {
         if activity == Activity::Inbound {
             let home = match self.free {
                 Some(_) => self.world.is_nest(self.thoughts[i].cell()),
-                None => self.thoughts[i].state == self.origin,
+                None => {
+                    let t = &self.thoughts[i];
+                    t.route.first().map(|o| t.state == *o).unwrap_or(false)
+                }
             };
             if home {
                 self.deliver(i);
@@ -877,8 +1010,13 @@ impl<P: Problem> Mind<P> {
             return self.choose_free(i, Mode::Inbound);
         }
         let state = self.thoughts[i].state.clone();
-        if state != self.origin {
-            if let Some(q) = self.problem.quality(&state) {
+        let at_origin = self.thoughts[i]
+            .route
+            .first()
+            .map(|o| state == *o)
+            .unwrap_or(true);
+        if !at_origin {
+            if let Some(q) = self.problem.quality_at(&state, &self.thoughts[i].x) {
                 self.found(i, q);
                 return self.arrive(i);
             }
@@ -934,10 +1072,11 @@ impl<P: Problem> Mind<P> {
         let origin_place = self.origin_place;
         let recruitment = self.cfg.recruitment.max(0.0);
         let colony_best = self.best.as_ref().map(|b| b.quality).unwrap_or(0.0);
+        let route = self.route_of(i);
         let symbol = self
             .net
             .as_ref()
-            .and_then(|n| n.find(&n.word(&self.thoughts[i].places)));
+            .and_then(|n| n.find(&n.word(&route, &self.thoughts[i].prefix)));
         let t = &mut self.thoughts[i];
         t.symbol = symbol;
         t.load = Some(quality);
@@ -977,6 +1116,16 @@ impl<P: Problem> Mind<P> {
     /// state to try another way, or turn for home empty-handed.
     fn give_up(&mut self, i: usize, dead_end: bool) {
         let cell = self.thoughts[i].cell();
+        {
+            let route = self.route_of(i);
+            if let Some(net) = &mut self.net {
+                net.observe_miss(&route, &self.thoughts[i].prefix);
+            }
+            let t = &self.thoughts[i];
+            if let Some(origin) = t.route.first() {
+                self.problem.learn(origin, &t.route, &t.x, 0.0);
+            }
+        }
         if dead_end {
             self.stats.dead_ends += 1;
             let amount = self.cfg.no_entry_deposit;
@@ -1045,8 +1194,24 @@ impl<P: Problem> Mind<P> {
             self.stats.deliveries += 1;
             self.stats.quality_sum += q;
             t.findings += 1;
+            let route = Route::with_letters(t.places.clone(), t.letters.clone());
             if let Some(net) = &mut self.net {
-                net.observe(&t.places, q, tick);
+                // What the trip integrated: where it arrived less where
+                // it set out.
+                let departure = t
+                    .route
+                    .first()
+                    .map(|o| self.problem.departure(o))
+                    .unwrap_or_default();
+                let transported: Vec<f64> =
+                    t.x.iter()
+                        .enumerate()
+                        .map(|(d, v)| v - departure.get(d).copied().unwrap_or(0.0))
+                        .collect();
+                net.observe(&route, &t.prefix, &transported, q, tick);
+            }
+            if let Some(origin) = t.route.first() {
+                self.problem.learn(origin, &t.route, &t.x, q);
             }
             // The route is remembered when it led to the best the
             // thought knows (its site was set on finding it).
@@ -1061,6 +1226,9 @@ impl<P: Problem> Mind<P> {
                     places: t.places.clone(),
                     tick,
                     thought: i,
+                    letters: t.letters.clone(),
+                    prefix: t.prefix.clone(),
+                    x: t.x.clone(),
                 });
                 self.stats.improvements += 1;
                 self.last_improvement_epoch = self.stats.epochs;
@@ -1086,8 +1254,12 @@ impl<P: Problem> Mind<P> {
         self.close_records(i, INSIDE, 0.0);
         let tick = self.tick;
         let rest = self.cfg.rest_ticks;
-        let origin = self.origin.clone();
-        let place = self.origin_place;
+        let origin = self.thoughts[i]
+            .route
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.origin.clone());
+        let place = self.problem.place(&origin);
         let t = &mut self.thoughts[i];
         t.reset_trip(origin, place);
         if let Some(site) = t.site.as_mut() {
@@ -1252,6 +1424,8 @@ impl<P: Problem> Mind<P> {
         };
         let t = &self.thoughts[i];
         let (place, heading, state) = (t.place, t.heading, t.state.clone());
+        let home = t.route.first().cloned();
+        let x = t.x.clone();
         let body = Body {
             place,
             home_dir: t.home_direction(),
@@ -1265,7 +1439,6 @@ impl<P: Problem> Mind<P> {
             sensitivity: 1.0,
         };
         let free = self.free.is_some();
-        let origin = &self.origin;
         let mut senses = Senses::default();
         let mut best = [f64::NEG_INFINITY; RING];
         for (j, c) in cands.iter().enumerate() {
@@ -1276,11 +1449,20 @@ impl<P: Problem> Mind<P> {
                 let h = ring_heading(c.ring, heading);
                 (h.cos(), h.sin())
             });
-            let food = c.state != *origin && self.problem.quality(&c.state).is_some();
+            let is_home = home.as_ref().map(|h| c.state == *h).unwrap_or(false);
+            let food = !is_home && {
+                if x.is_empty() || free {
+                    self.problem.quality_at(&c.state, &x).is_some()
+                } else {
+                    let mut ahead = x.clone();
+                    self.problem.integrate(&state, &c.state, &mut ahead);
+                    self.problem.quality_at(&c.state, &ahead).is_some()
+                }
+            };
             let nest = if free {
                 self.world.is_nest(c.point.cell())
             } else {
-                c.state == *origin
+                is_home
             };
             let sight = Sight {
                 food,
@@ -1288,7 +1470,7 @@ impl<P: Problem> Mind<P> {
                 scent: if free {
                     0.0
                 } else {
-                    self.problem.scent(&state, &c.state)
+                    self.problem.scent_at(&state, &c.state, &x)
                 },
                 clear: if free {
                     clear_ahead(&self.world, place, u)
@@ -1467,12 +1649,15 @@ impl<P: Problem> Mind<P> {
             )
         };
         let walked = place.distance(pre);
+        let free_walk = self.free.is_some();
         let (mut next, mut turn) = (pre, 0.0);
+        let mut portal: Letter = 0;
         if !self.world.is_passable_point(pre) {
             match self.world.warp(pre) {
                 Some(w) => {
                     next = w.point;
                     turn = w.turn;
+                    portal = move_letter(w.portal, w.forward);
                 }
                 None => {
                     // Blocked: the move is given up and decided again.
@@ -1523,6 +1708,9 @@ impl<P: Problem> Mind<P> {
             let t = &mut self.thoughts[i];
             t.home_vector.0 += pre.x - place.x;
             t.home_vector.1 += pre.y - place.y;
+            if free_walk && t.activity.is_out() {
+                t.develop(pre.x - place.x, pre.y - place.y);
+            }
             t.rotate_frame(turn);
             t.place = next;
             t.trip_length += walked;
@@ -1545,6 +1733,7 @@ impl<P: Problem> Mind<P> {
                 target.state.clone()
             };
             let free = self.free.is_some();
+            let from_state = self.thoughts[i].state.clone();
             let t = &mut self.thoughts[i];
             t.state = state;
             t.target = None;
@@ -1552,17 +1741,38 @@ impl<P: Problem> Mind<P> {
             t.remember(to_cell);
             if t.retreat {
                 // Back at the state before the dead end: the way it
-                // went is dropped from the route.
+                // went is dropped from the route, and what it
+                // integrated is undone by integrating the rest again.
                 t.retreat = false;
                 t.route.pop();
                 t.places.pop();
+                t.letters.pop();
                 t.no_entry_left = 0.0;
+                if !free && !t.x.is_empty() {
+                    let route = t.route.clone();
+                    let mut x = self.problem.departure(&route[0]);
+                    for w in route.windows(2) {
+                        self.problem.integrate(&w[0], &w[1], &mut x);
+                    }
+                    self.thoughts[i].x = x;
+                }
             } else if t.activity.is_out() {
                 let new_cell =
                     !free || t.places.last().map(|p| p.cell() != to_cell).unwrap_or(true);
                 if new_cell && t.route.len() < 4 * self.cfg.trip_budget.max(1) {
+                    let letter = if free {
+                        portal
+                    } else {
+                        self.problem.letter(&from_state, &t.state).unwrap_or(0)
+                    };
+                    if !free && !t.x.is_empty() {
+                        let mut x = std::mem::take(&mut t.x);
+                        self.problem.integrate(&from_state, &t.state, &mut x);
+                        t.x = x;
+                    }
                     t.route.push(t.state.clone());
                     t.places.push(next);
+                    t.letters.push(letter);
                 }
             }
         }
@@ -2294,7 +2504,7 @@ impl<P: Problem> Mind<P> {
                 grid[c.y as usize][c.x as usize] = ch;
             }
         };
-        for p in &s.glyph {
+        for p in &s.glyph.points {
             mark(&mut grid, *p, '+');
         }
         for p in net.punctures() {

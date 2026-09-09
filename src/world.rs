@@ -563,10 +563,15 @@ pub struct Slope {
 /// Where a point beyond a portal's edge comes out, and the turn made.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Warp {
-    /// The point on the other side.
+    /// Where the point comes out.
     pub point: Point,
-    /// The turn a heading makes, radians.
+    /// How much the body's frame turns in crossing.
     pub turn: f64,
+    /// Which portal was crossed (an index into the config's portals).
+    pub portal: usize,
+    /// Whether the crossing went from the portal's first edge to its
+    /// second.
+    pub forward: bool,
 }
 
 /// How far beyond an edge a point may lie and still come through its
@@ -1246,6 +1251,8 @@ impl World {
                     Warp {
                         point: to.point_inside(along, depth),
                         turn,
+                        portal: i as usize,
+                        forward: which == 0,
                     },
                 ));
             }

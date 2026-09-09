@@ -1,5 +1,6 @@
 //! The path-topological network: a variable pheromone surface whose
-//! channels are learned symbols, each a class of routes.
+//! channels are learned symbols, each a class of routes, and the
+//! holonomy embedding those classes carry.
 //!
 //! The ants' surface has six channels with fixed meanings. Here the
 //! surface grows: a channel is registered for every *kind of route*
@@ -13,24 +14,30 @@
 //! word if and only if one can be deformed into the other without
 //! passing through a puncture: the word is the route's homotopy class,
 //! its *h-signature* (Bhattacharya, Likhachev & Kumar 2012). It is a
-//! label nobody gave: the pattern names itself.
+//! label nobody gave: the pattern names itself. Moves can be letters
+//! too, a portal crossed on a free walk or a relation followed on a
+//! walk of states, and a trip's word may begin with letters of its
+//! own (a query), so that the classes are classes of that query's
+//! routes.
 //!
 //! A word seen on enough successful trips is **registered** as a
 //! symbol: a channel of its own in the symbol field, where the trips of
 //! that class lay their trail; a representative route (its *glyph*); a
 //! weight learned from how the class yields (quality per length,
 //! against the other classes), which the thoughts sense as they sense a
-//! pheromone. The symbols are the units of a network whose wiring is
-//! the topology of the routes: an input (a route) activates the unit
-//! whose class it is (**inference**, [`PathNet::label`]), and a unit
-//! can be driven to produce a route of its class, either by a search
-//! in the space of cells and words ([`PathNet::generate`]) or by
-//! expressing its glyph into its channel and attending to it, so that
-//! the thoughts walk the class again (**generation**,
-//! [`PathNet::express`]). Punctures are learned as well: a hole the
-//! invariant skeleton of the movement history encloses for several
-//! epochs becomes a puncture, and every symbol's word is refined under
-//! the new alphabet.
+//! pheromone; and a **transport**, the mean of the integrated state the
+//! routes of the class arrive with, the class's vector in the holonomy
+//! embedding, with the spread of those states as the curvature signal.
+//! The symbols are the units of a network whose wiring is the topology
+//! of the routes: an input (a route) activates the unit whose class it
+//! is (**inference**, [`PathNet::label`]), and a unit can be driven to
+//! produce a route of its class, either by a search in the space of
+//! places and words ([`PathNet::generate`]) or by expressing its glyph
+//! into its channel and attending to it, so that the thoughts walk the
+//! class again (**generation**, [`PathNet::express`]). Punctures are
+//! learned as well: a hole the walks enclose for several epochs, that
+//! would tell apart routes now of one class, becomes a puncture, and
+//! every symbol's word is refined under the new alphabet.
 
 use ant_simulator::geometry::{Point, Position};
 use ant_simulator::pheromone::perceived;
@@ -38,11 +45,60 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 
-/// A crossing of a ray: the puncture's number from one, negative when
-/// the crossing runs from the ray's right to its left (falling `x`).
+/// A letter of a word: a crossing of a ray (the puncture's number from
+/// one), a move (from [`MOVE_LETTERS`]) or a prefix (from
+/// [`PREFIX_LETTERS`]), negative when inverse (a crossing from the
+/// ray's right to its left, a move walked backwards).
 pub type Letter = i16;
 
-/// A word: the freely reduced sequence of ray crossings of a route.
+/// Letters from here are moves over the surface (a portal crossed),
+/// numbered by the problem; below are ray crossings. A move followed by
+/// its reverse cancels, as a crossing does: the way back through a
+/// portal undoes the way there.
+pub const MOVE_LETTERS: Letter = 1000;
+
+/// Letters from here are links (a relation of a graph followed), which
+/// never cancel: a relation followed and then followed backwards leads
+/// somewhere else (a parent's other child), so the word keeps both.
+pub const LINK_LETTERS: Letter = 10000;
+
+/// Letters from here begin a trip's word (a query).
+pub const PREFIX_LETTERS: Letter = 20000;
+
+/// The letter of a move over the surface, by its number and direction.
+pub fn move_letter(id: usize, forward: bool) -> Letter {
+    let l = MOVE_LETTERS + (id as Letter).min(LINK_LETTERS - MOVE_LETTERS - 1);
+    if forward {
+        l
+    } else {
+        -l
+    }
+}
+
+/// The letter of a link, by its number and direction.
+pub fn link_letter(id: usize, forward: bool) -> Letter {
+    let l = LINK_LETTERS + (id as Letter).min(PREFIX_LETTERS - LINK_LETTERS - 1);
+    if forward {
+        l
+    } else {
+        -l
+    }
+}
+
+/// The number of a link letter, if it is one.
+pub fn link_of(letter: Letter) -> Option<(usize, bool)> {
+    let a = letter.abs();
+    (LINK_LETTERS..PREFIX_LETTERS)
+        .contains(&a)
+        .then(|| ((a - LINK_LETTERS) as usize, letter > 0))
+}
+
+/// The letter a trip's word begins with, by its number.
+pub fn prefix_letter(id: usize) -> Letter {
+    PREFIX_LETTERS + (id as Letter).min(Letter::MAX - PREFIX_LETTERS - 1)
+}
+
+/// A word: the freely reduced sequence of letters of a route.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Word(Vec<Letter>);
 
@@ -61,12 +117,14 @@ impl Word {
         w
     }
 
-    /// Append a letter, cancelling it against an inverse last letter.
+    /// Append a letter, cancelling it against an inverse last letter
+    /// (a link never cancels).
     pub fn push(&mut self, letter: Letter) {
         if letter == 0 {
             return;
         }
-        if self.0.last() == Some(&-letter) {
+        let cancels = letter.abs() < LINK_LETTERS && self.0.last() == Some(&-letter);
+        if cancels {
             self.0.pop();
         } else {
             self.0.push(letter);
@@ -117,30 +175,90 @@ impl Word {
         }
         prev[b.len()]
     }
+
+    /// The word shown with names for its letters where given.
+    pub fn show(&self, name: &dyn Fn(Letter) -> Option<String>) -> String {
+        if self.0.is_empty() {
+            return "1".to_string();
+        }
+        let mut out = String::new();
+        for (i, &l) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            match name(l.abs()) {
+                Some(n) => out.push_str(&n),
+                None => out.push_str(&raw_letter(l.abs())),
+            }
+            if l < 0 {
+                out.push('\'');
+            }
+        }
+        out
+    }
+}
+
+fn raw_letter(l: Letter) -> String {
+    if l >= PREFIX_LETTERS {
+        format!("q{}", l - PREFIX_LETTERS)
+    } else if l >= LINK_LETTERS {
+        format!("r{}", l - LINK_LETTERS)
+    } else if l >= MOVE_LETTERS {
+        format!("m{}", l - MOVE_LETTERS)
+    } else {
+        let n = (l - 1) as u32;
+        if n < 26 {
+            char::from_u32('a' as u32 + n).unwrap_or('?').to_string()
+        } else {
+            format!("p{n}")
+        }
+    }
 }
 
 impl fmt::Display for Word {
-    /// Letters `a`, `b`, `c`… for the punctures, primed when inverse;
-    /// `1` for the empty word.
+    /// Letters `a`, `b`, `c`… for the punctures, `m0`, `m1`… for moves,
+    /// `q0`… for prefixes, primed when inverse; `1` for the empty word.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_empty() {
-            return write!(f, "1");
+        write!(f, "{}", self.show(&|_| None))
+    }
+}
+
+/// A route: its places, and the letter of each move between them (0
+/// where a move is no letter; an empty list where none is).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Route {
+    /// The places, the origin first.
+    pub points: Vec<Point>,
+    /// One letter per move, or none.
+    pub letters: Vec<Letter>,
+}
+
+impl Route {
+    /// A route of places whose moves are no letters.
+    pub fn of(points: Vec<Point>) -> Route {
+        Route {
+            points,
+            letters: Vec::new(),
         }
-        for (i, &l) in self.0.iter().enumerate() {
-            if i > 0 {
-                write!(f, " ")?;
-            }
-            let n = (l.unsigned_abs() - 1) as u32;
-            if n < 26 {
-                write!(f, "{}", char::from_u32('a' as u32 + n).unwrap_or('?'))?;
-            } else {
-                write!(f, "p{n}")?;
-            }
-            if l < 0 {
-                write!(f, "'")?;
-            }
+    }
+
+    /// A route with the letters of its moves.
+    pub fn with_letters(points: Vec<Point>, letters: Vec<Letter>) -> Route {
+        Route { points, letters }
+    }
+
+    /// Length in cells.
+    pub fn length(&self) -> f64 {
+        self.points.windows(2).map(|w| w[0].distance(w[1])).sum()
+    }
+
+    /// The letter of the move to the point at `i` (from 1).
+    pub fn letter(&self, i: usize) -> Letter {
+        if i == 0 {
+            0
+        } else {
+            self.letters.get(i - 1).copied().unwrap_or(0)
         }
-        Ok(())
     }
 }
 
@@ -197,10 +315,24 @@ impl Rays {
         }
     }
 
-    /// The word of a route.
-    pub fn word(&self, route: &[Point]) -> Word {
+    /// The word of a route: its prefix, then for every move the rays it
+    /// crosses and its own letter.
+    pub fn word(&self, route: &Route, prefix: &[Letter]) -> Word {
         let mut w = Word::new();
-        for pair in route.windows(2) {
+        for &l in prefix {
+            w.push(l);
+        }
+        for (i, pair) in route.points.windows(2).enumerate() {
+            self.step(pair[0], pair[1], &mut w);
+            w.push(route.letter(i + 1));
+        }
+        w
+    }
+
+    /// The word of a route of places whose moves are no letters.
+    pub fn word_of(&self, points: &[Point]) -> Word {
+        let mut w = Word::new();
+        for pair in points.windows(2) {
             self.step(pair[0], pair[1], &mut w);
         }
         w
@@ -315,12 +447,12 @@ impl SymbolField {
     }
 
     /// Lay a channel along a route.
-    pub fn stamp(&mut self, k: usize, route: &[Point], per_cell: f64) {
-        for pair in route.windows(2) {
+    pub fn stamp(&mut self, k: usize, points: &[Point], per_cell: f64) {
+        for pair in points.windows(2) {
             self.lay(k, pair[0], pair[1], per_cell);
         }
-        if route.len() == 1 {
-            self.deposit(route[0].cell(), k, per_cell);
+        if points.len() == 1 {
+            self.deposit(points[0].cell(), k, per_cell);
         }
     }
 
@@ -404,16 +536,21 @@ impl SymbolField {
 }
 
 /// A symbol: a class of routes, with its channel, its statistics, its
-/// weight, its glyph and, if someone gave it one, its name.
+/// weight, its transport, its glyph and, if someone gave it one, its
+/// name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Symbol {
     /// The class: the word of its routes.
     pub word: Word,
+    /// The letters the class's routes begin their word with.
+    pub prefix: Vec<Letter>,
     /// Its channel in the symbol field.
     pub channel: usize,
     /// Trips of the class brought home.
     pub support: u32,
-    /// Mean quality of those trips (exponentially weighted).
+    /// Trips of the class given up.
+    pub misses: u32,
+    /// Mean quality of the trips brought home (exponentially weighted).
     pub quality: f64,
     /// Mean length of their routes, in cells (exponentially weighted).
     pub length: f64,
@@ -423,14 +560,21 @@ pub struct Symbol {
     /// The learned weight the thoughts sense the channel with: logits
     /// per unit of perceived level, from the yield against the others.
     pub weight: f64,
+    /// The transport: the mean of what the class's routes integrate
+    /// between departure and arrival, its vector in the holonomy
+    /// embedding (empty where the problem integrates nothing).
+    pub vector: Vec<f64>,
+    /// The spread of those states about the mean (mean squared
+    /// distance): the curvature signal, zero on a flat connection.
+    pub spread: f64,
     /// A representative route: the best brought home.
-    pub glyph: Vec<Point>,
+    pub glyph: Route,
     /// The glyph's quality.
     pub glyph_quality: f64,
     /// The last few routes of the class brought home, which a candidate
     /// puncture is tested against: it is learned only where routes of
     /// one class go round it both ways.
-    pub exemplars: Vec<Vec<Point>>,
+    pub exemplars: Vec<Route>,
     /// A name given after the fact.
     pub name: Option<String>,
     /// Tick registered.
@@ -441,6 +585,18 @@ pub struct Symbol {
     pub alive: bool,
     /// The symbol this one was merged into when the alphabet grew.
     pub merged_into: Option<usize>,
+}
+
+impl Symbol {
+    /// Of the trips of the class, the share brought home.
+    pub fn precision(&self) -> f64 {
+        let n = self.support + self.misses;
+        if n == 0 {
+            0.0
+        } else {
+            self.support as f64 / n as f64
+        }
+    }
 }
 
 /// What the network says of a route.
@@ -528,9 +684,10 @@ impl Default for SymbolConfig {
 #[derive(Clone, Debug)]
 struct Pending {
     count: u32,
-    best: Vec<Point>,
+    best: Route,
     quality: f64,
     length: f64,
+    prefix: Vec<Letter>,
 }
 
 /// The network.
@@ -545,6 +702,7 @@ pub struct PathNet {
     pending: HashMap<Word, Pending>,
     holes: HashMap<(i32, i32), (u32, Point)>,
     attention: Vec<f64>,
+    names: HashMap<Letter, String>,
     mean_yield: f64,
     width: usize,
     height: usize,
@@ -589,6 +747,7 @@ impl PathNet {
             pending: HashMap::new(),
             holes: HashMap::new(),
             attention: Vec::new(),
+            names: HashMap::new(),
             mean_yield: 0.0,
             width,
             height,
@@ -643,9 +802,24 @@ impl PathNet {
         &self.field
     }
 
-    /// The word of a route.
-    pub fn word(&self, route: &[Point]) -> Word {
-        self.rays.word(route)
+    /// Name a letter (a move or a prefix), for showing words.
+    pub fn set_name(&mut self, letter: Letter, name: &str) {
+        self.names.insert(letter.abs(), name.to_string());
+    }
+
+    /// A word shown with the letters' names.
+    pub fn show(&self, word: &Word) -> String {
+        word.show(&|l| self.names.get(&l).cloned())
+    }
+
+    /// The word of a route with a prefix.
+    pub fn word(&self, route: &Route, prefix: &[Letter]) -> Word {
+        self.rays.word(route, prefix)
+    }
+
+    /// The word of a route of places whose moves are no letters.
+    pub fn word_of(&self, points: &[Point]) -> Word {
+        self.rays.word_of(points)
     }
 
     /// The living symbol of a word.
@@ -666,20 +840,29 @@ impl PathNet {
         out
     }
 
-    /// A route brought home with a quality: its class is found or,
-    /// with enough support, registered; the class's statistics, glyph
-    /// and every class's weight are updated. Returns the class.
-    pub fn observe(&mut self, route: &[Point], quality: f64, tick: u64) -> Option<usize> {
+    /// A route brought home with a quality and what it integrated (the
+    /// state it arrived with less the state it set out with): its
+    /// class is found or, with enough support, registered; the class's
+    /// statistics, transport, glyph and every class's weight are
+    /// updated. Returns the class.
+    pub fn observe(
+        &mut self,
+        route: &Route,
+        prefix: &[Letter],
+        x: &[f64],
+        quality: f64,
+        tick: u64,
+    ) -> Option<usize> {
         self.observations += 1;
-        if route.len() < 2 {
+        if route.points.len() < 2 {
             return None;
         }
-        let word = self.rays.word(route);
+        let word = self.rays.word(route, prefix);
         if word.len() > self.cfg.max_word {
             self.dropped += 1;
             return None;
         }
-        let length: f64 = route.windows(2).map(|w| w[0].distance(w[1])).sum();
+        let length = route.length();
         let rate = self.cfg.rate.clamp(0.0, 1.0);
         let k = match self.find(&word) {
             Some(k) => {
@@ -688,11 +871,20 @@ impl PathNet {
                 s.quality += rate * (quality - s.quality);
                 s.length += rate * (length - s.length);
                 s.last_seen = tick;
+                if s.vector.len() == x.len() && !x.is_empty() {
+                    let dist2: f64 = s.vector.iter().zip(x).map(|(m, v)| (v - m) * (v - m)).sum();
+                    s.spread += rate * (dist2 - s.spread);
+                    for (m, v) in s.vector.iter_mut().zip(x) {
+                        *m += rate * (v - *m);
+                    }
+                } else if !x.is_empty() {
+                    s.vector = x.to_vec();
+                    s.spread = 0.0;
+                }
                 let better = quality > s.glyph_quality + 1e-9
-                    || ((quality - s.glyph_quality).abs() <= 1e-9
-                        && length < s.glyph.windows(2).map(|w| w[0].distance(w[1])).sum::<f64>());
+                    || ((quality - s.glyph_quality).abs() <= 1e-9 && length < s.glyph.length());
                 if better {
-                    s.glyph = route.to_vec();
+                    s.glyph = route.clone();
                     s.glyph_quality = quality;
                 }
                 // The exemplars are a uniform sample of the class's routes
@@ -700,7 +892,7 @@ impl PathNet {
                 // is still on record when a puncture is tested.
                 let keep = self.cfg.exemplars.max(1);
                 if s.exemplars.len() < keep {
-                    s.exemplars.push(route.to_vec());
+                    s.exemplars.push(route.clone());
                 } else {
                     self.lcg = self
                         .lcg
@@ -708,7 +900,7 @@ impl PathNet {
                         .wrapping_add(1442695040888963407);
                     let slot = (self.lcg >> 33) as usize % s.support.max(1) as usize;
                     if slot < keep {
-                        s.exemplars[slot] = route.to_vec();
+                        s.exemplars[slot] = route.clone();
                     }
                 }
                 k
@@ -716,13 +908,14 @@ impl PathNet {
             None => {
                 let entry = self.pending.entry(word.clone()).or_insert(Pending {
                     count: 0,
-                    best: route.to_vec(),
+                    best: route.clone(),
                     quality,
                     length,
+                    prefix: prefix.to_vec(),
                 });
                 entry.count += 1;
                 if quality > entry.quality || (quality == entry.quality && length < entry.length) {
-                    entry.best = route.to_vec();
+                    entry.best = route.clone();
                     entry.quality = quality;
                     entry.length = length;
                 }
@@ -730,14 +923,23 @@ impl PathNet {
                     return None;
                 }
                 let pending = self.pending.remove(&word).expect("just seen");
-                self.register(word, pending, tick)?
+                self.register(word, pending, x, tick)?
             }
         };
         self.reweigh();
         Some(k)
     }
 
-    fn register(&mut self, word: Word, pending: Pending, tick: u64) -> Option<usize> {
+    /// A trip of a class given up: counted against the class's
+    /// precision, if the class is registered.
+    pub fn observe_miss(&mut self, route: &Route, prefix: &[Letter]) -> Option<usize> {
+        let word = self.rays.word(route, prefix);
+        let k = self.find(&word)?;
+        self.symbols[k].misses += 1;
+        Some(k)
+    }
+
+    fn register(&mut self, word: Word, pending: Pending, x: &[f64], tick: u64) -> Option<usize> {
         if self.living().len() >= self.cfg.capacity.max(1) && !self.evict(tick) {
             return None;
         }
@@ -749,15 +951,19 @@ impl PathNet {
             None => self.field.add_channel(),
         };
         let deposit = self.cfg.deposit * pending.quality;
-        self.field.stamp(channel, &pending.best, deposit);
+        self.field.stamp(channel, &pending.best.points, deposit);
         self.symbols.push(Symbol {
             word,
+            prefix: pending.prefix,
             channel,
             support: pending.count,
+            misses: 0,
             quality: pending.quality,
             length: pending.length,
             yield_: 0.0,
             weight: 0.0,
+            vector: x.to_vec(),
+            spread: 0.0,
             glyph: pending.best.clone(),
             glyph_quality: pending.quality,
             exemplars: vec![pending.best],
@@ -853,8 +1059,13 @@ impl PathNet {
     }
 
     /// What class a route is.
-    pub fn label(&self, route: &[Point]) -> Label {
-        let word = self.rays.word(route);
+    pub fn label(&self, route: &Route, prefix: &[Letter]) -> Label {
+        let word = self.rays.word(route, prefix);
+        self.label_word(word)
+    }
+
+    /// What class a word is.
+    pub fn label_word(&self, word: Word) -> Label {
         let symbol = self.find(&word);
         let nearest = self
             .living()
@@ -902,7 +1113,7 @@ impl PathNet {
             .enumerate()
             .filter(|(k, a)| **a > 1e-9 && self.symbols[*k].alive)
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
-        let glyph = &self.symbols[k].glyph;
+        let glyph = &self.symbols[k].glyph.points;
         let first = glyph.iter().find(|p| p.distance(glyph[0]) > 0.5)?;
         let (dx, dy) = glyph[0].to(*first);
         Some((k, dy.atan2(dx)))
@@ -915,16 +1126,15 @@ impl PathNet {
     pub fn express(&mut self, k: usize, per_cell: f64) {
         if let Some(s) = self.symbols.get(k) {
             if s.alive {
-                let (channel, glyph) = (s.channel, s.glyph.clone());
+                let (channel, glyph) = (s.channel, s.glyph.points.clone());
                 self.field.stamp(channel, &glyph, per_cell);
             }
         }
     }
 
-    /// A route of a class from one cell to another, or none within the
-    /// longest word: a breadth-first search over cells and the words
-    /// of the way to them, so that the route found is a shortest one
-    /// of that class in steps.
+    /// A route of a class from one cell to another over a grid, or none
+    /// within the longest word: the eight neighbours of a cell are its
+    /// moves (no cutting of corners), and only the rays give letters.
     pub fn generate(
         &self,
         word: &Word,
@@ -932,9 +1142,49 @@ impl PathNet {
         to: Position,
         passable: &dyn Fn(Position) -> bool,
     ) -> Option<Vec<Point>> {
+        let neighbours = |cell: Position| -> Vec<(Position, Letter)> {
+            let mut out = Vec::with_capacity(8);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let next = Position::new(cell.x + dx, cell.y + dy);
+                    if !passable(next) {
+                        continue;
+                    }
+                    if dx != 0
+                        && dy != 0
+                        && !(passable(Position::new(cell.x + dx, cell.y))
+                            && passable(Position::new(cell.x, cell.y + dy)))
+                    {
+                        continue;
+                    }
+                    out.push((next, 0));
+                }
+            }
+            out
+        };
         if !passable(from) || !passable(to) {
             return None;
         }
+        self.generate_with(word, from, to, &neighbours)
+    }
+
+    /// A route of a class from one cell to another, the moves of a cell
+    /// given by `neighbours` with the letter of each (0 for none; a
+    /// portal's letter, say): a breadth-first search over cells and the
+    /// words of the ways to them, so that the route found is a shortest
+    /// one of that class in moves. The rays' letters are added on every
+    /// move between cells of one chart; a move that is a letter itself
+    /// (a jump through a portal) contributes only its own.
+    pub fn generate_with(
+        &self,
+        word: &Word,
+        from: Position,
+        to: Position,
+        neighbours: &dyn Fn(Position) -> Vec<(Position, Letter)>,
+    ) -> Option<Vec<Point>> {
         let max_word = self.cfg.max_word.max(word.len());
         let start = (from, Word::new());
         let mut parent: HashMap<(Position, Word), (Position, Word)> = HashMap::new();
@@ -960,33 +1210,21 @@ impl PathNet {
                 return Some(path);
             }
             let (cell, w) = state;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if dx == 0 && dy == 0 {
-                        continue;
-                    }
-                    let next = Position::new(cell.x + dx, cell.y + dy);
-                    if !passable(next) {
-                        continue;
-                    }
-                    if dx != 0
-                        && dy != 0
-                        && !(passable(Position::new(cell.x + dx, cell.y))
-                            && passable(Position::new(cell.x, cell.y + dy)))
-                    {
-                        continue;
-                    }
-                    let mut nw = w.clone();
+            for (next, letter) in neighbours(cell) {
+                let mut nw = w.clone();
+                if letter == 0 {
                     self.rays
                         .step(Point::center_of(cell), Point::center_of(next), &mut nw);
-                    if nw.len() > max_word {
-                        continue;
-                    }
-                    let key = (next, nw);
-                    if seen.insert(key.clone()) {
-                        parent.insert(key.clone(), (cell, w.clone()));
-                        queue.push_back(key);
-                    }
+                } else {
+                    nw.push(letter);
+                }
+                if nw.len() > max_word {
+                    continue;
+                }
+                let key = (next, nw);
+                if seen.insert(key.clone()) {
+                    parent.insert(key.clone(), (cell, w.clone()));
+                    queue.push_back(key);
                 }
             }
         }
@@ -1106,8 +1344,8 @@ impl PathNet {
             // Exemplars of one word now, by their word with the puncture.
             let mut groups: HashMap<Word, HashMap<Word, usize>> = HashMap::new();
             for route in &s.exemplars {
-                let now = self.rays.word(route);
-                let then = trial.word(route);
+                let now = self.rays.word(route, &s.prefix);
+                let then = trial.word(route, &s.prefix);
                 *groups.entry(now).or_default().entry(then).or_insert(0) += 1;
             }
             if groups
@@ -1129,13 +1367,16 @@ impl PathNet {
             if !self.symbols[k].alive {
                 continue;
             }
-            let word = self.rays.word(&self.symbols[k].glyph);
+            let word = self
+                .rays
+                .word(&self.symbols[k].glyph, &self.symbols[k].prefix);
             match by_word.get(&word) {
                 Some(&into) => {
-                    let (support, quality, length, glyph, glyph_quality, name, channel) = {
+                    let (support, misses, quality, length, glyph, glyph_quality, name, channel) = {
                         let s = &self.symbols[k];
                         (
                             s.support,
+                            s.misses,
                             s.quality,
                             s.length,
                             s.glyph.clone(),
@@ -1151,6 +1392,7 @@ impl PathNet {
                     target.length =
                         (target.length * target.support as f64 + length * support as f64) / total;
                     target.support += support;
+                    target.misses += misses;
                     if glyph_quality > target.glyph_quality {
                         target.glyph = glyph;
                         target.glyph_quality = glyph_quality;
@@ -1187,10 +1429,11 @@ impl PathNet {
                 continue;
             }
             let word = self.symbols[k].word.clone();
+            let prefix = self.symbols[k].prefix.clone();
             let rays = &self.rays;
             self.symbols[k]
                 .exemplars
-                .retain(|route| rays.word(route) == word);
+                .retain(|route| rays.word(route, &prefix) == word);
         }
         self.reweigh();
     }
@@ -1216,19 +1459,31 @@ impl PathNet {
         order.sort_by(|&a, &b| self.symbols[b].support.cmp(&self.symbols[a].support));
         for k in order.into_iter().take(12) {
             let s = &self.symbols[k];
+            let vector = if s.vector.is_empty() {
+                String::new()
+            } else {
+                let norm: f64 = s.vector.iter().map(|v| v * v).sum::<f64>().sqrt();
+                format!(" |vector| {:.2} spread {:.3}", norm, s.spread)
+            };
             let _ = writeln!(
                 out,
-                "    #{k} [{}]{} support {} quality {:.3} length {:.0} yield {:.3} weight {:+.2}{}",
-                s.word,
+                "    #{k} [{}]{} support {}{} quality {:.3} length {:.0} yield {:.3} weight {:+.2}{}{}",
+                self.show(&s.word),
                 s.name
                     .as_ref()
                     .map(|n| format!(" \"{n}\""))
                     .unwrap_or_default(),
                 s.support,
+                if s.misses > 0 {
+                    format!(" (precision {:.2})", s.precision())
+                } else {
+                    String::new()
+                },
                 s.quality,
                 s.length,
                 s.yield_,
                 s.weight,
+                vector,
                 if self.attention[k].abs() > 1e-9 {
                     format!(" attended {:+.1}", self.attention[k])
                 } else {
@@ -1259,26 +1514,48 @@ mod tests {
         assert_eq!(Word::new().to_string(), "1");
         assert_eq!(v.distance(&Word::from_letters(&[1, 2])), 1);
         assert_eq!(v.distance(&v), 0);
+        let m = Word::from_letters(&[
+            prefix_letter(2),
+            move_letter(0, true),
+            move_letter(1, false),
+        ]);
+        assert_eq!(m.to_string(), "q2 m0 m1'");
+        let back = Word::from_letters(&[move_letter(0, true), move_letter(0, false)]);
+        assert!(back.is_empty(), "a move and its reverse cancel");
+        let link = Word::from_letters(&[link_letter(0, true), link_letter(0, false)]);
+        assert_eq!(link.to_string(), "r0 r0'", "a link and its reverse do not");
+        assert_eq!(link_of(link_letter(3, false)), Some((3, false)));
+        assert_eq!(link_of(move_letter(3, true)), None);
+        let names = |l: Letter| match l {
+            l if l == prefix_letter(2) => Some("cousin".to_string()),
+            l if l == move_letter(0, true) => Some("parent".to_string()),
+            _ => None,
+        };
+        assert_eq!(m.show(&names), "cousin parent m1'");
     }
 
     #[test]
     fn a_route_over_a_puncture_crosses_its_ray_and_one_under_does_not() {
         let rays = Rays::new(vec![Point::new(10.5, 10.0)]);
         let over = vec![Point::new(2.5, 4.5), Point::new(18.5, 4.5)];
-        assert_eq!(rays.word(&over).to_string(), "a");
+        assert_eq!(rays.word_of(&over).to_string(), "a");
         let back = vec![Point::new(18.5, 4.5), Point::new(2.5, 4.5)];
-        assert_eq!(rays.word(&back).to_string(), "a'");
+        assert_eq!(rays.word_of(&back).to_string(), "a'");
         let under = vec![Point::new(2.5, 14.5), Point::new(18.5, 14.5)];
-        assert!(rays.word(&under).is_empty());
+        assert!(rays.word_of(&under).is_empty());
         let there_and_back = vec![
             Point::new(2.5, 4.5),
             Point::new(18.5, 4.5),
             Point::new(2.5, 4.5),
         ];
-        assert!(rays.word(&there_and_back).is_empty(), "cancels");
+        assert!(rays.word_of(&there_and_back).is_empty(), "cancels");
         let two = Rays::new(vec![Point::new(5.5, 10.0), Point::new(15.5, 10.0)]);
         let across = vec![Point::new(0.5, 2.5), Point::new(20.5, 2.5)];
-        assert_eq!(two.word(&across).to_string(), "a b");
+        assert_eq!(two.word_of(&across).to_string(), "a b");
+        // Move letters and a prefix join the word in order.
+        let route = Route::with_letters(across.clone(), vec![move_letter(3, true)]);
+        let word = two.word(&route, &[prefix_letter(0)]);
+        assert_eq!(word.to_string(), "q0 a b m3");
     }
 
     #[test]
@@ -1305,35 +1582,45 @@ mod tests {
             ..SymbolConfig::default()
         };
         let mut net = PathNet::new(24, 16, 1.0, vec![Point::new(12.0, 8.0)], cfg);
-        let over = vec![
+        let over = Route::of(vec![
             Point::new(2.5, 2.5),
             Point::new(12.5, 1.5),
             Point::new(21.5, 2.5),
-        ];
-        let under = vec![
+        ]);
+        let under = Route::of(vec![
             Point::new(2.5, 13.5),
             Point::new(12.5, 14.5),
             Point::new(21.5, 13.5),
-        ];
-        assert_eq!(net.observe(&over, 1.0, 1), None, "one trip is not a class");
-        assert_eq!(net.observe(&over, 1.0, 2), Some(0));
-        assert_eq!(net.observe(&under, 1.0, 3), None);
-        assert_eq!(net.observe(&under, 1.0, 4), Some(1));
+        ]);
+        assert_eq!(
+            net.observe(&over, &[], &[], 1.0, 1),
+            None,
+            "one trip is not a class"
+        );
+        assert_eq!(net.observe(&over, &[], &[], 1.0, 2), Some(0));
+        assert_eq!(net.observe(&under, &[], &[], 1.0, 3), None);
+        assert_eq!(net.observe(&under, &[], &[], 1.0, 4), Some(1));
         assert_eq!(net.symbols()[0].word.to_string(), "a");
         assert!(net.symbols()[1].word.is_empty());
         net.name(0, "over");
-        let label = net.label(&[Point::new(1.5, 3.5), Point::new(22.5, 3.5)]);
+        let label = net.label(
+            &Route::of(vec![Point::new(1.5, 3.5), Point::new(22.5, 3.5)]),
+            &[],
+        );
         assert_eq!(label.symbol, Some(0));
         assert_eq!(label.name.as_deref(), Some("over"));
-        let label = net.label(&[Point::new(1.5, 12.5), Point::new(22.5, 12.5)]);
+        let label = net.label(
+            &Route::of(vec![Point::new(1.5, 12.5), Point::new(22.5, 12.5)]),
+            &[],
+        );
         assert_eq!(label.symbol, Some(1));
-        // The over class is the shorter one here: it weighs more.
         assert!(net.symbols()[0].weight >= net.symbols()[1].weight);
         assert!(
             net.field().total(net.symbols()[0].channel) > 0.0,
             "the glyph is laid"
         );
-        // Generation: a route of each class, checked by its word.
+        assert_eq!(net.observe_miss(&over, &[]), Some(0));
+        assert!((net.symbols()[0].precision() - 2.0 / 3.0).abs() < 1e-9);
         let passable = |p: Position| {
             p.x >= 0 && p.y >= 0 && p.x < 24 && p.y < 16 && !(p.x == 12 && (5..=10).contains(&p.y))
         };
@@ -1342,14 +1629,91 @@ mod tests {
         let a = net
             .generate(&Word::from_letters(&[1]), from, to, &passable)
             .expect("a route over");
-        assert_eq!(net.word(&a).to_string(), "a");
+        assert_eq!(net.word_of(&a).to_string(), "a");
         assert!(a.iter().all(|p| passable(p.cell())));
         let b = net
             .generate(&Word::new(), from, to, &passable)
             .expect("a route under");
-        assert!(net.word(&b).is_empty());
+        assert!(net.word_of(&b).is_empty());
         assert_eq!(a[0].cell(), from);
         assert_eq!(b.last().unwrap().cell(), to);
+    }
+
+    #[test]
+    fn transports_are_the_mean_state_of_a_class_and_their_spread_its_curvature() {
+        let cfg = SymbolConfig {
+            support: 1,
+            rate: 0.5,
+            ..SymbolConfig::default()
+        };
+        let mut net = PathNet::new(16, 16, 1.0, Vec::new(), cfg);
+        let route = Route::with_letters(
+            vec![Point::new(2.5, 2.5), Point::new(8.5, 2.5)],
+            vec![move_letter(0, true)],
+        );
+        assert_eq!(net.observe(&route, &[], &[1.0, 0.0], 1.0, 1), Some(0));
+        assert_eq!(net.symbols()[0].vector, vec![1.0, 0.0]);
+        net.observe(&route, &[], &[3.0, 0.0], 1.0, 2);
+        let s = &net.symbols()[0];
+        assert!((s.vector[0] - 2.0).abs() < 1e-9, "{:?}", s.vector);
+        assert!(s.spread > 0.0, "a class arriving in two places has spread");
+        assert_eq!(s.word.to_string(), "m0");
+    }
+
+    #[test]
+    fn generation_follows_letters_of_moves_such_as_portals() {
+        // A strip of 12 cells whose right end joins its left end (a
+        // tube): jumping across is the letter of move 0.
+        let cfg = SymbolConfig {
+            max_word: 4,
+            ..SymbolConfig::default()
+        };
+        let net = PathNet::new(12, 3, 1.0, Vec::new(), cfg);
+        let neighbours = |c: Position| -> Vec<(Position, Letter)> {
+            let mut out = Vec::new();
+            if c.x > 0 {
+                out.push((Position::new(c.x - 1, c.y), 0));
+            } else {
+                out.push((Position::new(11, c.y), move_letter(0, false)));
+            }
+            if c.x < 11 {
+                out.push((Position::new(c.x + 1, c.y), 0));
+            } else {
+                out.push((Position::new(0, c.y), move_letter(0, true)));
+            }
+            out
+        };
+        let from = Position::new(2, 1);
+        let once = net
+            .generate_with(
+                &Word::from_letters(&[move_letter(0, true)]),
+                from,
+                from,
+                &neighbours,
+            )
+            .expect("once round");
+        assert_eq!(once.len(), 13, "twelve moves round the tube");
+        let twice = net
+            .generate_with(
+                &Word::from_letters(&[move_letter(0, true), move_letter(0, true)]),
+                from,
+                from,
+                &neighbours,
+            )
+            .expect("twice round");
+        assert_eq!(twice.len(), 25);
+        let back = net
+            .generate_with(
+                &Word::from_letters(&[move_letter(0, false)]),
+                from,
+                from,
+                &neighbours,
+            )
+            .expect("once round the other way");
+        assert_eq!(back.len(), 13);
+        assert!(net
+            .generate_with(&Word::new(), from, Position::new(5, 1), &neighbours)
+            .is_some());
     }
 
     #[test]
@@ -1361,19 +1725,18 @@ mod tests {
             ..SymbolConfig::default()
         };
         let mut net = PathNet::new(16, 16, 1.0, Vec::new(), cfg);
-        let over = vec![Point::new(2.5, 2.5), Point::new(13.5, 2.5)];
-        let under = vec![Point::new(2.5, 12.5), Point::new(13.5, 12.5)];
-        assert_eq!(net.observe(&over, 1.0, 1), Some(0));
+        let over = Route::of(vec![Point::new(2.5, 2.5), Point::new(13.5, 2.5)]);
+        let under = Route::of(vec![Point::new(2.5, 12.5), Point::new(13.5, 12.5)]);
+        assert_eq!(net.observe(&over, &[], &[], 1.0, 1), Some(0));
         assert_eq!(
-            net.observe(&under, 1.0, 2),
+            net.observe(&under, &[], &[], 1.0, 2),
             Some(0),
             "the same empty word: one class"
         );
-        assert_eq!(net.observe(&over, 1.0, 3), Some(0));
-        assert_eq!(net.observe(&under, 1.0, 4), Some(0));
+        assert_eq!(net.observe(&over, &[], &[], 1.0, 3), Some(0));
+        assert_eq!(net.observe(&under, &[], &[], 1.0, 4), Some(0));
         assert_eq!(net.symbols()[0].support, 4);
         assert_eq!(net.symbols()[0].exemplars.len(), 4);
-        // A skeleton: a ring of channel cells round the middle.
         let mut channel = vec![false; 256];
         for x in 4..=11 {
             channel[3 * 16 + x] = true;
@@ -1390,12 +1753,9 @@ mod tests {
             (p.x - 8.25).abs() < 1.0 && (p.y - 7.25).abs() < 1.0,
             "the hole's middle: {p:?}"
         );
-        // Now the two routes differ: the glyph (over) keeps the class,
-        // and a route under is a new word.
         assert_eq!(net.symbols()[0].word.to_string(), "a");
-        assert!(net.word(&under).is_empty());
-        assert_eq!(net.observe(&under, 1.0, 5), Some(1));
-        // A hole all the routes pass the same side of teaches nothing.
+        assert!(net.word(&under, &[]).is_empty());
+        assert_eq!(net.observe(&under, &[], &[], 1.0, 5), Some(1));
         let mut aside = vec![false; 256];
         for x in 1..=3 {
             aside[6 * 16 + x] = true;

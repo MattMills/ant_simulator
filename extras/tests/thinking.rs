@@ -333,7 +333,7 @@ fn the_classes_of_routes_round_a_wall_register_themselves_and_are_named_inferred
         su.weight
     );
     assert!(so.support >= 3 && su.support >= 3);
-    assert!(!so.glyph.is_empty() && net.field().total(so.channel) > 0.0);
+    assert!(!so.glyph.points.is_empty() && net.field().total(so.channel) > 0.0);
     let (over_word, under_word) = (so.word.clone(), su.word.clone());
 
     // Names after the fact, and inference on routes nobody walked.
@@ -460,11 +460,11 @@ fn tours_fall_into_classes_by_how_they_wind_round_the_cities() {
     // finding's route is of a registered class.
     for &k in &living {
         let s = &net.symbols()[k];
-        assert_eq!(net.word(&s.glyph), s.word);
+        assert_eq!(net.word(&s.glyph, &s.prefix), s.word);
         assert!(s.support >= 3);
     }
     let best = mind.best().unwrap();
-    let label = net.label(&best.places);
+    let label = mind.label(&best.places).unwrap();
     assert!(label.symbol.is_some(), "{label:?}");
     // The classes are weighed by their yield: the best-yielding class
     // has the largest weight.
@@ -480,4 +480,250 @@ fn tours_fall_into_classes_by_how_they_wind_round_the_cities() {
     assert!(living
         .iter()
         .all(|&k| net.symbols()[k].weight <= net.symbols()[*top].weight + 1e-9));
+}
+
+// ---------------------------------------------------------------------
+// The holonomy embedding
+
+use ant_extras::topos::{move_letter, Route};
+use ant_simulator::world::{Edge, Rect, Side};
+
+/// A cylinder: a region whose north edge joins its south edge.
+fn cylinder(width: usize, height: usize) -> Frame {
+    let mut frame = Frame::new(width, height, 1.0);
+    let rect = Rect::new(
+        Position::new(1, 1),
+        Position::new(width as i32 - 2, height as i32 - 2),
+    );
+    frame.region(
+        "ring",
+        rect,
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    );
+    frame.portal(
+        Edge {
+            start: Position::new(1, 1),
+            end: Position::new(width as i32 - 2, 1),
+            side: Side::North,
+        },
+        Edge {
+            start: Position::new(1, height as i32 - 2),
+            end: Position::new(width as i32 - 2, height as i32 - 2),
+            side: Side::South,
+        },
+    );
+    frame
+}
+
+#[test]
+fn windings_round_a_cylinder_are_classes_with_transports_of_a_circumference() {
+    // The ring is 16 cells tall between its joined edges; the goal is
+    // four cells south of the start, so the short way is four cells
+    // and the way round through the fold is twelve.
+    let frame = cylinder(14, 18);
+    let start = Position::new(6, 3);
+    let goal = Position::new(6, 7);
+    let problem = Maze::on_frame(&frame, start, goal);
+    struct Developing(Maze);
+    impl Problem for Developing {
+        type State = Position;
+        fn embedding(&self) -> ant_simulator::world::WorldConfig {
+            self.0.embedding()
+        }
+        fn origin(&self) -> Position {
+            self.0.origin()
+        }
+        fn place(&self, s: &Position) -> Point {
+            self.0.place(s)
+        }
+        fn moves(&self, s: &Position) -> Moves<Position> {
+            self.0.moves(s)
+        }
+        fn quality(&self, s: &Position) -> Option<f64> {
+            self.0.quality(s)
+        }
+        fn locate(&self, p: Point) -> Option<Position> {
+            self.0.locate(p)
+        }
+        fn describe(&self, s: &Position) -> String {
+            self.0.describe(s)
+        }
+        fn name(&self) -> String {
+            "cylinder".to_string()
+        }
+        fn capacity(&self) -> usize {
+            2
+        }
+    }
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 120,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig {
+        learn_punctures: false,
+        ..SymbolConfig::default()
+    });
+    let mut mind = Mind::new(Developing(problem), cfg);
+    mind.run(3000);
+    let net = mind.net().expect("a network");
+    let living = net.living();
+    assert!(!living.is_empty(), "{}", net.report());
+    // The direct class crosses nothing and develops four cells south;
+    // a class round the fold carries the portal's letter and develops
+    // a circumference less: its transport is twelve cells north.
+    let direct = net.find(&Word::new()).expect("the direct class");
+    let d = &net.symbols()[direct];
+    assert_eq!(d.vector.len(), 2);
+    assert!(
+        (d.vector[1] - 4.0).abs() < 1.5,
+        "direct transport {:?}",
+        d.vector
+    );
+    assert!(d.vector[0].abs() < 1.5, "direct transport {:?}", d.vector);
+    // Express the way round, if the colony found it, or generate it.
+    let round = net
+        .find(&Word::from_letters(&[move_letter(0, true)]))
+        .or_else(|| net.find(&Word::from_letters(&[move_letter(0, false)])));
+    if let Some(k) = round {
+        let s = &net.symbols()[k];
+        assert!(
+            (s.vector[1] + 12.0).abs() < 2.0,
+            "a winding develops a circumference: {:?}",
+            s.vector
+        );
+        assert!(s.spread < 4.0, "a flat fold: spread {}", s.spread);
+    }
+    // Generation through the fold: once round, and twice.
+    let once = mind
+        .generate(&Word::from_letters(&[move_letter(0, true)]), goal)
+        .expect("a route once round");
+    let label = mind.label_route(&Route::of(once.clone()), &[]).unwrap();
+    assert!(
+        label.word.is_empty(),
+        "the rays see no crossing on a cylinder"
+    );
+    assert!(
+        once.len() >= 12,
+        "round the fold is the long way: {} points",
+        once.len()
+    );
+    let twice = mind
+        .generate(
+            &Word::from_letters(&[move_letter(0, true), move_letter(0, true)]),
+            goal,
+        )
+        .expect("a route twice round");
+    assert!(twice.len() > once.len() + 12);
+    let none = mind.generate(&Word::new(), goal).expect("the direct route");
+    assert!(
+        none.len() <= 6,
+        "the direct route is four moves: {}",
+        none.len()
+    );
+}
+
+#[test]
+fn walking_queries_learns_rules_transports_and_a_geometry_that_predicts() {
+    use ant_extras::problems::{Node, Relations};
+    use ant_extras::sense::F_SITE;
+    use ant_extras::topos::{link_letter, prefix_letter};
+    const PARENT: u16 = 0;
+    const SIBLING: u16 = 1;
+    const GRANDPARENT: u16 = 3;
+    let (problem, tests) = Relations::family(8, 64, 48, 12, 0.3, 3);
+    assert!(problem.entities() > 50 && tests.len() > 10);
+    let before = problem.evaluate(&tests, None);
+    let cfg = MindConfig {
+        thoughts: 48,
+        speed: 16.0,
+        trip_budget: 12,
+        rest_ticks: 1,
+        odour_release: 0.0,
+        recruitment: 4.0,
+        site_fidelity: false,
+        history: None,
+        ..MindConfig::default()
+    }
+    .with_weight(F_HEADING, 0.0)
+    .with_weight(F_ODOUR, 8.0)
+    .with_weight(F_ROUTE, 0.0)
+    .with_weight(F_SITE, 0.0)
+    .with_symbols(SymbolConfig {
+        support: 3,
+        capacity: 128,
+        max_word: 5,
+        learn_punctures: false,
+        ..SymbolConfig::default()
+    });
+    let mut mind = Mind::new(problem, cfg);
+    mind.run(4000);
+    let net = mind.net().expect("a network");
+    let problem = mind.problem();
+    assert!(mind.stats().deliveries > 100, "{}", mind.report());
+    assert!(problem.updates > 100, "the geometry learned");
+    // The planted grandparent rule is a registered class whose
+    // transport is exact: two parent vectors, with no spread.
+    let word = Word::from_letters(&[
+        prefix_letter(GRANDPARENT as usize),
+        link_letter(PARENT as usize, true),
+        link_letter(PARENT as usize, true),
+    ]);
+    let k = net
+        .find(&word)
+        .unwrap_or_else(|| panic!("grandparent: parent parent\n{}", net.report()));
+    let s = &net.symbols()[k];
+    assert!(s.support >= 3);
+    let twice: Vec<f64> = problem
+        .relation_vector(PARENT)
+        .iter()
+        .map(|v| 2.0 * v)
+        .collect();
+    let err: f64 = s
+        .vector
+        .iter()
+        .zip(&twice)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        err < 0.5,
+        "transport {:?} vs twice parent {:?}",
+        s.vector,
+        twice
+    );
+    assert!(s.spread < 0.5, "a flat connection: spread {}", s.spread);
+    assert_eq!(net.show(&s.word), "grandparent: parent parent");
+    // Prediction of the held-out facts improves greatly on chance.
+    let after = problem.evaluate(&tests, Some(net));
+    assert!(
+        after.mrr > 5.0 * before.mrr.max(0.02),
+        "before {before}after {after}"
+    );
+    assert!(after.hits10 > 0.5, "{after}");
+    // The sibling rule closes: parent then parent backwards.
+    let sibling = problem.closure(SIBLING, &[(PARENT, true), (PARENT, false)]);
+    assert!(sibling < 0.8, "sibling closes to {sibling}");
+    // Generation over states: a route of the grandparent rule from a
+    // held-out grandparent's head reaches the held-out grandparent.
+    let t = tests
+        .iter()
+        .find(|t| t.relation == GRANDPARENT)
+        .expect("a held-out grandparent");
+    let from = Node {
+        at: t.head,
+        head: t.head,
+        query: GRANDPARENT,
+        hops: 0,
+        last: None,
+        prev: u32::MAX,
+    };
+    let tail = t.tail;
+    let path = mind
+        .generate_states(&word, from, &|n| n.hops >= 2 && n.at == tail, 3)
+        .expect("a route of the rule to the held-out fact");
+    assert_eq!(path.len(), 3);
+    assert_eq!(path.last().unwrap().at, tail);
 }
