@@ -186,6 +186,8 @@ sign's meaning by where the thoughts that heard it went.
 * **The floor is one and global.** Every returning thought dances at
   the same nest and every departing follower hears everything; there
   is no locality of listening, no dialect, no drift between groups.
+  The echo (`docs/echo.md`) is a first answer to the reach of the
+  floor, not to its unity: a sign walked is heard along the way.
 * **The decoding is shared memory.** A bee's dance carries a vector;
   our sign carries a class, and the recruit decodes it through the
   network's glyph and channel. The lexicon is public only because the

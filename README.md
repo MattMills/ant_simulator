@@ -970,9 +970,13 @@ a sign means where its trips end, synonyms are signs that lead to the
 same place, and a sign is understood as far as those who heard it get
 there; on a maze with a rich source and a poor one the sign tells all
 there is about the outcome, every recruit is understood, and the colony
-that talks brings home 46 % more (`extras/docs/lexicon.md`). What the
-exploration found, and where the ants' way stops, is in the crate's
-README.
+that talks brings home 46 % more (`extras/docs/lexicon.md`). And the
+signs are persisted in walk form: echoes hold a sign for an epoch and
+walk its glyph again and again, for the others to hear on the way, so
+that the route enters the colony's invariant geometry early, the glyph
+is refined by the walks, and thoughts born into the colony are
+imprinted from the ground (`extras/docs/echo.md`). What the exploration
+found, and where the ants' way stops, is in the crate's README.
 
 ```text
 cargo run --release -p ant_extras --example think
@@ -980,6 +984,7 @@ cargo run --release -p ant_extras --example symbols
 cargo run --release -p ant_extras --example relations
 cargo run --release -p ant_extras --example bridge
 cargo run --release -p ant_extras --example lexicon
+cargo run --release -p ant_extras --example echo
 cargo test --release -p ant_extras
 ```
 

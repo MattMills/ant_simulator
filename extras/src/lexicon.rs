@@ -193,6 +193,13 @@ impl Lexicon {
         }
     }
 
+    /// Silence: every dance stops (the floor is cleared).
+    pub fn silence(&mut self) {
+        for s in self.signs.iter_mut() {
+            s.dance = 0.0;
+        }
+    }
+
     /// A thought home with a solution dances its sign.
     pub fn dance(&mut self, k: usize, quality: f64) {
         self.ensure(k + 1);

@@ -127,6 +127,16 @@ pub struct Thought<S> {
     /// The sign the thought set out with in mind (see
     /// [`crate::lexicon`]).
     pub intent: Option<usize>,
+    /// Whether the thought is an echo (see [`crate::echo`]).
+    pub echo: bool,
+    /// The sign an echo holds across its trips.
+    pub held: Option<usize>,
+    /// Tick the held sign was taken up.
+    pub held_since: u64,
+    /// Walks of the held sign that found nothing at the glyph's end.
+    pub empty_walks: u32,
+    /// Whether the intent was taken from an echo met on the way.
+    pub heard: bool,
     /// Where the trip's solution was found.
     pub finding: Option<Position>,
     /// The letters of the moves of the trip out, one per move after
@@ -201,6 +211,11 @@ impl<S: Clone> Thought<S> {
             avoid: None,
             symbol: None,
             intent: None,
+            echo: false,
+            held: None,
+            held_since: 0,
+            empty_walks: 0,
+            heard: false,
             finding: None,
             letters: Vec::new(),
             prefix: Vec::new(),
@@ -318,6 +333,11 @@ impl<S: Clone> Thought<S> {
         unit(self.place.to(next))
     }
 
+    /// Whether the plan has been walked to its end.
+    pub fn plan_done(&self) -> bool {
+        !self.plan.is_empty() && self.plan_index >= self.plan.len()
+    }
+
     /// How far the thought stands from the plan's next point.
     pub fn plan_distance(&self) -> Option<f64> {
         let next = *self.plan.get(self.plan_index)?;
@@ -362,6 +382,7 @@ impl<S: Clone> Thought<S> {
         self.avoid = None;
         self.symbol = None;
         self.intent = None;
+        self.heard = false;
         self.finding = None;
         self.letters.clear();
         self.prefix.clear();

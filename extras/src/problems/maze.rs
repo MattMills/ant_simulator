@@ -51,6 +51,13 @@ impl Maze {
         }
     }
 
+    /// Change the goals (the world outside the thoughts changes).
+    pub fn set_goals(&mut self, goals: Vec<(Position, f64)>) {
+        if !goals.is_empty() {
+            self.goals = goals;
+        }
+    }
+
     /// Several goals, each with its quality (the first is the goal
     /// [`goal`](Self::goal) names).
     pub fn with_goals(mut self, goals: Vec<(Position, f64)>) -> Maze {

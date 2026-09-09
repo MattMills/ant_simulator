@@ -35,6 +35,7 @@
 //! | [`problems::Relations`] | path integration | the holonomy embedding: thoughts integrate a D-dimensional state through the relations they follow, the words of their trips are rules, and the geometry learns to close along them |
 //! | [`bridge`] | the outbound walk and the trail laid home | the forward and backward filters solved explicitly on the grain: the predicted corridor, the surprise of the flows against it, the drift of the conditioned walk |
 //! | [`lexicon`] | recruitment at the nest, the honeybee's dance floor | signs: the classes danced by the thoughts that come home, drawn by those setting out, meaning where they lead, understood as far as the listeners get there |
+//! | [`echo`] | tandem running | signs persisted in walk form: followers that hold a sign for an epoch and walk its glyph again and again, for the others to hear on the way, the route to enter the invariant skeleton, and the glyph to be refined |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -118,6 +119,18 @@
 //! between sign and outcome, the entropy of the floor, each sign's
 //! agreement, and what talking is worth (`extras/docs/lexicon.md`).
 //!
+//! ## The echo
+//!
+//! The floor speaks fast and at the nest; an [`echo`] speaks the same
+//! language at a slower epoch and along the route. It holds a sign,
+//! walks its glyph out and back again and again, lays the sign's
+//! channel both ways, and is heard by the thoughts it meets on the way,
+//! who take the sign from where they met it. The walks put the route
+//! into the movement history's invariant skeleton an epoch before the
+//! foragers do, refine the glyph, and re-seed the floor whenever the
+//! source is still there; they do not lengthen the memory, which lives
+//! in the ground already (`extras/docs/echo.md`).
+//!
 //! ## Where the ants' way stops
 //!
 //! Habits and foresight belong to the walk between decisions, so they
@@ -131,6 +144,7 @@
 //! practice module is how a surface is tuned to one.
 
 pub mod bridge;
+pub mod echo;
 pub mod lexicon;
 pub mod mind;
 pub mod practice;
@@ -143,6 +157,7 @@ pub mod topos;
 /// Everything commonly needed.
 pub mod prelude {
     pub use crate::bridge::{Bridge, BridgeConfig};
+    pub use crate::echo::{Echo, EchoConfig};
     pub use crate::lexicon::{Lexicon, LexiconConfig, Sign};
     pub use crate::mind::{Choice, Finding, Geometry, Mind, MindConfig, MindStats, QueenPolicy};
     pub use crate::practice::{Practice, PracticeConfig, PracticeReport, Targets, Turn};

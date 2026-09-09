@@ -1042,3 +1042,174 @@ fn a_lexicon_raises_the_yield_by_recruiting_to_the_rich_source() {
         "quality brought home with a lexicon {qt:.0} against without {qs:.0}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The echo
+
+use ant_extras::echo::EchoConfig;
+
+/// A talking mind on the two-source maze, with or without echoes, and
+/// a floor listened to with the given chance.
+fn talking(echoes: usize, listen: f64) -> MindConfig {
+    let mut cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default())
+    .with_lexicon(LexiconConfig {
+        listen,
+        ..LexiconConfig::default()
+    });
+    if echoes > 0 {
+        cfg = cfg.with_echo(EchoConfig {
+            echoes,
+            ..EchoConfig::default()
+        });
+    }
+    cfg
+}
+
+/// The living signs that mean the rich source.
+fn rich_signs(mind: &Mind<Maze>, rich: Position) -> Vec<usize> {
+    let (net, lex) = (mind.net().unwrap(), mind.lexicon().unwrap());
+    let block = lex.block_of(rich);
+    net.living()
+        .into_iter()
+        .filter(|&k| {
+            lex.meaning(k)
+                .first()
+                .map(|(b, _)| *b == block)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// The shortest glyph among the rich source's signs, and the share of
+/// its cells that lie in the movement history's invariant skeleton.
+fn rich_glyph(mind: &Mind<Maze>, rich: Position) -> Option<(f64, f64)> {
+    let net = mind.net().unwrap();
+    let (k, length) = rich_signs(mind, rich)
+        .into_iter()
+        .map(|k| (k, net.symbols()[k].glyph.length()))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
+    let mask = mind.history()?.channel_mask();
+    let w = mind.problem().config().width;
+    let mut cells: Vec<Position> = net.symbols()[k]
+        .glyph
+        .points
+        .iter()
+        .map(|p| p.cell())
+        .collect();
+    cells.dedup();
+    let inside = cells
+        .iter()
+        .filter(|c| {
+            mask.get(c.y as usize * w + c.x as usize)
+                .copied()
+                .unwrap_or(false)
+        })
+        .count();
+    Some((length, inside as f64 / cells.len().max(1) as f64))
+}
+
+#[test]
+fn echoes_carry_the_sign_where_the_floor_does_not_reach() {
+    // A floor few listen to: the sign has to travel some other way.
+    let problem = two_sources();
+    let mut quiet = Mind::new(problem.clone(), talking(0, 0.1));
+    let mut echoing = Mind::new(problem, talking(4, 0.1));
+    quiet.run(4000);
+    echoing.run(4000);
+    let (q0, q1) = (quiet.stats().quality_sum, echoing.stats().quality_sum);
+    assert!(
+        q1 > 1.15 * q0,
+        "quality with echoes {q1:.0} against {q0:.0} without, on a floor few listen to"
+    );
+    let e = echoing.echo().expect("echoes");
+    assert!(e.walks > 100, "walks: {}", e.walks);
+    assert!(e.heard > 200, "heard on the way: {}", e.heard);
+    assert!(
+        e.heard_success_rate() > 0.8,
+        "understood on the way: {:.2}",
+        e.heard_success_rate()
+    );
+    assert!(
+        e.verified > e.empty,
+        "the echoes' walks found the source {} times and nothing {} times",
+        e.verified,
+        e.empty
+    );
+}
+
+#[test]
+fn echo_traffic_makes_the_route_invariant_early_and_refines_the_glyph() {
+    let problem = two_sources();
+    let rich = problem.goal();
+    let mut plain = Mind::new(problem.clone(), talking(0, 0.7));
+    let mut echoing = Mind::new(problem, talking(4, 0.7));
+    plain.run(1000);
+    echoing.run(1000);
+    let (_, c0) = rich_glyph(&plain, rich).expect("a rich sign without echoes");
+    let (_, c1) = rich_glyph(&echoing, rich).expect("a rich sign with echoes");
+    assert!(
+        c1 >= 0.4 && c1 > c0 + 0.2,
+        "of the rich source's glyph, {:.0}% lies in the invariant skeleton at tick 1000 with echoes against {:.0}% without",
+        100.0 * c1,
+        100.0 * c0
+    );
+    plain.run(5000);
+    echoing.run(5000);
+    let (g0, _) = rich_glyph(&plain, rich).unwrap();
+    let (g1, _) = rich_glyph(&echoing, rich).unwrap();
+    assert!(
+        g1 <= g0 + 1e-9,
+        "the glyph walked again and again is no longer: {g1:.0} against {g0:.0}"
+    );
+    let e = echoing.echo().unwrap();
+    assert!(e.refined > 0, "walks that refined a glyph: {}", e.refined);
+    // Four thoughts of thirty-two echoing cost the colony nothing.
+    let (q0, q1) = (plain.stats().quality_sum, echoing.stats().quality_sum);
+    assert!(
+        q1 > 0.95 * q0,
+        "quality with echoes {q1:.0} against {q0:.0} without"
+    );
+}
+
+#[test]
+fn new_thoughts_are_imprinted_from_the_ground() {
+    let problem = two_sources();
+    let rich = problem.goal();
+    let mut mind = Mind::new(problem, talking(4, 0.7));
+    mind.run(2500);
+    // Every thought but the echoes forgets what it knew, and the floor
+    // falls silent: what the colony knows is in the ground and in the
+    // echoes' walks.
+    mind.lexicon_mut().unwrap().silence();
+    let renewed = mind.renew(1.0);
+    assert!(renewed >= 27, "renewed: {renewed}");
+    let q0 = mind.stats().quality_sum;
+    mind.run(200);
+    let first = mind.stats().quality_sum - q0;
+    assert!(
+        first > 25.0,
+        "the first window after the renewal brought home {first:.0}"
+    );
+    mind.run(1400);
+    let lex = mind.lexicon().unwrap();
+    let dance: f64 = rich_signs(&mind, rich)
+        .iter()
+        .map(|&k| lex.sign(k).unwrap().dance)
+        .sum();
+    assert!(
+        dance > 50.0,
+        "the floor re-seeded from memory: rich dance {dance:.1}"
+    );
+    let e = mind.echo().unwrap();
+    assert!(e.heard > 100, "heard on the way: {}", e.heard);
+    assert!(
+        e.verified > 50,
+        "walks that found the source: {}",
+        e.verified
+    );
+}

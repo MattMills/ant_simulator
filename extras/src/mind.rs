@@ -37,6 +37,7 @@
 //! rest, and go out again with site fidelity and a route memory.
 
 use crate::bridge::{Bridge, BridgeConfig};
+use crate::echo::{Echo, EchoConfig};
 use crate::lexicon::{Lexicon, LexiconConfig};
 use crate::problem::{Moves, Problem};
 use crate::sense::{clear_ahead, features, Body, Candidate, Senses, Sight};
@@ -218,6 +219,9 @@ pub struct MindConfig {
     /// The lexicon: the symbols in use between the thoughts (see
     /// [`crate::lexicon`]); needs the symbols.
     pub lexicon: Option<LexiconConfig>,
+    /// The echoes: followers that hold a sign for an epoch and walk its
+    /// glyph again and again (see [`crate::echo`]); needs the lexicon.
+    pub echo: Option<EchoConfig>,
     /// Kinetics of the medium's channels.
     pub pheromones: PheromoneSet,
     /// Seconds per tick.
@@ -260,6 +264,7 @@ impl Default for MindConfig {
             symbols: None,
             bridge: None,
             lexicon: None,
+            echo: None,
             pheromones: MindConfig::pheromones(),
             tick_s: 1.0,
             ledger: true,
@@ -363,6 +368,14 @@ impl MindConfig {
     /// with a sign in mind, and the signs mean where they lead.
     pub fn with_lexicon(mut self, lexicon: LexiconConfig) -> MindConfig {
         self.lexicon = Some(lexicon);
+        self
+    }
+
+    /// A mind with echoes: followers that hold a sign for an epoch and
+    /// walk its glyph again and again, for the others to hear on the
+    /// way (needs the lexicon and the symbols).
+    pub fn with_echo(mut self, echo: EchoConfig) -> MindConfig {
+        self.echo = Some(echo);
         self
     }
 
@@ -495,6 +508,7 @@ pub struct Mind<P: Problem> {
     hierarchy: Hierarchy,
     policies: Vec<EffectivePolicy>,
     castes: Vec<NodeId>,
+    echo: Option<Echo>,
     thoughts: Vec<Thought<P::State>>,
     origin: P::State,
     origin_place: Point,
@@ -612,6 +626,17 @@ impl<P: Problem> Mind<P> {
             (Some(_), Some(c)) => Some(Lexicon::new(w, h, tick_s, c.clone())),
             _ => None,
         };
+        let echo = match (&lexicon, &cfg.echo) {
+            (Some(_), Some(c)) => {
+                for t in thoughts.iter_mut().rev().take(c.echoes) {
+                    if t.caste != 0 {
+                        t.echo = true;
+                    }
+                }
+                Some(Echo::new(c.clone()))
+            }
+            _ => None,
+        };
 
         Mind {
             problem,
@@ -620,6 +645,7 @@ impl<P: Problem> Mind<P> {
             hierarchy,
             policies,
             castes,
+            echo,
             thoughts,
             origin,
             origin_place,
@@ -747,6 +773,42 @@ impl<P: Problem> Mind<P> {
     /// The lexicon, if the mind keeps one.
     pub fn lexicon(&self) -> Option<&Lexicon> {
         self.lexicon.as_ref()
+    }
+
+    /// The echoes' bookkeeping, if the mind has echoes.
+    pub fn echo(&self) -> Option<&Echo> {
+        self.echo.as_ref()
+    }
+
+    /// The problem, to change the world outside the thoughts.
+    pub fn problem_mut(&mut self) -> &mut P {
+        &mut self.problem
+    }
+
+    /// The lexicon, to silence the floor.
+    pub fn lexicon_mut(&mut self) -> Option<&mut Lexicon> {
+        self.lexicon.as_mut()
+    }
+
+    /// New thoughts: a share of the thoughts that are not echoes
+    /// forget what they knew (their site, their remembered route, the
+    /// sign they held), as if newly born into the colony; what the
+    /// colony knows is in the ground, on the floor and in the echoes.
+    pub fn renew(&mut self, share: f64) -> usize {
+        let mut renewed = 0;
+        for i in 0..self.thoughts.len() {
+            if self.thoughts[i].echo || !self.rng.chance(share.clamp(0.0, 1.0)) {
+                continue;
+            }
+            let t = &mut self.thoughts[i];
+            t.site = None;
+            t.remembered.clear();
+            t.held = None;
+            t.empty_walks = 0;
+            t.findings = 0;
+            renewed += 1;
+        }
+        renewed
     }
 
     /// The bridge, to set its temperature.
@@ -946,6 +1008,7 @@ impl<P: Problem> Mind<P> {
         for i in 0..self.thoughts.len() {
             self.think(i);
         }
+        self.echo_encounters();
         self.world.step_pheromones();
         if let Some(h) = &mut self.history {
             h.step();
@@ -1028,19 +1091,25 @@ impl<P: Problem> Mind<P> {
         // straight ahead, so where it starts is where it looks).
         let attended = self.net.as_ref().and_then(|n| n.attended());
         // Or with a sign in mind: a follower may listen to the dance
-        // floor and set out the way the sign's glyph goes.
-        let intent = match (attended, &self.lexicon, &self.net) {
-            (None, Some(lex), Some(net)) => {
-                let caste = self.thoughts[i].caste;
-                if (caste != 0 || lex.config().scouts_listen)
-                    && self.rng.chance(lex.config().listen)
-                {
-                    lex.draw(&net.living(), &mut self.rng)
-                } else {
-                    None
+        // floor and set out the way the sign's glyph goes; an echo
+        // walks the sign it holds.
+        let is_echo = self.thoughts[i].echo && self.echo.is_some();
+        let intent = if is_echo {
+            self.echo_hold(i)
+        } else {
+            match (attended, &self.lexicon, &self.net) {
+                (None, Some(lex), Some(net)) => {
+                    let caste = self.thoughts[i].caste;
+                    if (caste != 0 || lex.config().scouts_listen)
+                        && self.rng.chance(lex.config().listen)
+                    {
+                        lex.draw(&net.living(), &mut self.rng)
+                    } else {
+                        None
+                    }
                 }
+                _ => None,
             }
-            _ => None,
         };
         let intended_heading = intent.and_then(|k| self.net.as_ref().and_then(|n| n.heading_of(k)));
         // The sign's glyph, the route its class is known by, as the
@@ -1053,8 +1122,13 @@ impl<P: Problem> Mind<P> {
                 .map(|s| s.glyph.points.clone()),
             _ => None,
         };
-        if let (Some(lex), Some(k)) = (&mut self.lexicon, intent) {
-            lex.recruited(k);
+        match (&mut self.lexicon, &mut self.echo, intent, is_echo) {
+            (_, Some(e), Some(k), true) => {
+                e.walks += 1;
+                *e.echoed.entry(k).or_insert(0) += 1;
+            }
+            (Some(lex), _, Some(k), false) => lex.recruited(k),
+            _ => {}
         }
         let tick = self.tick;
         let t = &mut self.thoughts[i];
@@ -1139,6 +1213,15 @@ impl<P: Problem> Mind<P> {
                 self.found(i, q);
                 return self.arrive(i);
             }
+        }
+        // An echo at the end of its glyph with nothing found turns
+        // back along it.
+        if self.thoughts[i].echo
+            && self.thoughts[i].intent.is_some()
+            && self.thoughts[i].plan_done()
+        {
+            self.echo_turn_home(i);
+            return self.arrive(i);
         }
         if self.thoughts[i].steps >= self.cfg.trip_budget.max(1) {
             self.give_up(i, false);
@@ -1232,8 +1315,177 @@ impl<P: Problem> Mind<P> {
         t.deadline = 0;
         t.back = t.route.len().saturating_sub(1);
         t.heading = wrap_angle(t.heading + std::f64::consts::PI);
-        if let (true, Some(radius)) = (free, foresight) {
+        if t.echo && !t.plan.is_empty() {
+            // An echo goes home the way it came: the glyph backwards.
+            t.plan.reverse();
+            t.plan_index = 0;
+        } else if let (true, Some(radius)) = (free, foresight) {
             self.plan(i, origin_place, radius);
+        }
+    }
+
+    /// An echo at the end of its glyph with nothing there: the miss is
+    /// observed, and it turns for home along the glyph.
+    fn echo_turn_home(&mut self, i: usize) {
+        let route = self.route_of(i);
+        if let Some(net) = &mut self.net {
+            net.observe_miss(&route, &self.thoughts[i].prefix);
+        }
+        if let Some(e) = &mut self.echo {
+            e.empty += 1;
+        }
+        self.close_records(i, INSIDE, 0.0);
+        let t = &mut self.thoughts[i];
+        t.empty_walks += 1;
+        t.load = None;
+        t.activity = Activity::Inbound;
+        t.hold_activity = Activity::Inbound;
+        t.hold_until = 0;
+        t.deadline = 0;
+        t.back = t.route.len().saturating_sub(1);
+        t.heading = wrap_angle(t.heading + std::f64::consts::PI);
+        t.plan.reverse();
+        t.plan_index = 0;
+    }
+
+    /// The sign an echo walks: the one it holds, unless its epoch is
+    /// over, it has found nothing at the end too often, or its class
+    /// is dead, in which case one is drawn from the floor; when nothing
+    /// is danced the held sign is kept in silence.
+    fn echo_hold(&mut self, i: usize) -> Option<usize> {
+        let cfg = self.echo.as_ref()?.config().clone();
+        let (held, since, empty) = {
+            let t = &self.thoughts[i];
+            (t.held, t.held_since, t.empty_walks)
+        };
+        let tick = self.tick;
+        let (Some(lex), Some(net)) = (&self.lexicon, &self.net) else {
+            return None;
+        };
+        let alive = held
+            .and_then(|k| net.symbols().get(k))
+            .map(|s| s.alive)
+            .unwrap_or(false);
+        let stale = held.is_some() && tick.saturating_sub(since) >= cfg.epoch_ticks.max(1);
+        let tired = held.is_some() && empty >= cfg.patience.max(1);
+        if held.is_some() && alive && !stale && !tired {
+            return held;
+        }
+        let drawn = lex.draw(&net.living(), &mut self.rng);
+        let e = self.echo.as_mut()?;
+        let t = &mut self.thoughts[i];
+        match drawn {
+            Some(k) => {
+                if tired || (held.is_some() && !alive) {
+                    e.dropped += 1;
+                }
+                if held != Some(k) {
+                    e.drawn += 1;
+                }
+                t.held = Some(k);
+                t.held_since = tick;
+                t.empty_walks = 0;
+                Some(k)
+            }
+            None if tired || !alive => {
+                if held.is_some() {
+                    e.dropped += 1;
+                }
+                t.held = None;
+                t.empty_walks = 0;
+                None
+            }
+            None => {
+                // Nothing danced: the memory is kept in silence.
+                e.kept_in_silence += 1;
+                t.held_since = tick;
+                held
+            }
+        }
+    }
+
+    /// Thoughts out searching that meet an echo on its way take the
+    /// sign it walks as their own, from the point where they met.
+    fn echo_encounters(&mut self) {
+        let Some(cfg) = self.echo.as_ref().map(|e| e.config().clone()) else {
+            return;
+        };
+        if cfg.hear <= 0.0 {
+            return;
+        }
+        let speakers: Vec<(Position, usize)> = self
+            .thoughts
+            .iter()
+            .filter(|t| t.echo && t.activity.is_moving() && !t.plan.is_empty())
+            .filter_map(|t| t.intent.map(|k| (t.cell(), k)))
+            .collect();
+        if speakers.is_empty() {
+            return;
+        }
+        let tick = self.tick;
+        let free = self.free.is_some();
+        for j in 0..self.thoughts.len() {
+            let (cell, place, open) = {
+                let t = &self.thoughts[j];
+                (
+                    t.cell(),
+                    t.place,
+                    !t.echo
+                        && t.activity.is_out()
+                        && t.intent.is_none()
+                        && t.load.is_none()
+                        && t.transit.is_none(),
+                )
+            };
+            if !open || (free && self.world.is_nest(cell)) {
+                continue;
+            }
+            let Some(&(_, k)) = speakers.iter().find(|(c, _)| {
+                (c.x - cell.x).abs() <= cfg.radius && (c.y - cell.y).abs() <= cfg.radius
+            }) else {
+                continue;
+            };
+            if !self.rng.chance(cfg.hear) {
+                continue;
+            }
+            let glyph = match self
+                .net
+                .as_ref()
+                .and_then(|n| n.symbols().get(k))
+                .filter(|s| s.alive && s.glyph.points.len() >= 2)
+            {
+                Some(s) => s.glyph.points.clone(),
+                None => continue,
+            };
+            let nearest = glyph
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, place.distance(*p)))
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let t = &mut self.thoughts[j];
+            t.intent = Some(k);
+            t.heard = true;
+            t.plan = glyph;
+            t.plan_index = nearest;
+            t.planned_at = tick;
+            t.hold_until = 0;
+            t.deadline = 0;
+            t.activity = Activity::Searching;
+            t.hold_activity = Activity::Searching;
+            if let Some(next) = t.plan.get(nearest + 1) {
+                let (dx, dy) = t.place.to(*next);
+                if dx * dx + dy * dy > 1e-18 {
+                    t.heading = angle_of(dx, dy);
+                }
+            }
+            if let Some(lex) = &mut self.lexicon {
+                lex.recruited(k);
+            }
+            if let Some(e) = &mut self.echo {
+                e.heard += 1;
+            }
         }
     }
 
@@ -1321,6 +1573,10 @@ impl<P: Problem> Mind<P> {
             t.findings += 1;
             let route =
                 Route::with_letters(t.places.clone(), t.letters.clone()).ending(t.suffix.clone());
+            let glyph_before = match (t.echo, t.intent, &self.net) {
+                (true, Some(k), Some(net)) => net.symbols().get(k).map(|s| s.glyph.length()),
+                _ => None,
+            };
             let class = match self.net.as_mut() {
                 Some(net) => {
                     // What the trip transported: its state less the one
@@ -1343,13 +1599,37 @@ impl<P: Problem> Mind<P> {
                         lex.outcome(k, cell);
                     }
                 }
-                match (t.intent, class) {
-                    (Some(i), Some(k)) if i == k => lex.success(k),
-                    (Some(i), _) => lex.strayed(i),
-                    (None, _) => {}
+                if !t.echo {
+                    match (t.intent, class) {
+                        (Some(i), Some(k)) if i == k => lex.success(k),
+                        (Some(i), _) => lex.strayed(i),
+                        (None, _) => {}
+                    }
+                    if let (Some(i), Some(cell)) = (t.intent, t.finding) {
+                        lex.taken(i, cell);
+                    }
                 }
-                if let (Some(i), Some(cell)) = (t.intent, t.finding) {
-                    lex.taken(i, cell);
+            }
+            if let Some(e) = &mut self.echo {
+                if t.echo {
+                    e.verified += 1;
+                    t.empty_walks = 0;
+                    if let (Some(before), Some(k), Some(net)) = (glyph_before, t.intent, &self.net)
+                    {
+                        let after = net
+                            .symbols()
+                            .get(k)
+                            .map(|s| s.glyph.length())
+                            .unwrap_or(before);
+                        if class == Some(k) && after < before - 1e-9 {
+                            e.refined += 1;
+                        }
+                    }
+                } else if t.heard {
+                    e.heard_home += 1;
+                    if t.intent.is_some() && class == t.intent {
+                        e.heard_understood += 1;
+                    }
                 }
             }
             if let Some(origin) = t.route.first() {
@@ -1376,8 +1656,11 @@ impl<P: Problem> Mind<P> {
                 self.last_improvement_epoch = self.stats.epochs;
             }
         } else {
-            if let (Some(lex), Some(k)) = (&mut self.lexicon, t.intent) {
+            if let (Some(lex), Some(k), false) = (&mut self.lexicon, t.intent, t.echo) {
                 lex.lost(k);
+            }
+            if let (Some(e), true) = (&mut self.echo, t.heard) {
+                e.heard_home += 1;
             }
             if let Some(site) = t.site.as_mut() {
                 site.failures += 1;
@@ -1881,9 +2164,17 @@ impl<P: Problem> Mind<P> {
             m.record_move(to_cell, walked);
         }
         // What is laid along the way.
-        let (activity, load, no_entry_left, recruit, symbol) = {
+        let (activity, load, no_entry_left, recruit, symbol, echo, intent) = {
             let t = &self.thoughts[i];
-            (t.activity, t.load, t.no_entry_left, t.recruit, t.symbol)
+            (
+                t.activity,
+                t.load,
+                t.no_entry_left,
+                t.recruit,
+                t.symbol,
+                t.echo,
+                t.intent,
+            )
         };
         if let Some(q) = load {
             let per_cell = self.cfg.trail_deposit * q * recruit;
@@ -1892,6 +2183,11 @@ impl<P: Problem> Mind<P> {
                 let per_cell = net.config().deposit * q * recruit;
                 net.lay(k, place, pre, per_cell);
             }
+        } else if let (true, Some(k), Some(e), Some(net)) =
+            (echo, intent, &self.echo, &mut self.net)
+        {
+            // An echo speaks its sign along the way, out and back.
+            net.lay(k, place, pre, e.config().deposit);
         }
         if no_entry_left > 0.0 && self.cfg.no_entry_deposit > 0.0 {
             let per_cell = 0.25 * self.cfg.no_entry_deposit;
@@ -2626,6 +2922,9 @@ impl<P: Problem> Mind<P> {
         }
         if let (Some(l), Some(n)) = (&self.lexicon, &self.net) {
             out.push_str(&l.report(n));
+            if let Some(e) = &self.echo {
+                out.push_str(&e.report(n, l));
+            }
         }
         if let Some(q) = &self.queen {
             let dials = self.dials();

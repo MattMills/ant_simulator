@@ -360,6 +360,31 @@ synonyms at similarity 1.000, and the colony that talks brings home
 built before the one that works, and what each failure taught, are in
 [`docs/lexicon.md`](docs/lexicon.md).
 
+## The echo
+
+The dance floor speaks fast and at the nest. An *echo* is a follower
+that speaks the same language at a slower epoch and everywhere along
+the route: it draws a sign from the floor, holds it for an epoch, and
+walks the sign's glyph out and back, again and again, laying the
+sign's channel both ways whether or not anything is at the end. The
+other thoughts receive it as traffic. The walks enter the movement
+history, whose invariant skeleton is the colony's geometry; a thought
+out searching that meets an echo takes the sign it walks as its own,
+from the point where they met, as a follower takes the route from a
+tandem leader; and a walk that finds the source still there brings it
+home, dances it, and refines the glyph if it was shorter. On the
+two-source maze with a floor few listen to, four echoes among
+thirty-two thoughts raise the quality brought home from 695 to 890 and
+carry the sign to 627 thoughts on the way, 96 % of whom come home in
+its class; the route lies 68 % in the invariant skeleton at tick 1000
+against 3 % without them; the glyph shortens from 44 to 42 cells; and
+thoughts newly born into the colony, with the floor silenced, are
+imprinted from the ground within 200 ticks. What the echo does not add
+is persistence: the memory of a route already lives in the glyph and
+the floor's linear draw, and patient echoes of a sign the world has
+left cost yield. The design, the numbers and where it stops are in
+[`docs/echo.md`](docs/echo.md).
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -412,6 +437,12 @@ built before the one that works, and what each failure taught, are in
   site in mind strays to it, and a sign followed as a scent is followed
   too slowly to pay. Meaning is measured by use: where the thoughts
   that heard the sign went.
+* **A sign walked is a sign heard everywhere, but not a sign kept
+  longer.** Echoes carry the lexicon to thoughts the floor never
+  reaches, put the route into the colony's invariant geometry an epoch
+  early, and refine the glyph by walking it; they do not lengthen the
+  memory, which is in the ground already, and an echo faithful to a
+  sign the world has left is the design's failure mode.
 * **The queen is a policy over two numbers.** Given stagnation and
   organisation she has a sensible thing to do with the castes' dials;
   what she cannot do is tell a saturating quality from a stagnant one,
@@ -436,6 +467,9 @@ extras/examples/bridge.rs the bridge observing, forcing, drifting; sector weight
 extras/src/lexicon.rs     Lexicon, LexiconConfig, Sign (the dance floor: signs danced, drawn, meant, taken)
 extras/docs/lexicon.md    the lexicon: claim, build, the three that failed and the one that works, limits
 extras/examples/lexicon.rs signs forming over two sources, naming, synonyms, talking against silence
+extras/src/echo.rs        Echo, EchoConfig (signs persisted in walk form: held, walked, heard on the way)
+extras/docs/echo.md       the echo: claim, build, reach, invariance, refinement, imprinting, what it does not add
+extras/examples/echo.rs   echoes on a quiet floor, the route in the skeleton, new thoughts imprinted
 extras/examples/relations.rs  the family graph learned by walking
 extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems
