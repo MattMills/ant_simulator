@@ -37,6 +37,7 @@
 //! rest, and go out again with site fidelity and a route memory.
 
 use crate::bridge::{Bridge, BridgeConfig};
+use crate::lexicon::{Lexicon, LexiconConfig};
 use crate::problem::{Moves, Problem};
 use crate::sense::{clear_ahead, features, Body, Candidate, Senses, Sight};
 use crate::thought::{unit, Activity, Site, Target, Thought};
@@ -214,6 +215,9 @@ pub struct MindConfig {
     /// explicit on a coarse graph of the medium (see [`crate::bridge`]);
     /// kept for problems walked freely.
     pub bridge: Option<BridgeConfig>,
+    /// The lexicon: the symbols in use between the thoughts (see
+    /// [`crate::lexicon`]); needs the symbols.
+    pub lexicon: Option<LexiconConfig>,
     /// Kinetics of the medium's channels.
     pub pheromones: PheromoneSet,
     /// Seconds per tick.
@@ -255,6 +259,7 @@ impl Default for MindConfig {
             queen: None,
             symbols: None,
             bridge: None,
+            lexicon: None,
             pheromones: MindConfig::pheromones(),
             tick_s: 1.0,
             ledger: true,
@@ -350,6 +355,14 @@ impl MindConfig {
     /// with the configured gain.
     pub fn with_bridge(mut self, bridge: BridgeConfig) -> MindConfig {
         self.bridge = Some(bridge);
+        self
+    }
+
+    /// A mind with a lexicon: returning thoughts dance their route's
+    /// sign at the nest, departing followers may listen and set out
+    /// with a sign in mind, and the signs mean where they lead.
+    pub fn with_lexicon(mut self, lexicon: LexiconConfig) -> MindConfig {
+        self.lexicon = Some(lexicon);
         self
     }
 
@@ -491,6 +504,7 @@ pub struct Mind<P: Problem> {
     queen: Option<Queen>,
     net: Option<PathNet>,
     bridge: Option<Bridge>,
+    lexicon: Option<Lexicon>,
     rng: Rng,
     tick: u64,
     stats: MindStats,
@@ -594,6 +608,11 @@ impl<P: Problem> Mind<P> {
             None
         };
 
+        let lexicon = match (&net, &cfg.lexicon) {
+            (Some(_), Some(c)) => Some(Lexicon::new(w, h, tick_s, c.clone())),
+            _ => None,
+        };
+
         Mind {
             problem,
             cfg,
@@ -610,6 +629,7 @@ impl<P: Problem> Mind<P> {
             queen,
             net,
             bridge,
+            lexicon,
             rng,
             tick: 0,
             stats: MindStats::default(),
@@ -724,6 +744,11 @@ impl<P: Problem> Mind<P> {
         self.bridge.as_ref()
     }
 
+    /// The lexicon, if the mind keeps one.
+    pub fn lexicon(&self) -> Option<&Lexicon> {
+        self.lexicon.as_ref()
+    }
+
     /// The bridge, to set its temperature.
     pub fn bridge_mut(&mut self) -> Option<&mut Bridge> {
         self.bridge.as_mut()
@@ -786,7 +811,8 @@ impl<P: Problem> Mind<P> {
         if !world.is_passable(to) {
             return None;
         }
-        net.generate_with(word, self.origin_place.cell(), to, &neighbours)
+        let word = word.without_destinations();
+        net.generate_with(&word, self.origin_place.cell(), to, &neighbours)
     }
 
     /// A route of a class over the problem's states from a state, by
@@ -862,7 +888,7 @@ impl<P: Problem> Mind<P> {
     /// letters of its moves.
     fn route_of(&self, i: usize) -> Route {
         let t = &self.thoughts[i];
-        Route::with_letters(t.places.clone(), t.letters.clone())
+        Route::with_letters(t.places.clone(), t.letters.clone()).ending(t.suffix.clone())
     }
 
     /// Express a symbol: its glyph is laid into its channel and the
@@ -944,6 +970,9 @@ impl<P: Problem> Mind<P> {
                 }
             }
         }
+        if let Some(l) = &mut self.lexicon {
+            l.step();
+        }
         if let Some(b) = &mut self.bridge {
             for t in &self.thoughts {
                 if t.activity.is_out() {
@@ -998,15 +1027,54 @@ impl<P: Problem> Mind<P> {
         // its glyph goes (the sucker that selects its moves climbs from
         // straight ahead, so where it starts is where it looks).
         let attended = self.net.as_ref().and_then(|n| n.attended());
+        // Or with a sign in mind: a follower may listen to the dance
+        // floor and set out the way the sign's glyph goes.
+        let intent = match (attended, &self.lexicon, &self.net) {
+            (None, Some(lex), Some(net)) => {
+                let caste = self.thoughts[i].caste;
+                if (caste != 0 || lex.config().scouts_listen)
+                    && self.rng.chance(lex.config().listen)
+                {
+                    lex.draw(&net.living(), &mut self.rng)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let intended_heading = intent.and_then(|k| self.net.as_ref().and_then(|n| n.heading_of(k)));
+        // The sign's glyph, the route its class is known by, as the
+        // plan of the trip, if the sign is enacted.
+        let enacted: Option<Vec<Point>> = match (intent, &self.lexicon, &self.net) {
+            (Some(k), Some(lex), Some(net)) if lex.config().enact => net
+                .symbols()
+                .get(k)
+                .filter(|s| s.alive && s.glyph.points.len() >= 2)
+                .map(|s| s.glyph.points.clone()),
+            _ => None,
+        };
+        if let (Some(lex), Some(k)) = (&mut self.lexicon, intent) {
+            lex.recruited(k);
+        }
+        let tick = self.tick;
         let t = &mut self.thoughts[i];
         t.reset_trip(origin, place);
         t.prefix = prefix;
         t.x = x;
-        t.heading = match attended {
-            Some((_, heading)) => heading,
-            None => random,
+        t.intent = intent;
+        if let Some(plan) = enacted {
+            t.plan = plan;
+            t.plan_index = 0;
+            t.planned_at = tick;
+        }
+        t.heading = match (attended, intended_heading) {
+            (Some((_, heading)), _) => heading,
+            (None, Some(heading)) => heading,
+            _ => random,
         };
-        t.activity = if site_fidelity && t.site.is_some() {
+        // A thought with a sign in mind goes where the sign says, not
+        // back to its own site.
+        t.activity = if site_fidelity && t.site.is_some() && intent.is_none() {
             Activity::Outbound
         } else {
             Activity::Searching
@@ -1126,6 +1194,8 @@ impl<P: Problem> Mind<P> {
         let origin_place = self.origin_place;
         let recruitment = self.cfg.recruitment.max(0.0);
         let colony_best = self.best.as_ref().map(|b| b.quality).unwrap_or(0.0);
+        let suffix = self.problem.suffix(&self.thoughts[i].state);
+        self.thoughts[i].suffix = suffix;
         let route = self.route_of(i);
         let symbol = self
             .net
@@ -1133,6 +1203,7 @@ impl<P: Problem> Mind<P> {
             .and_then(|n| n.find(&n.word(&route, &self.thoughts[i].prefix)));
         let t = &mut self.thoughts[i];
         t.symbol = symbol;
+        t.finding = Some(cell);
         t.load = Some(quality);
         // Recruitment is judged against the best the thought knows and
         // the best the mind has brought home.
@@ -1248,21 +1319,38 @@ impl<P: Problem> Mind<P> {
             self.stats.deliveries += 1;
             self.stats.quality_sum += q;
             t.findings += 1;
-            let route = Route::with_letters(t.places.clone(), t.letters.clone());
-            if let Some(net) = &mut self.net {
-                // What the trip integrated: where it arrived less where
-                // it set out.
-                let departure = t
-                    .route
-                    .first()
-                    .map(|o| self.problem.departure(o))
-                    .unwrap_or_default();
-                let transported: Vec<f64> =
-                    t.x.iter()
-                        .enumerate()
-                        .map(|(d, v)| v - departure.get(d).copied().unwrap_or(0.0))
-                        .collect();
-                net.observe(&route, &t.prefix, &transported, q, tick);
+            let route =
+                Route::with_letters(t.places.clone(), t.letters.clone()).ending(t.suffix.clone());
+            let class = match self.net.as_mut() {
+                Some(net) => {
+                    // What the trip transported: its state less the one
+                    // it set out with.
+                    let departure = self.problem.departure(&t.route[0]);
+                    let transported: Vec<f64> =
+                        t.x.iter()
+                            .enumerate()
+                            .map(|(d, v)| v - departure.get(d).copied().unwrap_or(0.0))
+                            .collect();
+                    net.observe(&route, &t.prefix, &transported, q, tick)
+                }
+                None => None,
+            };
+            if let (Some(lex), Some(net)) = (&mut self.lexicon, &self.net) {
+                lex.ensure(net.symbols().len());
+                if let Some(k) = class {
+                    lex.dance(k, q);
+                    if let Some(cell) = t.finding {
+                        lex.outcome(k, cell);
+                    }
+                }
+                match (t.intent, class) {
+                    (Some(i), Some(k)) if i == k => lex.success(k),
+                    (Some(i), _) => lex.strayed(i),
+                    (None, _) => {}
+                }
+                if let (Some(i), Some(cell)) = (t.intent, t.finding) {
+                    lex.taken(i, cell);
+                }
             }
             if let Some(origin) = t.route.first() {
                 self.problem.learn(origin, &t.route, &t.x, q);
@@ -1287,10 +1375,15 @@ impl<P: Problem> Mind<P> {
                 self.stats.improvements += 1;
                 self.last_improvement_epoch = self.stats.epochs;
             }
-        } else if let Some(site) = t.site.as_mut() {
-            site.failures += 1;
-            if site.failures >= patience.max(1) {
-                t.site = None;
+        } else {
+            if let (Some(lex), Some(k)) = (&mut self.lexicon, t.intent) {
+                lex.lost(k);
+            }
+            if let Some(site) = t.site.as_mut() {
+                site.failures += 1;
+                if site.failures >= patience.max(1) {
+                    t.site = None;
+                }
             }
         }
         t.activity = Activity::Resting;
@@ -1468,22 +1561,27 @@ impl<P: Problem> Mind<P> {
         let offset = mode.offset();
         let leaf = self.thoughts[i].leaf;
         let weights = self.policies[leaf].weights;
+        // A thought with a sign in mind goes where the sign says: its
+        // own site and remembered route are set aside for the trip.
         let route_dir = {
             let t = &mut self.thoughts[i];
-            if t.plan.is_empty() {
-                t.route_direction()
-            } else {
+            if !t.plan.is_empty() {
                 t.plan_direction()
+            } else if t.intent.is_some() {
+                None
+            } else {
+                t.route_direction()
             }
         };
         let t = &self.thoughts[i];
         let (place, heading, state) = (t.place, t.heading, t.state.clone());
         let home = t.route.first().cloned();
         let x = t.x.clone();
+        let intent = t.intent;
         let body = Body {
             place,
             home_dir: t.home_direction(),
-            site_dir: if t.activity.is_out() && self.free.is_some() {
+            site_dir: if t.activity.is_out() && self.free.is_some() && intent.is_none() {
                 t.site_direction()
             } else {
                 None
@@ -1493,6 +1591,32 @@ impl<P: Problem> Mind<P> {
             sensitivity: 1.0,
         };
         let free = self.free.is_some();
+        // The intended sign's channel along every move open, relative
+        // to the most of it along any: the ridge, whatever the level.
+        let ridge: Vec<f64> = match (intent, &self.net) {
+            (Some(k), Some(net)) => {
+                let levels: Vec<f64> = cands
+                    .iter()
+                    .map(|c| {
+                        if !c.valid {
+                            return 0.0;
+                        }
+                        let u = unit(place.to(c.point)).unwrap_or_else(|| {
+                            let h = ring_heading(c.ring, heading);
+                            (h.cos(), h.sin())
+                        });
+                        net.channel_along(place, u, c.len, k)
+                    })
+                    .collect();
+                let peak = levels.iter().cloned().fold(0.0, f64::max);
+                if peak > 1e-12 {
+                    levels.iter().map(|l| l / peak).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
         let mut senses = Senses::default();
         let mut best = [f64::NEG_INFINITY; RING];
         for (j, c) in cands.iter().enumerate() {
@@ -1548,6 +1672,14 @@ impl<P: Problem> Mind<P> {
                 .as_ref()
                 .map(|n| n.extra(place, u, c.len))
                 .unwrap_or(0.0);
+            // A thought with a sign in mind attends to its sign: the
+            // common trail and the classes' general say are disregarded
+            // by its focus, and its sign's channel is sensed sensitised.
+            if let (Some(_), Some(lex)) = (intent, &self.lexicon) {
+                let heed = 1.0 - lex.config().focus.clamp(0.0, 1.0);
+                feat[offset + ant_simulator::ant::F_TRAIL] *= heed;
+                extra *= heed;
+            }
             if let (Some(b), true) = (&self.bridge, free) {
                 let gain = b.config().gain;
                 if gain > 0.0 {
@@ -1555,6 +1687,13 @@ impl<P: Problem> Mind<P> {
                         extra += gain * (g.0 * u.0 + g.1 * u.1);
                     }
                 }
+            }
+            if let (Some(_), Some(lex)) = (intent, &self.lexicon) {
+                // The sign's channel's ridge, and the sign's glyph if
+                // it is the plan, weigh with the lexicon's gain.
+                let gain = lex.config().gain;
+                extra += gain * ridge.get(j).copied().unwrap_or(0.0);
+                extra += gain * feat[offset + ant_simulator::ant::F_ROUTE];
             }
             let logit = dot(&weights, &feat) + extra;
             if !senses.valid[c.ring] || logit > best[c.ring] {
@@ -1577,7 +1716,7 @@ impl<P: Problem> Mind<P> {
                 t.leaf,
                 t.cell(),
                 t.laden(),
-                t.activity == Activity::Searching,
+                t.activity == Activity::Searching && t.intent.is_none(),
             )
         };
         let policy = self.policies[leaf].clone();
@@ -2084,7 +2223,12 @@ impl<P: Problem> Mind<P> {
     ) -> bool {
         let levels = self.transit_levels();
         let crossed = crossed.min(levels.len()).min(MAX_TRANSIT_LEVELS);
-        if crossed == 0 || !self.thoughts[i].activity.is_moving() {
+        // A thought with a sign in mind walks its sign's channel step
+        // by step: no habit carries it.
+        if crossed == 0
+            || !self.thoughts[i].activity.is_moving()
+            || self.thoughts[i].intent.is_some()
+        {
             return false;
         }
         let (heading, leaf, laden, searching, caste) = {
@@ -2093,7 +2237,7 @@ impl<P: Problem> Mind<P> {
                 t.heading,
                 t.leaf,
                 t.laden(),
-                t.activity == Activity::Searching,
+                t.activity == Activity::Searching && t.intent.is_none(),
                 t.caste,
             )
         };
@@ -2479,6 +2623,9 @@ impl<P: Problem> Mind<P> {
         }
         if let Some(b) = &self.bridge {
             out.push_str(&b.report());
+        }
+        if let (Some(l), Some(n)) = (&self.lexicon, &self.net) {
+            out.push_str(&l.report(n));
         }
         if let Some(q) = &self.queen {
             let dials = self.dials();

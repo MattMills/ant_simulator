@@ -34,6 +34,7 @@
 //! | [`topos`] | the six pheromone channels | a variable surface: a channel per learned symbol, each a class of routes (its word round the punctures), registered, weighed, labelled and generated, with a transport as its vector |
 //! | [`problems::Relations`] | path integration | the holonomy embedding: thoughts integrate a D-dimensional state through the relations they follow, the words of their trips are rules, and the geometry learns to close along them |
 //! | [`bridge`] | the outbound walk and the trail laid home | the forward and backward filters solved explicitly on the grain: the predicted corridor, the surprise of the flows against it, the drift of the conditioned walk |
+//! | [`lexicon`] | recruitment at the nest, the honeybee's dance floor | signs: the classes danced by the thoughts that come home, drawn by those setting out, meaning where they lead, understood as far as the listeners get there |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -102,6 +103,21 @@
 //! functions, and conditions a practice on survival
 //! (`extras/docs/bridge.md`).
 //!
+//! ## The lexicon
+//!
+//! A symbol becomes a sign when it is used to tell another thought
+//! something. [`lexicon`] borrows the use from the honeybee: a thought
+//! home with a solution dances the sign of its route's class in
+//! proportion to what it found, a follower setting out may draw a sign
+//! in proportion to its dance and set out with it in mind (the way its
+//! glyph goes, the glyph as its plan, the class's channel as its
+//! scent, its own memory set aside), a sign means where the trips of
+//! its class ended, synonyms are signs that lead to the same place,
+//! and a sign is understood as far as the thoughts that heard it end
+//! where it means. The lexicon measures itself: the mutual information
+//! between sign and outcome, the entropy of the floor, each sign's
+//! agreement, and what talking is worth (`extras/docs/lexicon.md`).
+//!
 //! ## Where the ants' way stops
 //!
 //! Habits and foresight belong to the walk between decisions, so they
@@ -115,6 +131,7 @@
 //! practice module is how a surface is tuned to one.
 
 pub mod bridge;
+pub mod lexicon;
 pub mod mind;
 pub mod practice;
 pub mod problem;
@@ -126,6 +143,7 @@ pub mod topos;
 /// Everything commonly needed.
 pub mod prelude {
     pub use crate::bridge::{Bridge, BridgeConfig};
+    pub use crate::lexicon::{Lexicon, LexiconConfig, Sign};
     pub use crate::mind::{Choice, Finding, Geometry, Mind, MindConfig, MindStats, QueenPolicy};
     pub use crate::practice::{Practice, PracticeConfig, PracticeReport, Targets, Turn};
     pub use crate::problem::{embedding, Layered, Moves, Problem};

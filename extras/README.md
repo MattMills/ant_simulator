@@ -335,6 +335,31 @@ weighed by their sector partition functions at a temperature, and a
 practice can be conditioned on survival. The design, the numbers and
 where it stops are in [`docs/bridge.md`](docs/bridge.md).
 
+## The lexicon
+
+The symbols become signs the way a honeybee's source becomes a dance.
+A thought that brings a solution home dances the sign of the class it
+walked, in proportion to what it found, and the dance fades; a thought
+about to set out may listen, draw a sign in proportion to how much of
+it is danced, and set out with it in mind: the way its glyph goes,
+with the glyph as the plan of its trip, following the ridge of the
+class's channel, and with its own site, route, habits and the common
+trail set aside for the trip. A sign means where the trips of its
+class ended, a distribution over blocks of the medium that is its
+vector; signs that lead to the same place are synonyms whatever their
+words; and a sign is understood as far as the thoughts that heard it
+end where it means. `lexicon.rs` keeps the floor and measures it: the
+mutual information between the sign danced and the outcome reached,
+the entropy of the floor, each sign's agreement and success rate, and
+what talking is worth. On the maze round a wall with a rich source
+beyond it and a poor one near the nest, nine signs form, the sign
+tells all 0.68 nats there are about the outcome, every one of 1263
+recruited trips is understood, eight signs meaning the rich source are
+synonyms at similarity 1.000, and the colony that talks brings home
+46 % more quality than the one that does not. The three lexicons
+built before the one that works, and what each failure taught, are in
+[`docs/lexicon.md`](docs/lexicon.md).
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -377,6 +402,16 @@ where it stops are in [`docs/bridge.md`](docs/bridge.md).
   only close at zero and then tells nothing apart; the words carry
   what the translation cannot. The affine transport the design allows
   is the next step.
+* **A sign is a class with a use.** Nothing had to be added to the
+  symbol for it to become a sign: a dance floor at the nest, a draw in
+  proportion to the dance (the bees' linear feedback, which picks the
+  source worth more per trip rather than the one found first), and a
+  recruit that sets its own memory aside and enacts the sign's glyph.
+  Each of those was found by a lexicon that failed without it: a
+  softmax draw locks in on the first source, a recruit with its own
+  site in mind strays to it, and a sign followed as a scent is followed
+  too slowly to pay. Meaning is measured by use: where the thoughts
+  that heard the sign went.
 * **The queen is a policy over two numbers.** Given stagnation and
   organisation she has a sensible thing to do with the castes' dials;
   what she cannot do is tell a saturating quality from a stagnant one,
@@ -398,6 +433,9 @@ extras/docs/holonomy.md   the holonomy embedding: proposal, build, numbers, limi
 extras/src/bridge.rs      Bridge, BridgeConfig (the forward and backward filters on the grain)
 extras/docs/bridge.md     the bridge: claim, build, numbers, limits
 extras/examples/bridge.rs the bridge observing, forcing, drifting; sector weights; survival
+extras/src/lexicon.rs     Lexicon, LexiconConfig, Sign (the dance floor: signs danced, drawn, meant, taken)
+extras/docs/lexicon.md    the lexicon: claim, build, the three that failed and the one that works, limits
+extras/examples/lexicon.rs signs forming over two sources, naming, synonyms, talking against silence
 extras/examples/relations.rs  the family graph learned by walking
 extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems

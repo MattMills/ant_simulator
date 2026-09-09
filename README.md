@@ -963,14 +963,23 @@ both (`extras/docs/holonomy.md`). And the colony's forward and
 backward filters are made explicit as a bridge on the grain, the
 predicted corridor of successful trips, the surprise of the flows
 against it, and a drift the thoughts can follow
-(`extras/docs/bridge.md`). What the exploration found, and where the
-ants' way stops, is in the crate's README.
+(`extras/docs/bridge.md`). And the symbols become signs: a thought home
+with a solution dances the sign of its route's class at the nest, a
+thought setting out may draw a sign from the floor and enact its glyph,
+a sign means where its trips end, synonyms are signs that lead to the
+same place, and a sign is understood as far as those who heard it get
+there; on a maze with a rich source and a poor one the sign tells all
+there is about the outcome, every recruit is understood, and the colony
+that talks brings home 46 % more (`extras/docs/lexicon.md`). What the
+exploration found, and where the ants' way stops, is in the crate's
+README.
 
 ```text
 cargo run --release -p ant_extras --example think
 cargo run --release -p ant_extras --example symbols
 cargo run --release -p ant_extras --example relations
 cargo run --release -p ant_extras --example bridge
+cargo run --release -p ant_extras --example lexicon
 cargo test --release -p ant_extras
 ```
 

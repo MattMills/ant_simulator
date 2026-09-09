@@ -5,6 +5,7 @@
 //! walls, as the ants' trails do (Goss et al. 1989).
 
 use crate::problem::{embedding, Moves, Problem};
+use crate::topos::{destination_letter, Letter};
 use ant_simulator::frame::Frame;
 use ant_simulator::geometry::{Point, Position};
 use ant_simulator::world::{Rect, WorldConfig};
@@ -14,7 +15,7 @@ use ant_simulator::world::{Rect, WorldConfig};
 pub struct Maze {
     config: WorldConfig,
     start: Position,
-    goal: Position,
+    goals: Vec<(Position, f64)>,
     goal_radius: i32,
     step: f64,
 }
@@ -27,7 +28,7 @@ impl Maze {
         Maze {
             config,
             start,
-            goal,
+            goals: vec![(goal, 1.0)],
             goal_radius: 1,
             step: 1.0,
         }
@@ -44,10 +45,24 @@ impl Maze {
         Maze {
             config,
             start,
-            goal,
+            goals: vec![(goal, 1.0)],
             goal_radius: 1,
             step: 1.0,
         }
+    }
+
+    /// Several goals, each with its quality (the first is the goal
+    /// [`goal`](Self::goal) names).
+    pub fn with_goals(mut self, goals: Vec<(Position, f64)>) -> Maze {
+        if !goals.is_empty() {
+            self.goals = goals;
+        }
+        self
+    }
+
+    /// The goals and their qualities.
+    pub fn goals(&self) -> &[(Position, f64)] {
+        &self.goals
     }
 
     /// Two ways round a wall, one shorter than the other: the double
@@ -79,9 +94,9 @@ impl Maze {
         self.start
     }
 
-    /// The goal cell.
+    /// The goal cell (the first goal).
     pub fn goal(&self) -> Position {
-        self.goal
+        self.goals[0].0
     }
 
     /// The world the maze is drawn on.
@@ -103,7 +118,7 @@ impl Maze {
 
     /// The straight-line distance from start to goal, in cells.
     pub fn crow_flight(&self) -> f64 {
-        self.start.euclid(self.goal)
+        self.start.euclid(self.goals[0].0)
     }
 }
 
@@ -127,12 +142,42 @@ impl Problem for Maze {
     }
 
     fn quality(&self, state: &Position) -> Option<f64> {
-        (state.chebyshev(self.goal) <= self.goal_radius).then_some(1.0)
+        self.goals
+            .iter()
+            .filter(|(g, _)| state.chebyshev(*g) <= self.goal_radius)
+            .map(|(_, q)| *q)
+            .fold(None, |best: Option<f64>, q| {
+                Some(best.map_or(q, |b| b.max(q)))
+            })
     }
 
     fn locate(&self, place: Point) -> Option<Position> {
         let cell = place.cell();
         self.passable(cell).then_some(cell)
+    }
+
+    /// Which goal a solution is: the nearest goal within reach.
+    fn suffix(&self, state: &Position) -> Vec<Letter> {
+        self.goals
+            .iter()
+            .enumerate()
+            .filter(|(_, (g, _))| state.chebyshev(*g) <= self.goal_radius)
+            .min_by_key(|(_, (g, _))| state.chebyshev(*g))
+            .map(|(i, _)| vec![destination_letter(i)])
+            .unwrap_or_default()
+    }
+
+    fn letter_names(&self) -> Vec<(Letter, String)> {
+        self.goals
+            .iter()
+            .enumerate()
+            .map(|(i, (g, q))| {
+                (
+                    destination_letter(i),
+                    format!("@({},{}) {:.1}", g.x, g.y, q),
+                )
+            })
+            .collect()
     }
 
     /// The centre of each wall.

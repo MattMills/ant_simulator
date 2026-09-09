@@ -124,11 +124,18 @@ pub struct Thought<S> {
     /// The class of the trip's route, once a solution was found (see
     /// [`crate::topos`]).
     pub symbol: Option<usize>,
+    /// The sign the thought set out with in mind (see
+    /// [`crate::lexicon`]).
+    pub intent: Option<usize>,
+    /// Where the trip's solution was found.
+    pub finding: Option<Position>,
     /// The letters of the moves of the trip out, one per move after
     /// the origin (0 where a move is no letter).
     pub letters: Vec<Letter>,
     /// The letters the trip's word begins with.
     pub prefix: Vec<Letter>,
+    /// The letters the trip's word ends with, once a solution is found.
+    pub suffix: Vec<Letter>,
     /// The integrated state: what the trip has transported, or the
     /// developed displacement of a free walk.
     pub x: Vec<f64>,
@@ -193,8 +200,11 @@ impl<S: Clone> Thought<S> {
             retreat: false,
             avoid: None,
             symbol: None,
+            intent: None,
+            finding: None,
             letters: Vec::new(),
             prefix: Vec::new(),
+            suffix: Vec::new(),
             x: Vec::new(),
             phi: 0.0,
             last_turn: 0.0,
@@ -285,13 +295,24 @@ impl<S: Clone> Thought<S> {
         unit(self.place.to(site.place))
     }
 
-    /// The direction along the plan: to its next point not yet reached,
-    /// advancing past the points within a cell.
+    /// The direction along the plan: to the point after the nearest
+    /// point within reach among the next few from where the plan
+    /// stands, which then stands there; or, off the plan, back to the
+    /// point it stands at.
     pub fn plan_direction(&mut self) -> Option<(f64, f64)> {
-        while self.plan_index < self.plan.len()
-            && self.place.distance(self.plan[self.plan_index]) < 0.75
-        {
-            self.plan_index += 1;
+        if self.plan.is_empty() {
+            return None;
+        }
+        let end = (self.plan_index + 16).min(self.plan.len());
+        let mut best: Option<(usize, f64)> = None;
+        for j in self.plan_index..end {
+            let d = self.place.distance(self.plan[j]);
+            if d <= 1.5 && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((j, d));
+            }
+        }
+        if let Some((j, _)) = best {
+            self.plan_index = j + 1;
         }
         let next = *self.plan.get(self.plan_index)?;
         unit(self.place.to(next))
@@ -340,8 +361,11 @@ impl<S: Clone> Thought<S> {
         self.retreat = false;
         self.avoid = None;
         self.symbol = None;
+        self.intent = None;
+        self.finding = None;
         self.letters.clear();
         self.prefix.clear();
+        self.suffix.clear();
         self.x.clear();
         self.phi = 0.0;
         self.last_turn = 0.0;

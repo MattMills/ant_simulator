@@ -65,6 +65,11 @@ pub const LINK_LETTERS: Letter = 10000;
 /// Letters from here begin a trip's word (a query).
 pub const PREFIX_LETTERS: Letter = 20000;
 
+/// Letters from here end a trip's word: where it ended (a goal). A
+/// homotopy class is complete only between fixed endpoints, so a
+/// trip's destination is part of its class.
+pub const DESTINATION_LETTERS: Letter = 30000;
+
 /// The letter of a move over the surface, by its number and direction.
 pub fn move_letter(id: usize, forward: bool) -> Letter {
     let l = MOVE_LETTERS + (id as Letter).min(LINK_LETTERS - MOVE_LETTERS - 1);
@@ -95,7 +100,12 @@ pub fn link_of(letter: Letter) -> Option<(usize, bool)> {
 
 /// The letter a trip's word begins with, by its number.
 pub fn prefix_letter(id: usize) -> Letter {
-    PREFIX_LETTERS + (id as Letter).min(Letter::MAX - PREFIX_LETTERS - 1)
+    PREFIX_LETTERS + (id as Letter).min(DESTINATION_LETTERS - PREFIX_LETTERS - 1)
+}
+
+/// The letter a trip's word ends with, by the destination's number.
+pub fn destination_letter(id: usize) -> Letter {
+    DESTINATION_LETTERS + (id as Letter).min(Letter::MAX - DESTINATION_LETTERS - 1)
 }
 
 /// A word: the freely reduced sequence of letters of a route.
@@ -144,6 +154,18 @@ impl Word {
     /// Whether the word is empty (the class of routes crossing nothing).
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The word without its destination letters: the class of the
+    /// route as a route, wherever it ended.
+    pub fn without_destinations(&self) -> Word {
+        Word(
+            self.0
+                .iter()
+                .copied()
+                .filter(|l| l.abs() < DESTINATION_LETTERS)
+                .collect(),
+        )
     }
 
     /// The word of the route walked backwards.
@@ -199,7 +221,9 @@ impl Word {
 }
 
 fn raw_letter(l: Letter) -> String {
-    if l >= PREFIX_LETTERS {
+    if l >= DESTINATION_LETTERS {
+        format!("@{}", l - DESTINATION_LETTERS)
+    } else if l >= PREFIX_LETTERS {
         format!("q{}", l - PREFIX_LETTERS)
     } else if l >= LINK_LETTERS {
         format!("r{}", l - LINK_LETTERS)
@@ -231,6 +255,8 @@ pub struct Route {
     pub points: Vec<Point>,
     /// One letter per move, or none.
     pub letters: Vec<Letter>,
+    /// The letters of where the route ended (its destination), if any.
+    pub suffix: Vec<Letter>,
 }
 
 impl Route {
@@ -239,12 +265,23 @@ impl Route {
         Route {
             points,
             letters: Vec::new(),
+            suffix: Vec::new(),
         }
     }
 
     /// A route with the letters of its moves.
     pub fn with_letters(points: Vec<Point>, letters: Vec<Letter>) -> Route {
-        Route { points, letters }
+        Route {
+            points,
+            letters,
+            suffix: Vec::new(),
+        }
+    }
+
+    /// The route with the letters of where it ended.
+    pub fn ending(mut self, suffix: Vec<Letter>) -> Route {
+        self.suffix = suffix;
+        self
     }
 
     /// Length in cells.
@@ -325,6 +362,9 @@ impl Rays {
         for (i, pair) in route.points.windows(2).enumerate() {
             self.step(pair[0], pair[1], &mut w);
             w.push(route.letter(i + 1));
+        }
+        for &l in &route.suffix {
+            w.push(l);
         }
         w
     }
@@ -948,12 +988,25 @@ impl PathNet {
     }
 
     /// A trip of a class given up: counted against the class's
-    /// precision, if the class is registered.
+    /// precision, if the class is registered (a trip given up has no
+    /// destination, so the class is matched by its route alone; where
+    /// several destinations share the route, the most supported takes
+    /// the miss).
     pub fn observe_miss(&mut self, route: &Route, prefix: &[Letter]) -> Option<usize> {
-        let word = self.rays.word(route, prefix);
-        let k = self.find(&word)?;
+        let word = self.rays.word(route, prefix).without_destinations();
+        let k = self.find(&word).or_else(|| self.find_by_route(&word))?;
         self.symbols[k].misses += 1;
         Some(k)
+    }
+
+    /// The living symbol whose word, without its destination letters,
+    /// is the given one: the most supported where several are.
+    pub fn find_by_route(&self, word: &Word) -> Option<usize> {
+        let word = word.without_destinations();
+        self.living()
+            .into_iter()
+            .filter(|&k| self.symbols[k].word.without_destinations() == word)
+            .max_by_key(|&k| self.symbols[k].support)
     }
 
     fn register(&mut self, word: Word, pending: Pending, x: &[f64], tick: u64) -> Option<usize> {
@@ -1104,15 +1157,34 @@ impl PathNet {
         total
     }
 
+    /// One symbol's channel read along a move, its level as it is:
+    /// what a thought with that symbol in mind senses of it.
+    pub fn channel_along(&self, from: Point, unit: (f64, f64), len: f64, k: usize) -> f64 {
+        match self.symbols.get(k) {
+            Some(s) if s.alive => self.field.read_along(from, unit, len, s.channel).max(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// The heading a symbol's glyph sets out on.
+    pub fn heading_of(&self, k: usize) -> Option<f64> {
+        let s = self.symbols.get(k)?;
+        let glyph = &s.glyph.points;
+        let first = glyph.iter().find(|p| p.distance(glyph[0]) > 0.5)?;
+        let (dx, dy) = glyph[0].to(*first);
+        Some(dy.atan2(dx))
+    }
+
     /// What class a route is.
     pub fn label(&self, route: &Route, prefix: &[Letter]) -> Label {
         let word = self.rays.word(route, prefix);
         self.label_word(word)
     }
 
-    /// What class a word is.
+    /// What class a word is: the symbol of exactly that word, or the
+    /// symbol of that route whatever its destination.
     pub fn label_word(&self, word: Word) -> Label {
-        let symbol = self.find(&word);
+        let symbol = self.find(&word).or_else(|| self.find_by_route(&word));
         let nearest = self
             .living()
             .into_iter()

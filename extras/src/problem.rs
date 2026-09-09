@@ -89,6 +89,15 @@ pub trait Problem {
         Vec::new()
     }
 
+    /// The letters a trip's word ends with when it finds a solution in
+    /// this state: which of the problem's destinations it is. A homotopy
+    /// class is complete only between fixed endpoints, so a route to one
+    /// source and a route to another that cross the same rays are the
+    /// same word without this. Use [`crate::topos::destination_letter`].
+    fn suffix(&self, _state: &Self::State) -> Vec<Letter> {
+        Vec::new()
+    }
+
     /// The letter of a move between states, if the move is a letter of
     /// the route's word (a relation of a graph, signed by direction).
     /// Use [`crate::topos::move_letter`].

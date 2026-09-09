@@ -888,3 +888,157 @@ fn a_practice_conditioned_on_survival_rewards_only_survival() {
         practice.history().iter().filter(|t| t.survived).count()
     );
 }
+
+// ---------------------------------------------------------------------
+// The lexicon
+
+use ant_extras::lexicon::LexiconConfig;
+
+/// A maze with a rich source beyond the wall (reached over it or under
+/// it) and a poor one on the near side.
+fn two_sources() -> Maze {
+    let maze = Maze::around_a_wall(48, 32);
+    let rich = maze.goal();
+    let poor = Position::new(6, 26);
+    maze.with_goals(vec![(rich, 1.0), (poor, 0.2)])
+}
+
+#[test]
+fn signs_emerge_carry_their_outcomes_recruit_and_form_synonyms() {
+    let problem = two_sources();
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default())
+    .with_lexicon(LexiconConfig::default());
+    let mut mind = Mind::new(problem.clone(), cfg);
+    mind.run(4000);
+    let net = mind.net().expect("a network");
+    let lex = mind.lexicon().expect("a lexicon");
+    let living = net.living();
+    assert!(lex.utterances > 50, "dances: {}", lex.utterances);
+    assert!(
+        lex.recruitments > 20,
+        "departures listened: {}",
+        lex.recruitments
+    );
+    assert!(lex.in_use(&living) >= 2, "{}", lex.report(net));
+    // The signs tell where a trip ends: the mutual information between
+    // sign and outcome is most of the outcome's entropy.
+    let (mi, h) = lex.mutual_information(&living);
+    assert!(
+        h > 0.1,
+        "two sources are two outcomes: H {h}\n{}",
+        lex.report(net)
+    );
+    assert!(
+        mi > 0.6 * h,
+        "signs mean places: I {mi} of H {h}\n{}",
+        lex.report(net)
+    );
+    // Recruitment is understood more often than not.
+    let (successes, tried) =
+        living
+            .iter()
+            .filter_map(|&k| lex.sign(k))
+            .fold((0u64, 0u64), |(s, t), sign| {
+                (
+                    s + sign.successes,
+                    t + sign.successes + sign.strayed + sign.lost,
+                )
+            });
+    assert!(tried > 10);
+    assert!(
+        successes as f64 > 0.5 * tried as f64,
+        "understood {successes} of {tried}\n{}",
+        lex.report(net)
+    );
+    // The dance floor favours the rich source (it is worth more per
+    // trip): the signs meaning its block are the ones danced.
+    let rich_block = lex.block_of(problem.goal());
+    let poor_block = lex.block_of(Position::new(6, 26));
+    let means = |k: usize, block: usize| {
+        lex.meaning(k)
+            .first()
+            .map(|(b, _)| *b == block)
+            .unwrap_or(false)
+    };
+    let rich_signs: Vec<usize> = living
+        .iter()
+        .copied()
+        .filter(|&k| means(k, rich_block))
+        .collect();
+    let poor_signs: Vec<usize> = living
+        .iter()
+        .copied()
+        .filter(|&k| means(k, poor_block))
+        .collect();
+    assert!(
+        !rich_signs.is_empty(),
+        "a sign for the rich source\n{}",
+        lex.report(net)
+    );
+    assert!(
+        !poor_signs.is_empty(),
+        "a sign for the poor source\n{}",
+        lex.report(net)
+    );
+    let dance =
+        |signs: &[usize]| -> f64 { signs.iter().map(|&k| lex.sign(k).unwrap().dance).sum() };
+    let (rich_dance, poor_dance) = (dance(&rich_signs), dance(&poor_signs));
+    assert!(
+        rich_dance > 4.0 * poor_dance,
+        "the rich source danced {rich_dance:.1} against the poor {poor_dance:.1}\n{}",
+        lex.report(net)
+    );
+    // Recruits to the rich source's signs got there: what the signs
+    // are taken to mean is what they mean.
+    for &k in &rich_signs {
+        if lex.sign(k).unwrap().taken_count >= 10 {
+            assert!(
+                lex.understanding(k) > 0.9,
+                "understood: {}\n{}",
+                lex.understanding(k),
+                lex.report(net)
+            );
+        }
+    }
+    // Two ways to the rich source are synonyms; a sign for the poor
+    // source is not.
+    if rich_signs.len() >= 2 {
+        assert!(
+            lex.similarity(rich_signs[0], rich_signs[1]) > 0.9,
+            "synonyms: {}",
+            lex.similarity(rich_signs[0], rich_signs[1])
+        );
+    }
+    if let (Some(&r), Some(&p)) = (rich_signs.first(), poor_signs.first()) {
+        assert!(
+            lex.similarity(r, p) < 0.5,
+            "different places: {}",
+            lex.similarity(r, p)
+        );
+    }
+}
+
+#[test]
+fn a_lexicon_raises_the_yield_by_recruiting_to_the_rich_source() {
+    let problem = two_sources();
+    let base = MindConfig {
+        thoughts: 32,
+        trip_budget: 200,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default());
+    let mut silent = Mind::new(problem.clone(), base.clone());
+    let mut talking = Mind::new(problem, base.with_lexicon(LexiconConfig::default()));
+    silent.run(4000);
+    talking.run(4000);
+    let (qs, qt) = (silent.stats().quality_sum, talking.stats().quality_sum);
+    assert!(
+        qt > 1.1 * qs,
+        "quality brought home with a lexicon {qt:.0} against without {qs:.0}"
+    );
+}
