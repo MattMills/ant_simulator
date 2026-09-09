@@ -923,6 +923,77 @@ to the cells (the memo's two trees would take some 800 MB at
 1024 × 1024); they are off in these rows, and keeping them from their
 grain up is the natural next step.
 
+## The extras crate: an architecture that thinks in the style of ants
+
+The workspace carries a second crate, [`ant_extras`](extras/README.md),
+that re-leverages every component above as a general-purpose
+architecture. A *problem* is a set of states with places on a grid, an
+origin, solutions with a quality and moves (free steps, or successor
+states); a *mind* is a colony of thoughts walking it over the ants'
+medium, governed by the ant's instinct through the hierarchy, deformed
+and selected on the ring, collapsed into the movement history, stood
+in for by memoized transits where the ground is plain, foreseen through
+the lens, paced by the pipeline, and dialled by a queen who reads
+stagnation and organisation; learners tune its surfaces through
+rotating levers. The thoughts perceive a move into the ant's thirty
+sensory slots, so the surfaces apply unchanged.
+
+Three problems are embedded: a maze walked freely (on a grid or over a
+frame's box), where the trail found round the wall is the path and
+foresight shortens the trips by a quarter; a tour of sixteen cities,
+where the trail laid home along the tour's edges finds tours 5 % better
+than the nearest-neighbour tour (a mean of 0.98 and a best of 1.05 of
+it, against 0.63 for the best of two thousand random tours); and a
+graph colouring laid out layer by layer, where dead ends are marked
+no-entry and retreated from and the trail selects the colourings with
+fewer colours. The pheromone surface is made variable as well: a
+path-topological network classes every route by its word (the rays it
+crosses from the embedding's punctures, freely reduced, which is its
+homotopy class), registers the classes walked home as symbols with
+channels of their own and weights learned from their yields, labels any
+route by its class (with a name given after the fact), generates a
+route of any class by search or by expressing the symbol for the colony
+to walk, and learns its punctures from the holes the walks enclose.
+On that network stands a *holonomy embedding*: thoughts integrate a
+high-dimensional state through the moves and portals they cross, the
+transport of a class of routes is its vector, and a knowledge graph
+walked as queries yields rules as words, relation vectors that close
+along them, and predictions of held-out facts by geometry, rules and
+both (`extras/docs/holonomy.md`). And the colony's forward and
+backward filters are made explicit as a bridge on the grain, the
+predicted corridor of successful trips, the surprise of the flows
+against it, and a drift the thoughts can follow
+(`extras/docs/bridge.md`). And the symbols become signs: a thought home
+with a solution dances the sign of its route's class at the nest, a
+thought setting out may draw a sign from the floor and enact its glyph,
+a sign means where its trips end, synonyms are signs that lead to the
+same place, and a sign is understood as far as those who heard it get
+there; on a maze with a rich source and a poor one the sign tells all
+there is about the outcome, every recruit is understood, and the colony
+that talks brings home 46 % more (`extras/docs/lexicon.md`). And the
+signs are persisted in walk form: echoes hold a sign for an epoch and
+walk its glyph again and again, for the others to hear on the way, so
+that the route enters the colony's invariant geometry early, the glyph
+is refined by the walks, and thoughts born into the colony are
+imprinted from the ground (`extras/docs/echo.md`). And the abstraction
+is a ground: an interior is a second mind whose states are the words
+the foragers registered, coupled to them both ways, believing through
+its trail, speaking through the floor, proposing words nobody walked
+for the foragers to test, and registering classes of its own that a
+third layer can walk (`extras/docs/interior.md`). What the exploration
+found, and where the ants' way stops, is in the crate's README.
+
+```text
+cargo run --release -p ant_extras --example think
+cargo run --release -p ant_extras --example symbols
+cargo run --release -p ant_extras --example relations
+cargo run --release -p ant_extras --example bridge
+cargo run --release -p ant_extras --example lexicon
+cargo run --release -p ant_extras --example echo
+cargo run --release -p ant_extras --example interior
+cargo test --release -p ant_extras
+```
+
 ## Reproducibility and tests
 
 Everything is driven by a single `u64` seed through the crate's own xoshiro

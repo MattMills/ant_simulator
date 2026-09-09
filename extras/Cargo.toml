@@ -1,0 +1,12 @@
+[package]
+name = "ant_extras"
+version = "0.1.0"
+edition = "2021"
+description = "A general-purpose architecture that thinks in the style of ants, built from the components of ant_simulator: problems are embedded on a surface and walked by a colony of thoughts whose trails become the solution."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["stigmergy", "metaheuristic", "ants", "entropy", "optimization"]
+categories = ["algorithms", "science"]
+
+[dependencies]
+ant_simulator = { path = ".." }

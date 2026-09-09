@@ -104,6 +104,20 @@
 //!   and a trail is followed round a corner, so a colony forages over a
 //!   formicarium's surfaces.
 //!
+//! * **The extras crate** (`ant_extras`, in the workspace): every
+//!   component above re-leveraged as a general-purpose architecture
+//!   that thinks in the style of ants, where a problem is embedded on
+//!   a surface and walked by a colony of thoughts whose trails become
+//!   the solution: a maze, a tour of cities, a graph colouring; and a
+//!   path-topological network that makes the pheromone surface
+//!   variable, registering the classes of routes walked (their words
+//!   round the embedding's punctures) as learned symbols that label
+//!   routes and generate them, and a holonomy embedding in which the
+//!   thoughts integrate a high-dimensional state through the moves
+//!   they make and a knowledge graph is learned by walking its
+//!   queries; and a bridge that makes the colony's forward and
+//!   backward filters explicit.
+//!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
 //!   sweeps colony size and world area and fits the cost's exponents; and
