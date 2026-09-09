@@ -104,6 +104,12 @@
 //!   and a trail is followed round a corner, so a colony forages over a
 //!   formicarium's surfaces.
 //!
+//! * **The extras crate** (`ant_extras`, in the workspace): every
+//!   component above re-leveraged as a general-purpose architecture
+//!   that thinks in the style of ants, where a problem is embedded on
+//!   a surface and walked by a colony of thoughts whose trails become
+//!   the solution: a maze, a tour of cities, a graph colouring.
+//!
 //! * **Benchmarks and scale analysis** ([`scaling`], [`experiments`]):
 //!   every simulation profiles its tick phase by phase; `cargo bench`
 //!   sweeps colony size and world area and fits the cost's exponents; and
