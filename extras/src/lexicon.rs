@@ -91,6 +91,9 @@ impl Default for LexiconConfig {
 pub struct Sign {
     /// How strongly the sign is danced at present.
     pub dance: f64,
+    /// A standing dance that does not fade: what a slower layer of the
+    /// colony holds the sign to be worth (see [`crate::interior`]).
+    pub standing: f64,
     /// Times danced.
     pub dances: u64,
     /// Departures with the sign in mind.
@@ -193,11 +196,18 @@ impl Lexicon {
         }
     }
 
-    /// Silence: every dance stops (the floor is cleared).
+    /// Silence: every dance stops (the floor is cleared); a standing
+    /// dance stands.
     pub fn silence(&mut self) {
         for s in self.signs.iter_mut() {
             s.dance = 0.0;
         }
+    }
+
+    /// Set a sign's standing dance.
+    pub fn set_standing(&mut self, k: usize, standing: f64) {
+        self.ensure(k + 1);
+        self.signs[k].standing = standing.max(0.0);
     }
 
     /// A thought home with a solution dances its sign.
@@ -260,13 +270,20 @@ impl Lexicon {
     }
 
     /// A sign drawn from the dance floor, in proportion to
-    /// `dance ^ (1 / temperature)` over the living signs danced at all,
-    /// or none if nothing is danced.
+    /// `dance ^ (1 / temperature)` over the living signs danced at all
+    /// (a standing dance counting with the dance), or none if nothing
+    /// is danced.
     pub fn draw(&self, living: &[usize], rng: &mut Rng) -> Option<usize> {
+        let heard = |k: usize| {
+            self.signs
+                .get(k)
+                .map(|s| s.dance + s.standing)
+                .unwrap_or(0.0)
+        };
         let danced: Vec<usize> = living
             .iter()
             .copied()
-            .filter(|&k| self.signs.get(k).map(|s| s.dance > 1e-9).unwrap_or(false))
+            .filter(|&k| heard(k) > 1e-9)
             .collect();
         if danced.is_empty() {
             return None;
@@ -274,11 +291,11 @@ impl Lexicon {
         let t = self.cfg.temperature.max(1e-9);
         let peak = danced
             .iter()
-            .map(|&k| self.signs[k].dance)
+            .map(|&k| heard(k))
             .fold(f64::NEG_INFINITY, f64::max);
         let weights: Vec<f64> = danced
             .iter()
-            .map(|&k| (self.signs[k].dance / peak).powf(1.0 / t))
+            .map(|&k| (heard(k) / peak).powf(1.0 / t))
             .collect();
         let i = rng.choose_weighted(&weights);
         Some(danced[i])

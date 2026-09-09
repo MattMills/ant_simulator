@@ -98,6 +98,13 @@ pub trait Problem {
         Vec::new()
     }
 
+    /// The state a destination letter names (see [`Problem::suffix`]),
+    /// so that a route of a class ending there can be generated. None
+    /// by default.
+    fn destination(&self, _letter: Letter) -> Option<Self::State> {
+        None
+    }
+
     /// The letter of a move between states, if the move is a letter of
     /// the route's word (a relation of a graph, signed by direction).
     /// Use [`crate::topos::move_letter`].

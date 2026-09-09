@@ -36,6 +36,7 @@
 //! | [`bridge`] | the outbound walk and the trail laid home | the forward and backward filters solved explicitly on the grain: the predicted corridor, the surprise of the flows against it, the drift of the conditioned walk |
 //! | [`lexicon`] | recruitment at the nest, the honeybee's dance floor | signs: the classes danced by the thoughts that come home, drawn by those setting out, meaning where they lead, understood as far as the listeners get there |
 //! | [`echo`] | tandem running | signs persisted in walk form: followers that hold a sign for an epoch and walk its glyph again and again, for the others to hear on the way, the route to enter the invariant skeleton, and the glyph to be refined |
+//! | [`interior`] | the nest's interior | a second mind whose ground is the first's vocabulary: words as states, the foragers' yields as food, its trail as belief, spoken through the floor, its dead ends as hypotheses for the foragers to test, its own classes as parses |
 //! | the frame ([`ant_simulator::frame`]) | surfaces joined along edges | a maze over the folded-out surfaces of a box |
 //!
 //! ## Three problems
@@ -131,6 +132,20 @@
 //! source is still there; they do not lengthen the memory, which lives
 //! in the ground already (`extras/docs/echo.md`).
 //!
+//! ## The interior
+//!
+//! The words the foragers register are a space, and the same dynamics
+//! can walk it. An [`interior::Interior`] is a problem whose states
+//! are words and whose solutions are the words the foragers brought
+//! home, worth what they yield; an [`interior::Colony`] is an outer
+//! mind and an inner one on the interior, stepped slower, coupled
+//! every epoch: the interior reads the vocabulary, gives each sign on
+//! the floor a standing dance in proportion to its trail on the word,
+//! and proposes the words it arrived at that nobody has walked, as
+//! symbols with no support the foragers confirm or let die. Its own
+//! classes are parses, and a third layer can walk those
+//! (`extras/docs/interior.md`).
+//!
 //! ## Where the ants' way stops
 //!
 //! Habits and foresight belong to the walk between decisions, so they
@@ -145,6 +160,7 @@
 
 pub mod bridge;
 pub mod echo;
+pub mod interior;
 pub mod lexicon;
 pub mod mind;
 pub mod practice;
@@ -158,6 +174,7 @@ pub mod topos;
 pub mod prelude {
     pub use crate::bridge::{Bridge, BridgeConfig};
     pub use crate::echo::{Echo, EchoConfig};
+    pub use crate::interior::{Colony, Interior, InteriorConfig};
     pub use crate::lexicon::{Lexicon, LexiconConfig, Sign};
     pub use crate::mind::{Choice, Finding, Geometry, Mind, MindConfig, MindStats, QueenPolicy};
     pub use crate::practice::{Practice, PracticeConfig, PracticeReport, Targets, Turn};

@@ -1213,3 +1213,175 @@ fn new_thoughts_are_imprinted_from_the_ground() {
         e.verified
     );
 }
+
+// ---------------------------------------------------------------------
+// The interior
+
+use ant_extras::interior::{Colony, Interior, InteriorConfig};
+use ant_extras::topos::MOVE_LETTERS;
+
+/// The block of the rich source, and whether a symbol's word ends at
+/// it.
+fn means_rich(mind: &Mind<Maze>, k: usize, rich: Position) -> bool {
+    let lex = mind.lexicon().unwrap();
+    lex.meaning(k)
+        .first()
+        .map(|(b, _)| *b == lex.block_of(rich))
+        .unwrap_or(false)
+}
+
+#[test]
+fn the_interior_walks_the_vocabulary_and_believes_in_the_best_class() {
+    let problem = two_sources();
+    let rich = problem.goal();
+    let mut alone = Mind::new(problem.clone(), talking(0, 0.7));
+    let mut colony = Colony::new(problem, talking(0, 0.7), InteriorConfig::default());
+    alone.run(4000);
+    colony.run(4000);
+    let known = colony.inner().problem().known();
+    assert!(known.len() >= 2, "known words: {}", known.len());
+    let inner = colony.inner().stats();
+    assert!(
+        inner.deliveries > 100,
+        "the interior brought home {}",
+        inner.deliveries
+    );
+    // The strongest belief is in a class of the rich source.
+    let mut beliefs = colony.beliefs();
+    beliefs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let (word, level, k) = beliefs.first().cloned().expect("a belief");
+    assert!(level > 0.99);
+    assert!(
+        means_rich(colony.outer(), k, rich),
+        "the interior's strongest belief is in [{}]\n{}",
+        colony.outer().net().unwrap().show(&word),
+        colony.report()
+    );
+    // And it speaks through the floor: the sign stands.
+    let standing = colony.outer().lexicon().unwrap().sign(k).unwrap().standing;
+    assert!(standing > 0.0, "standing dance: {standing}");
+    // No harm to the colony that already talks.
+    let (q0, q1) = (
+        alone.stats().quality_sum,
+        colony.outer().stats().quality_sum,
+    );
+    assert!(
+        q1 > 0.9 * q0,
+        "quality with an interior {q1:.0} against {q0:.0} without"
+    );
+    // The interior has classes of its own: derivations.
+    assert!(colony
+        .inner()
+        .net()
+        .map(|n| !n.living().is_empty())
+        .unwrap_or(false));
+}
+
+#[test]
+fn a_quiet_floor_hears_the_interior() {
+    let problem = two_sources();
+    let mut alone = Mind::new(problem.clone(), talking(0, 0.1));
+    let mut colony = Colony::new(problem, talking(0, 0.1), InteriorConfig::default());
+    alone.run(4000);
+    colony.run(4000);
+    let (q0, q1) = (
+        alone.stats().quality_sum,
+        colony.outer().stats().quality_sum,
+    );
+    assert!(
+        q1 > 1.03 * q0,
+        "quality with an interior {q1:.0} against {q0:.0} without, on a floor few listen to"
+    );
+}
+
+#[test]
+fn the_interior_proposes_a_class_nobody_walked_and_the_foragers_confirm_it() {
+    let hall = Maze::hall(64, 40);
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 300,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default())
+    .with_lexicon(LexiconConfig::default());
+    let mut colony = Colony::new(hall, cfg, InteriorConfig::default());
+    colony.run(6000);
+    assert!(
+        colony.proposed >= 1,
+        "hypotheses proposed: {}",
+        colony.proposed
+    );
+    assert!(
+        colony.confirmed >= 1,
+        "hypotheses confirmed: {} of {}\n{}",
+        colony.confirmed,
+        colony.proposed,
+        colony.report()
+    );
+    let net = colony.outer().net().unwrap();
+    let confirmed: Vec<usize> = net
+        .living()
+        .into_iter()
+        .filter(|&k| net.symbols()[k].proposed && net.symbols()[k].support > 0)
+        .collect();
+    assert!(
+        !confirmed.is_empty(),
+        "a proposed class walked home\n{}",
+        colony.report()
+    );
+    for k in confirmed {
+        let s = &net.symbols()[k];
+        assert!(s.quality > 0.5, "the confirmed class yields: {}", s.quality);
+        assert!(s.glyph.points.len() >= 2);
+    }
+}
+
+#[test]
+fn a_third_layer_walks_the_interiors_own_classes() {
+    // The interior's symbols are classes of derivations; a further
+    // interior over them is the same construction once more.
+    let hall = Maze::hall(64, 40);
+    let cfg = MindConfig {
+        thoughts: 32,
+        trip_budget: 300,
+        ..MindConfig::default()
+    }
+    .with_symbols(SymbolConfig::default())
+    .with_lexicon(LexiconConfig::default());
+    let mut colony = Colony::new(hall, cfg, InteriorConfig::default());
+    colony.run(6000);
+    let parses = colony.inner().net().expect("the interior's network");
+    assert!(
+        parses.living().len() >= 2,
+        "parses: {}",
+        parses.living().len()
+    );
+    let mut third = Interior::new(&InteriorConfig::default());
+    third.refresh(parses);
+    let known = third.known();
+    assert!(!known.is_empty(), "the third layer knows the parses");
+    assert!(
+        known
+            .iter()
+            .any(|(w, _, _)| w.letters().iter().any(|l| l.abs() >= MOVE_LETTERS)),
+        "a parse is a word of chunks"
+    );
+    let mut mind = Mind::new(
+        third,
+        MindConfig {
+            thoughts: 8,
+            trip_budget: 10,
+            rest_ticks: 16,
+            ..MindConfig::default()
+        },
+    );
+    mind.run(2000);
+    assert!(
+        mind.stats().deliveries > 10,
+        "the third layer brought home {}",
+        mind.stats().deliveries
+    );
+    let best = mind.best().expect("a finding at the third layer");
+    let word: &Word = best.route.last().unwrap();
+    assert!(!word.is_empty());
+}

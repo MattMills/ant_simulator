@@ -135,6 +135,10 @@ lexicon's patience of six empty walks is the guard.
 
 ## Where it stops
 
+* **The echo is the literal reading.** A caste walking glyphs on the
+  same ground is one way to persist a sign; the reading that
+  generalises, a second mind whose ground is the first's vocabulary,
+  is the interior (`docs/interior.md`).
 * **The echoes choose from the floor.** They amplify what is danced;
   they cannot speak a sign nobody dances. A colony whose floor is
   wrong is echoed wrong, faster.

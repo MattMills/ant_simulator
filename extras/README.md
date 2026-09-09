@@ -385,6 +385,32 @@ the floor's linear draw, and patient echoes of a sign the world has
 left cost yield. The design, the numbers and where it stops are in
 [`docs/echo.md`](docs/echo.md).
 
+## The interior
+
+The reading of the same idea that generalises: the invariant structure
+the foragers produce, the words registered as symbols with their
+yields and glyphs, is itself a space, and the same dynamics can walk
+it. An *interior* is a problem whose states are words, a move appends
+a letter of the vocabulary or a whole known word, and a solution is a
+word the foragers have brought home, worth what it yields them; a
+*colony* is an outer mind on its problem and an inner mind on the
+interior, stepped at a quarter of the rate with marks that last ten
+times longer. Every epoch the layers couple: the interior reads the
+vocabulary; each sign on the floor is given a standing dance in
+proportion to the interior's trail on its word, so that recruits enact
+what the interior believes; and a word the inner thoughts arrived at
+that nobody has walked is a hypothesis, generated as a route, proposed
+as a symbol with no support, and confirmed or evicted by what the
+foragers do with it. The interior's own traffic registers classes of
+derivations, parses, and a third layer can walk those in turn. In a
+hall with a wall and four pillars the interior proposes the class that
+crosses no ray before any forager walks it and the foragers confirm
+it; on a quiet floor it raises the quality brought home by 6 %; on a
+loud one it changes nothing; and its first coupling, attention on a
+faint channel, collapsed discovery, which is why it speaks only through
+the floor. The design, the numbers, what failed on the way and where
+it stops are in [`docs/interior.md`](docs/interior.md).
+
 ## What the exploration found
 
 * **The sensorium transfers.** Putting a problem's moves into the ant's
@@ -443,6 +469,12 @@ left cost yield. The design, the numbers and where it stops are in
   early, and refine the glyph by walking it; they do not lengthen the
   memory, which is in the ground already, and an echo faithful to a
   sign the world has left is the design's failure mode.
+* **The abstraction is a ground.** The words the foragers register are
+  a space the same machinery walks; an interior's trail over them is a
+  belief, its dead ends at unknown words are hypotheses, and its own
+  classes are parses. What it cannot do is act directly: attention on
+  a channel breaks discovery, and the only downward path that works is
+  the colony's own language, a standing dance on the floor.
 * **The queen is a policy over two numbers.** Given stagnation and
   organisation she has a sensible thing to do with the castes' dials;
   what she cannot do is tell a saturating quality from a stagnant one,
@@ -470,6 +502,9 @@ extras/examples/lexicon.rs signs forming over two sources, naming, synonyms, tal
 extras/src/echo.rs        Echo, EchoConfig (signs persisted in walk form: held, walked, heard on the way)
 extras/docs/echo.md       the echo: claim, build, reach, invariance, refinement, imprinting, what it does not add
 extras/examples/echo.rs   echoes on a quiet floor, the route in the skeleton, new thoughts imprinted
+extras/src/interior.rs    Interior (words as a problem), Colony (two layers coupled), InteriorConfig
+extras/docs/interior.md   the interior: claim, build, the hall, a third layer, what failed, limits
+extras/examples/interior.rs  a hall with pillars, hypotheses, parses, a third layer, a quiet floor
 extras/examples/relations.rs  the family graph learned by walking
 extras/examples/symbols.rs the network round a wall, round a pillar, over tours
 extras/examples/think.rs  the three problems

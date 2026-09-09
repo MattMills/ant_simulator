@@ -5,7 +5,7 @@
 //! walls, as the ants' trails do (Goss et al. 1989).
 
 use crate::problem::{embedding, Moves, Problem};
-use crate::topos::{destination_letter, Letter};
+use crate::topos::{destination_letter, Letter, DESTINATION_LETTERS};
 use ant_simulator::frame::Frame;
 use ant_simulator::geometry::{Point, Position};
 use ant_simulator::world::{Rect, WorldConfig};
@@ -82,6 +82,30 @@ impl Maze {
         let goal = Position::new(w - 5, h / 3);
         let wall = Rect::new(Position::new(w / 2 - 1, 3), Position::new(w / 2 + 1, h - 4));
         Maze::new(width, height, start, goal).with_walls(vec![wall])
+    }
+
+    /// A hall: a wall across the middle with a way round it above and
+    /// below, and four pillars, two on each side, so that a route from
+    /// the nest at the left to the goal at the right has a word of up
+    /// to five letters (each pillar passed above crosses its ray).
+    pub fn hall(width: usize, height: usize) -> Maze {
+        let (w, h) = (width as i32, height as i32);
+        let start = Position::new(4, h / 2);
+        let goal = Position::new(w - 5, h / 2);
+        let wall = Rect::new(
+            Position::new(w / 2 - 1, h / 5),
+            Position::new(w / 2 + 1, h - h / 5),
+        );
+        let pillar =
+            |x: i32, y: i32| Rect::new(Position::new(x - 1, y - 1), Position::new(x + 1, y + 1));
+        let walls = vec![
+            wall,
+            pillar(w / 4, h / 3),
+            pillar(w / 4, 2 * h / 3),
+            pillar(3 * w / 4, h / 3),
+            pillar(3 * w / 4, 2 * h / 3),
+        ];
+        Maze::new(width, height, start, goal).with_walls(walls)
     }
 
     /// Walls as rectangles of cells.
@@ -172,6 +196,11 @@ impl Problem for Maze {
             .min_by_key(|(_, (g, _))| state.chebyshev(*g))
             .map(|(i, _)| vec![destination_letter(i)])
             .unwrap_or_default()
+    }
+
+    fn destination(&self, letter: Letter) -> Option<Position> {
+        let id = usize::try_from(letter.abs().checked_sub(DESTINATION_LETTERS)?).ok()?;
+        self.goals.get(id).map(|(g, _)| *g)
     }
 
     fn letter_names(&self) -> Vec<(Letter, String)> {

@@ -632,6 +632,9 @@ pub struct Symbol {
     pub alive: bool,
     /// The symbol this one was merged into when the alphabet grew.
     pub merged_into: Option<usize>,
+    /// Whether the symbol was proposed (a hypothesis registered with
+    /// no support, see [`PathNet::propose`]) rather than walked.
+    pub proposed: bool,
 }
 
 impl Symbol {
@@ -920,6 +923,15 @@ impl PathNet {
         let k = match self.find(&word) {
             Some(k) => {
                 let s = &mut self.symbols[k];
+                if s.support == 0 {
+                    // A proposed class, walked for the first time: the
+                    // trip is what it is.
+                    s.quality = quality;
+                    s.length = length;
+                    s.glyph = route.clone();
+                    s.glyph_quality = quality;
+                    s.exemplars.clear();
+                }
                 s.support += 1;
                 s.quality += rate * (quality - s.quality);
                 s.length += rate * (length - s.length);
@@ -987,6 +999,31 @@ impl PathNet {
         Some(k)
     }
 
+    /// Propose a class: a symbol of the word with the route as its
+    /// glyph and no support, laid out for the thoughts to test (see
+    /// [`crate::interior`]); none if the word is already a symbol or
+    /// there is no room.
+    pub fn propose(&mut self, word: Word, route: Route, tick: u64) -> Option<usize> {
+        if self.find(&word).is_some() || word.len() > self.cfg.max_word {
+            return None;
+        }
+        let pending = Pending {
+            count: 0,
+            best: route.clone(),
+            quality: 0.0,
+            length: route.length(),
+            prefix: Vec::new(),
+        };
+        let k = self.register(word, pending, &[], tick)?;
+        self.symbols[k].proposed = true;
+        Some(k)
+    }
+
+    /// The attention on a symbol.
+    pub fn attention(&self, k: usize) -> f64 {
+        self.attention.get(k).copied().unwrap_or(0.0)
+    }
+
     /// A trip of a class given up: counted against the class's
     /// precision, if the class is registered (a trip given up has no
     /// destination, so the class is matched by its route alone; where
@@ -1048,6 +1085,7 @@ impl PathNet {
             last_seen: tick,
             alive: true,
             merged_into: None,
+            proposed: false,
         });
         self.attention.push(0.0);
         self.registered += 1;
@@ -1076,7 +1114,21 @@ impl PathNet {
     /// Every class's yield against the shortest class, and its weight
     /// against the mean yield.
     fn reweigh(&mut self) {
-        let living = self.living();
+        // A proposed class nobody has walked yet weighs nothing, for or
+        // against, and is not counted among the classes.
+        let living: Vec<usize> = self
+            .living()
+            .into_iter()
+            .filter(|&k| {
+                if self.symbols[k].support == 0 {
+                    self.symbols[k].weight = 0.0;
+                    self.symbols[k].yield_ = 0.0;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         let reference = living
             .iter()
             .map(|&k| self.symbols[k].length)

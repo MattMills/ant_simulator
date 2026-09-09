@@ -975,7 +975,12 @@ signs are persisted in walk form: echoes hold a sign for an epoch and
 walk its glyph again and again, for the others to hear on the way, so
 that the route enters the colony's invariant geometry early, the glyph
 is refined by the walks, and thoughts born into the colony are
-imprinted from the ground (`extras/docs/echo.md`). What the exploration
+imprinted from the ground (`extras/docs/echo.md`). And the abstraction
+is a ground: an interior is a second mind whose states are the words
+the foragers registered, coupled to them both ways, believing through
+its trail, speaking through the floor, proposing words nobody walked
+for the foragers to test, and registering classes of its own that a
+third layer can walk (`extras/docs/interior.md`). What the exploration
 found, and where the ants' way stops, is in the crate's README.
 
 ```text
@@ -985,6 +990,7 @@ cargo run --release -p ant_extras --example relations
 cargo run --release -p ant_extras --example bridge
 cargo run --release -p ant_extras --example lexicon
 cargo run --release -p ant_extras --example echo
+cargo run --release -p ant_extras --example interior
 cargo test --release -p ant_extras
 ```
 
